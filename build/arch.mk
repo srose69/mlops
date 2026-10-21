@@ -4,8 +4,9 @@
 # build parallelism and the dependencies' headers.
 #
 #   ARCHS="61 89"   architectures of the library (default: all of sm_50..sm_90, the GPUs without native
-#                   FP4); ARCHS=native: only the local GPU's. sm_89's FP8 cvt needs nvcc 12.1+ (PTX ISA 8.1):
-#                   with an older nvcc it is dropped
+#                   FP4); ARCHS=native: only the local GPU's. A package that uses sm_89's FP8 cvt sets
+#                   SM89_FP8 := 1 before including this file: it needs nvcc 12.1+ (PTX ISA 8.1), and with an
+#                   older nvcc sm_89 is dropped
 #   JOBS=n          parallel jobs (default: min(cores, half of MemAvailable / JOB_MB)); a multi-architecture
 #                   object compiles its architectures in parallel (nvcc --threads) when there are more slots
 #                   than objects
@@ -39,7 +40,7 @@ ifneq ($(UNSUPPORTED),)
 endif
 NVCC_VER  := $(shell $(NVCC) --version 2>/dev/null | sed -n 's/.*release \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')
 NVCC_121  := $(shell set -- $(NVCC_VER); [ "$${1:-0}" -gt 12 ] || { [ "$${1:-0}" -eq 12 ] && [ "$${2:-0}" -ge 1 ]; } && echo 1)
-ifeq ($(NVCC_121)$(filter 89,$(ARCHS)),89)
+ifeq ($(SM89_FP8)$(NVCC_121)$(filter 89,$(ARCHS)),189)
   $(warning nvcc $(subst $(eval) ,.,$(NVCC_VER)) < 12.1: sm_89 dropped (FP8 cvt needs PTX ISA 8.1))
   override ARCHS := $(filter-out 89,$(ARCHS))
 endif

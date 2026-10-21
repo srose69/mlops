@@ -29,7 +29,7 @@ import torch_ext  # noqa: E402
 
 NAME = "mlops-optimizers"
 VERSION = torch_ext.header_version(os.path.join(PKG, "include", "mlops_optimizers.h"), "MLOPS_OPTIMIZERS")
-archs = torch_ext.target_archs(NAME, CUDA_HOME)
+archs = torch_ext.target_archs(NAME, CUDA_HOME, sm89_fp8=True)
 nv_dir, nv_ver = torch_ext.dependency(NAME, "nvfp4effma", "to build and to run")
 e5_dir = e5_ver = None
 if any(a < 89 for a in archs):

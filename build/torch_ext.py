@@ -6,7 +6,8 @@ PyTorch extension links it.
 
 Variables (all optional):
   MLOPS_ARCHS="61 89"            architectures, or TORCH_CUDA_ARCH_LIST="6.1;8.9"; default: the GPUs visible to
-                                 PyTorch, or all of sm_50..sm_90 if none is. sm_89 needs nvcc 12.1+.
+                                 PyTorch, or all of sm_50..sm_90 if none is. Packages that use sm_89's FP8 cvt
+                                 need nvcc 12.1+ for sm_89.
   MLOPS_CCBIN, MAX_JOBS          host compiler for nvcc, parallel jobs
   MLOPS_OBJDIR                   object directory that already holds the library for these architectures
                                  (dev/release.sh builds it once for every wheel)
@@ -41,7 +42,8 @@ def nvcc_version(cuda_home):
     return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
 
-def target_archs(name, cuda_home):
+def target_archs(name, cuda_home, sm89_fp8=False):
+    """sm89_fp8: the package uses sm_89's FP8 cvt (PTX ISA 8.1): sm_89 is dropped with an nvcc older than 12.1."""
     import torch
     env = os.environ.get("MLOPS_ARCHS") or os.environ.get("TORCH_CUDA_ARCH_LIST")
     if env:
@@ -61,7 +63,7 @@ def target_archs(name, cuda_home):
     if dropped:
         print(f"{name}: skipping sm_{', sm_'.join(map(str, dropped))} (native FP4 or unsupported)", file=sys.stderr)
     archs = sorted(a for a in archs if a in SUPPORTED)
-    if 89 in archs and nvcc_version(cuda_home) < (12, 1):
+    if sm89_fp8 and 89 in archs and nvcc_version(cuda_home) < (12, 1):
         print("%s: skipping sm_89: its FP8 cvt needs nvcc 12.1+ (PTX ISA 8.1), found %d.%d" % ((name,) + nvcc_version(cuda_home)),
               file=sys.stderr)
         archs.remove(89)

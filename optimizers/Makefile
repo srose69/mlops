@@ -10,6 +10,8 @@
 # Toolchain, architectures, parallelism and the NVFP4EffMA / E5M2EffMA locations: ../build/arch.mk.
 # Python / PyTorch bindings: python/ (pip install, or ../setup.sh optimizers).
 MLOPS_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
+# mlops_adamw_qat uses sm_89's FP8 cvt (qat_codec.cuh)
+SM89_FP8   := 1
 include $(MLOPS_ROOT)/build/arch.mk
 
 VERSION := $(shell sed -n 's/^\#define MLOPS_OPTIMIZERS_VERSION "\(.*\)"/\1/p' include/mlops_optimizers.h)

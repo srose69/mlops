@@ -7,15 +7,15 @@
 #   ./setup.sh optimizers [...]    one package or several
 #   ./setup.sh all                 every package and the meta package "mlops"
 #
-# Nothing is downloaded (pip --no-index): PyTorch and the EffMA packages must be installed first --
-#   nvfp4effma   always (https://github.com/srose69/nvfp4effma/releases)
-#   e5m2effma    only to build for GPUs below sm_89, headers only (https://github.com/srose69/e5m2effma/releases)
+# Nothing is downloaded (pip --no-index): PyTorch, and for optimizers the EffMA packages, must be installed first --
+#   nvfp4effma   optimizers (https://github.com/srose69/nvfp4effma/releases)
+#   e5m2effma    optimizers, only to build for GPUs below sm_89, headers only (https://github.com/srose69/e5m2effma/releases)
 # Variables: PYTHON (default python3), MLOPS_ARCHS="61 89" (default: the visible GPUs), MAX_JOBS, MLOPS_CCBIN,
 # CUDA_HOME; see build/torch_ext.py.
 set -euo pipefail
 cd "$(dirname "$0")"
 PYTHON=${PYTHON:-python3}
-PACKAGES=(optimizers)  # directories with include/mlops_<name>.h and python/setup.py
+PACKAGES=(optimizers positional)  # directories with include/mlops_<name>.h and python/setup.py
 
 version() { sed -n "s/^#define MLOPS_${1^^}_VERSION \"\(.*\)\"/\1/p" "$1/include/mlops_$1.h"; }
 meta_version() { sed -n 's/^VERSION = "\(.*\)"/\1/p' meta/setup.py; }
@@ -41,8 +41,10 @@ done
 "$PYTHON" -c "import torch; assert torch.version.cuda" 2> /dev/null || { echo "PyTorch without CUDA: a CUDA build of torch is needed"; exit 1; }
 "$PYTHON" -c "from torch.utils.cpp_extension import CUDA_HOME; assert CUDA_HOME" 2> /dev/null || {
   echo "CUDA toolkit not found: set CUDA_HOME"; exit 1; }
-"$PYTHON" -c "import importlib.util as u; assert u.find_spec('nvfp4effma')" 2> /dev/null || {
-  echo "nvfp4effma is not installed: install it first from https://github.com/srose69/nvfp4effma/releases"; exit 1; }
+if [[ " ${SELECTED[*]} " == *" optimizers "* ]]; then
+  "$PYTHON" -c "import importlib.util as u; assert u.find_spec('nvfp4effma')" 2> /dev/null || {
+    echo "nvfp4effma (needed by optimizers) is not installed: install it first from https://github.com/srose69/nvfp4effma/releases"; exit 1; }
+fi
 
 for p in "${SELECTED[@]}"; do
   echo "== mlops-$p $(version "$p")"
