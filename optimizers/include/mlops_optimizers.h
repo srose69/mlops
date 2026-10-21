@@ -8,7 +8,7 @@
 #ifndef MLOPS_OPTIMIZERS_H
 #define MLOPS_OPTIMIZERS_H
 
-#define MLOPS_OPTIMIZERS_VERSION "0.1.0"
+#define MLOPS_OPTIMIZERS_VERSION "0.2.0"
 
 #include "mlops_adamw.h"
 #include "mlops_adamw_qat.h"

@@ -15,8 +15,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "build"))
 import torch_ext  # noqa: E402
 
-VERSION = "0.2.0"
-PACKAGES = ["mlops-optimizers~=0.1.0", "mlops-positional~=0.1.0"]  # one entry per package, at the minor version this release was made with
+VERSION = "0.3.0"
+PACKAGES = ["mlops-optimizers~=0.2.0", "mlops-positional~=0.1.0"]  # one entry per package, at the minor version this release was made with
 
 setup(
     name="mlops",
