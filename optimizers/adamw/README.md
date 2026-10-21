@@ -1,0 +1,293 @@
+# mlops/optimizers/adamw
+
+Two CUDA C++ optimizers with a C API and PyTorch bindings, for every GPU NVFP4EffMA supports: sm_50 ..
+sm_90, the ones without native FP4 (see [Build](#build-and-test)):
+
+| | weights | state per element | step |
+|---|---|---|---|
+| `mlops_adamw` | BF16 / FP16 / FP32 | 8 B (FP32 `m`, `v`) | AdamW |
+| `mlops_adamw_qat` | NVFP4, trained in place | 5 B (+ 8 B per 16-element block) | AdamW on the NVFP4 lattice, no master copy |
+
+`mlops_adamw_qat` builds on [NVFP4EffMA](../../../NVFP4EffMA) (NVFP4 tensors, E2M1 / E4M3 codecs, the
+initial quantization) and, below sm_89, [E5M2EffMA](../../../E5M2EffMA) (FP8 codecs); from sm_89 on, where
+FP8 is native, it uses the hardware `cvt` instead ([FP8 codecs](#fp8-codecs)). A PyTorch reference of its step,
+bit-identical to the kernel, is in [`binds/python/mlops_adamw/reference.py`](binds/python/mlops_adamw/reference.py).
+
+## `mlops_adamw`
+
+Elementwise AdamW (Loshchilov & Hutter) over raw device pointers, in FP32:
+
+```
+g = grad * grad_scale
+m = b1 m + (1 - b1) g                     v = b2 v + (1 - b2) g^2
+p = p - lr wd p - lr (m / (1 - b1^t)) / (sqrt(v / (1 - b2^t)) + eps)
+```
+
+Parameters and gradients BF16, FP16 or FP32 (any pair), moments FP32, 128-bit accesses; bit-reproducible
+against the host emulation in `tests/test_adamw.cu`. It does not touch NVFP4: QAT with it means an FP32
+master, this step, and a fresh `nvfp4a_quantize_ex` of the master afterwards (the `adamw` baseline in
+[`misc/`](../../../misc)).
+
+## `mlops_adamw_qat`
+
+### Why
+
+With an FP32 master the master moves in steps far below the NVFP4 cell it sits in; the forward sees
+nothing until the master crosses a rounding boundary, and the 4 bytes that resolve the master below the
+cell are bytes the weight never uses. Storing the master *on* the lattice, with just enough bits for
+sub-cell progress, and keeping AdamW's moments in 8 bits, halves the memory of NVFP4 training. FP16 for
+the state is ruled out (`v` spans more binades than FP16 has); the formats below are chosen per quantity
+from its range and the precision the step needs.
+
+The other half of NVFP4 QAT is the block scale. Re-deriving it from the amax every step makes the lattice
+jump under the elements; freezing it loses the resolution a block gains when its weights settle. Here a
+scale moves only when the block's own statistics ask for it, persistently, and a move never changes a
+weight value.
+
+### The lattice
+
+E2M1's magnitudes `{0, .5, 1, 1.5, 2, 3, 4, 6}` are anchors at the integer coordinates 0..7; joining
+them with secants gives a piecewise-linear `g(u)` with slope `g' = 0.5 / 1 / 2` (the 4-bit code read as a
+continuous integer, Quake's float-bits-as-int at 4 bits). Element `i` of block `b`:
+
+```
+w_i = sigma_b g(u_i)            master (never stored as a float)
+q_i = sigma_b g(round(u_i))     what the forward reads: the NVFP4 nibble is round(u_i)
+sigma_b = E4M3(k_b) gdec        k_b the block's scale byte, gdec the global decode factor
+```
+
+`u` is stored as Q3.12: twelve fractional bits below a cell, enough for a step of `lr / J` with
+stochastic rounding to stay unbiased (an E2M1 value times its scale has at most 6 significant bits, so
+the lattice never needs more than the integer part plus sub-cell progress).
+
+### Element step
+
+AdamW on `q` in weight units, mapped onto `u` by the Jacobian `J = dw/du = sigma~ g'(u)`:
+
+```
+v    = b2 s^2 + (1 - b2) grad^2
+y    = rsqrt(v + eps^2)
+s   <- SR_E5M2(v y)                     E[s^2] = v
+r   <- SR_E4M3((b1 r s + (1 - b1) grad) y)
+u   <- SR_Q3.12(u - lr (r sqrt(1 - b2^t) / (1 - b1^t) + wd w) / J)
+qbar <- SR_Q3.4(b1 qbar + (1 - b1) q / sigma)
+```
+
+* **`r = m / sqrt(v)` in E4M3.** Scale-free, and bounded: by Cauchy-Schwarz on the two EMAs,
+  `|m| / sqrt(v) <= (1 - b1) / sqrt((1 - b2)(1 - b1^2 / b2)) = 7.27` for (0.9, 0.999), inside E4M3's range
+  with its 3 mantissa bits where Adam's update needs them.
+* **`s = sqrt(v)` in E5M2** with a power-of-two exponent per block (the block's largest `s` at `<= 2^12`).
+  The stochastic rounding is done in the squared domain, so `E[s^2] = v` exactly and `v`'s EMA stays
+  unbiased.
+* **`y` is Quake's rsqrt**: magic `0x5F1FFFF9` plus one Newton step with refitted coefficients,
+  `|rel. err| <= 6.5e-4`. `s` only seeds its rounding bracket from `v y`, so the approximation never
+  biases `s`.
+* **The moments never see `J`.** `g'` jumps by 2x at cell boundaries and `sigma` changes when the block
+  scale moves; inside `v` those jumps would be remembered for `1 / (1 - b2)` steps. Applying `J` to the
+  step instead makes this, to first order in `lr`, AdamW on `q`: `lr` and `weight_decay` mean what they
+  mean for AdamW, and the decay acts on the master `w`.
+* **`1 / sigma~`** is interpolated linearly between the centers of the element's block and its neighbour
+  along the row, so the step multiplier has no seam at block boundaries.
+* **Stochastic rounding** (SR) everywhere a value is stored: `E[stored] = exact`, so progress far below a
+  quantum accumulates in expectation. The uniforms come from a counter-based stream (one lowbias32 mix
+  per thread, xorshift steps after it).
+
+### Block scale
+
+Under QAT an element does not settle on its optimum `w*`: it oscillates between the two codes around it,
+and its master sits at the rounding boundary between them. Neither `u` nor `q` locates `w*` inside the
+cell; the mean of the oscillation does. With `H` the curvature, `m = H (qbar - w*)` (`qbar` the EMA of
+`q` over the same window as `m`), so
+
+```
+w*_i = qbar_i - m_i / H_b
+```
+
+**`H_b` is a secant**, the regression of the gradient on the code moves `d = q - qbar(t-1)` over the
+block: `E[grad | past] = H (q - w*)`, and the batch noise in `grad` is independent of `q`, which was fixed
+before the batch was drawn:
+
+```
+H_b = EMA_b2[sum_i grad_i d_i] / EMA_b2[sum_i d_i^2]        two BF16 accumulators, SR
+```
+
+It measures the curvature along the directions the elements actually move (coupled moves included),
+which is what the Newton estimate needs. (Centering `grad` on `m(t-1)` would bias it: `m(t-1)` drove the
+moves.)
+
+**`H_b` is used only when significant.** With `H = 0` the numerator is a sum of independent terms with
+`E[grad^2] = v`, so its null variance is `(1 - b2)/(1 + b2) * (1 + b2^t)/(1 - b2^t) * mean(v) * EMA[sum d^2]`
+(no extra state). A block votes only when the numerator is `z` of those standard deviations above zero;
+otherwise `m / H` would be noise over noise.
+
+**The preferred scale** minimizes the representation loss of `w*` over one E4M3 octave each way:
+
+```
+k* = argmin_{|k - k_b| <= 8} sum_i huber(w*_i - Q_k(w*_i), delta = sigma_b)
+```
+
+The window is two octaves because the loss is not convex in `k` (several local minima per octave: E2M1
+is self-similar under x2 only between 1 and 6), and a local search stops in them. Huber keeps an outlier
+from dragging the block scale by more than its linear share; `delta = sigma_b` makes every in-range
+rounding error quadratic (no cell is wider than `2 sigma`), so only clipping is linearized.
+
+**A CUSUM decides the move.** The vote `x = sign(k* - k_b)` enters a two-sided CUSUM with drift 1/16 per
+step (one element's share of the block), threshold `h = 4 z^2`:
+
+```
+S <- sign(S + P x) max(0, |S + P x| - P / 16);    |S| > h  ->  k_b += sign(S), S = 0
+```
+
+The vote is made of `b1`-EMAs, so it is evaluated once per `P = (1 + b1) / (1 - b1)` steps (19 for
+`b1 = 0.9`, the EMAs' integrated autocorrelation time) and held for those `P` steps. A move takes about
+`h / (1 - 1/16) = 38` steps of a unanimous vote; a vote that stops recurring drains away.
+
+**A move keeps every weight.** `u` and `qbar` are re-expressed against the new `sigma` (with SR); only the
+representation changes. At a fixed `w*` the argmin never returns to a byte it left, so a block cannot
+oscillate between two scales.
+
+**Initialization** quantizes the dense initial weight with amax scaling (`nvfp4a_quantize_ex`), then
+raises the global 8x and lowers every block byte by 24 codes (exact for normals): the same values, but no
+block starts pinned at the top of E4M3.
+
+### State
+
+| | per element | per 16-element block |
+|---|---|---|
+| NVFP4 weight | 0.5 B code | 1 B scale |
+| `u` | 2 B, Q3.12 | |
+| `r`, `s` | 1 B each, E4M3 / E5M2 | 1 B exponent of `s` |
+| `qbar` | 1 B, Q3.4 | |
+| secant | | 2 x 2 B, BF16 |
+| CUSUM | | 2 B, Q7.8 |
+| scratch | | 1 B next scale byte (+ 4 B per row) |
+
+**6.12 B per weight** in total, against 12.56 B for an FP32 master with FP32 moments plus the NVFP4 copy
+the forward reads.
+
+### Gradients
+
+E5M2 or E4M3 with a per-tensor decode factor (`grad_scale`: the FP8 output scale of the backward GEMM),
+or FP32. An FP8 gradient's rounding error, at most 2^-3 relative, is small next to the minibatch noise
+Adam averages over; E5M2's 32 binades cover a tensor's gradient range with per-tensor scaling, which is
+why Transformer Engine uses it for gradients.
+
+### FP8 codecs
+
+The FP8 operations of the step are the gradient decode (E5M2 / E4M3), the decode of the stored `r`
+(E4M3) and `s` (E5M2), and one E5M2 RNE encode (SR's lower neighbour, always an exact value). Their
+source depends on the target:
+
+| target | decode | encode |
+|---|---|---|
+| sm_50 .. sm_87 | E5M2EffMA: raw bits + one FMUL (`decode_fp8x4`) | E5M2EffMA `f32_to_e5m2` |
+| sm_89, sm_90 | `cvt.rn.f16x2.{e4m3x2,e5m2x2}` + `cvt.f32.f16` | `cvt.rn.satfinite.e5m2x2.f32` |
+
+All of them are exact on finite codes, so every architecture computes the same bits:
+
+* `f32_to_e5m2` against NVIDIA's model of `cvt.rn.satfinite.e5m2x2.f32` (`cuda_fp8.h`'s
+  `__nv_cvt_float_to_fp8`): 0 mismatches over all 2^32 FP32 inputs. Both decodes against the f16 that
+  `cvt.rn.f16x2.*` returns: 0 mismatches over all 256 codes.
+* `make qat` runs the whole QAT test twice: once on the GPU's own path, once with `QAT_FP8_CVT_MODEL`,
+  which routes the sm_89+ wrappers through `cuda_fp8.h` (NVIDIA's software model of the same
+  instructions) on any GPU. `tests/test_reference.py` with the extension built that way
+  (`NVCC_APPEND_FLAGS=-DQAT_FP8_CVT_MODEL`) is byte-identical to the PyTorch reference.
+* On sm_90, the wrappers and `cuda_fp8.h`'s intrinsics compile to the same SASS (`F2FP.F16.E5M2.UNPACK_B`,
+  `F2FP.F16.E4M3.UNPACK_B`, `F2FP.SATFINITE.E5M2.F32.PACK_AB_MERGE_C`). The sm_89 kernels assemble with
+  ptxas 12.6 into the same instructions.
+* Not run on Ada or Hopper hardware.
+
+They differ only on non-finite codes, which the step never stores (`r` saturates at 448, `s` at 57344).
+A gradient that holds Inf / NaN codes is outside the contract: `cvt` (like torch and the reference)
+decodes them as Inf / NaN, E5M2EffMA as large finite values.
+
+sm_89's `cvt` needs PTX ISA 8.1 (CUDA 12.1); with an older nvcc the build drops sm_89 (`Makefile`,
+`setup.py`) and `qat_codec.cuh` refuses it with an `#error`. sm_90 needs PTX ISA 7.8 (CUDA 11.8).
+
+### Performance
+
+Measured on a GTX 1080 (Pascal, 320 GB/s DRAM peak) only. A 4096 x 4096 weight, median of 100-200 steps
+after a boost warm-up (`make bench`):
+
+| step | time | bytes / element | DRAM throughput |
+|---|---|---|---|
+| `mlops_adamw`, FP32 param + grad | 1.66 ms | 28 | 283 GB/s (88% of peak) |
+| `mlops_adamw`, BF16 param + grad | 1.31 ms | 22 | 281 GB/s (88%) |
+| `mlops_adamw` FP32 + NVFP4 re-quantization (0.56 ms) | 2.22 ms | | |
+| `mlops_adamw_qat`, E5M2 grad | 1.33 ms | 13.1 | 166 GB/s (52%) |
+| `mlops_adamw_qat`, FP32 grad | 1.34 ms | 16.1 | 202 GB/s (63%) |
+
+Against the NVFP4 baseline it replaces (AdamW on an FP32 master plus re-quantization) the QAT step is
+1.67x faster; against plain BF16 AdamW it is on par while moving 40% fewer bytes. On the GTX 1080 it is not
+bandwidth-bound: the same access pattern with no arithmetic runs in 0.76 ms (290 GB/s). The difference is
+arithmetic: the scale vote's 17-candidate window (~0.25 ms), the stochastic roundings of `s` and `r`
+(~0.2 ms) and the uniforms (~0.15 ms). Newer GPUs have more FP32 throughput per byte of DRAM bandwidth,
+so there the step should be closer to its memory bound; that is not measured.
+
+### Training
+
+[`misc/train_nvfp4.py`](../../../misc/train_nvfp4.py): a 7-layer decoder (dim 64, SwiGLU 128, 4 heads,
+287k NVFP4 + 279k dense parameters) on WikiText-2's `wiki.train.raw` (byte-level BPE 4096, last 5% held
+out), NVFP4 forward through NVFP4EffMA's GEMM, 5000 steps of 20 x 256 tokens, lr 1e-3 with 100 warm-up
+steps and cosine decay to 1e-4, weight decay 0.1; the same hyperparameters for both optimizers:
+
+| NVFP4 linears optimized by | validation loss, seed 0 / 1 | NVFP4 weight + optimizer state |
+|---|---|---|
+| `mlops_adamw` on an FP32 master, re-quantized every step | 4.720 / 4.706 | 12.56 B / weight |
+| `mlops_adamw_qat`, E5M2 gradients | 4.716 / 4.707 | 6.12 B / weight |
+
+The difference between the optimizers (at most 0.003) is below the spread between seeds (0.01-0.014): with
+half the memory, QAT trains as well as an FP32 master here. Activations enter the GEMM exactly in FP32
+(`act="exact"`).
+
+### Limits
+
+* Rowwise NVFP4 with 1x16 blocks and E4M3 scales (linear or swizzled), global per tensor or per row; no
+  columnwise copy (a backward that needs `W^T` dequantizes or transposes).
+* The scale of a block whose curvature never becomes significant stays where initialization put it.
+* Under pure-noise gradients about 1% of the block scales move in 2000 steps (`make qat`).
+
+## Build and test
+
+Targets are NVFP4EffMA's architectures: sm_50 52 53 60 61 62 70 72 75 80 86 87 89 90.
+
+* The `Makefile` builds tests and bench, which run on GPU `GPU` (default 0). So it builds for that GPU's
+  architecture by default. `ARCHS="61 89"` or `ARCHS=all` select others.
+* `setup.py` uses the same list (see [Python](#python)).
+
+```
+make            # out/test_adamw, out/bench_adamw, out/test_adamw_qat, out/test_adamw_qat_cvt
+make test       # mlops_adamw vs its host emulation, every dtype pair, with and without bias correction
+make qat        # mlops_adamw_qat: codecs, one step vs a double-precision reference (linear and swizzled
+                # scales), noise / scale-finding / cell-walking behaviour; then the same through the
+                # sm_89+ FP8 path (QAT_FP8_CVT_MODEL, see FP8 codecs)
+make bench      # bandwidth of both, boost-warmed, NVML clocks
+make ARCHS=all  # every architecture (compile check; sm_89 needs nvcc 12.1+)
+```
+
+`NVFP4EFFMA` and `E5M2EFFMA` (default `../../../NVFP4EffMA`, `../../../E5M2EffMA`) point at the sibling
+checkouts; NVFP4EffMA's static library must be built with its own `make`.
+
+## Python
+
+```
+pip install ./NVFP4EffMA/binds/python --no-build-isolation                 # first: a dependency, not on PyPI
+pip install ./mlops/optimizers/adamw/binds/python --no-build-isolation
+```
+
+Architectures, as NVFP4EffMA's build chooses them, in this order:
+1. `MLOPS_ADAMW_ARCHS="61 89"` or `TORCH_CUDA_ARCH_LIST="6.1;8.9"`;
+2. else the GPUs visible at build time;
+3. else all of sm_50..sm_90.
+
+Anything outside that range is dropped. NVFP4EffMA's static library must have been built for the same
+architectures; its default `make` builds all of them.
+
+```python
+dense, qat = mlops_adamw.split_params(model)              # QATLinear weights vs everything else
+opt, opt_qat = mlops_adamw.AdamW(dense), mlops_adamw.AdamWQAT(qat, weight_decay=0.1)
+```
+
+[`binds/python/README.md`](binds/python/README.md): the `torch.optim` optimizers `AdamW` (dense) and
+`AdamWQAT` (only `QATLinear`'s NVFP4 weights, everything else refused), `QATLinear`, the low-level
+`mlops_adamw.adamw` / `QATState`, the reference, and the tests.
