@@ -104,7 +104,10 @@ template <int GT> __device__ __forceinline__ void load_grad(const void *__restri
   for (int i = 0; i < kQ; ++i) g[i] = mul(g[i], gs);
 }
 
-template <int GT>
+// the largest finite block-scale code: E4M3 0x7E (448), UE5M3 0xFE (114688); the smallest kept is 1
+template <bool UE> constexpr int kMaxCode = UE ? 0xFE : 0x7E;
+
+template <int GT, bool UE>
 __global__ __launch_bounds__(256) void qat_step_kernel(Lattice L, Hyper h, const void *__restrict__ grad,
                                                        mlops_adamw_qat_state st) {
   const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -115,10 +118,10 @@ __global__ __launch_bounds__(256) void qat_step_kernel(Lattice L, Hyper h, const
   const size_t e0 = (size_t)blk * kB + kQ * ql;
   const float gd = st.gdec[L.per_row ? row : 0];
   const uint32_t kb = L.scale[L.sidx(row, b)];
-  const float sm = nvfp4a::e4m3_value(kb), sigma = mul(sm, gd);
+  const float sm = nvfp4a::scale_val<UE>(kb), sigma = mul(sm, gd);
   // a quarter lies on one side of the block center: interpolate toward that side's neighbour
   const bool right = ql >= 2;
-  const float sn = nvfp4a::e4m3_value(L.scale[L.sidx(row, right ? min(b + 1, L.nb - 1) : max(b - 1, 0))]);
+  const float sn = nvfp4a::scale_val<UE>(L.scale[L.sidx(row, right ? min(b + 1, L.nb - 1) : max(b - 1, 0))]);
   // 1 / sigma~: the reciprocal of the block scale interpolated between the two block centers (the step
   // multiplier is what the Jacobian enters as, so it is the quantity smoothed)
   const float im = __frcp_rn(sigma), in_ = __frcp_rn(mul(sn, gd));
@@ -203,10 +206,10 @@ __global__ __launch_bounds__(256) void qat_step_kernel(Lattice L, Hyper h, const
       float best = 3.40282347e38f;
       int kbest = (int)kb;
 #pragma unroll
-      for (int o = -8; o <= 8; ++o) {  // clamped repeats at the E4M3 ends never win (strict <)
-        const int c = min(126, max(1, (int)kb + o));
+      for (int o = -8; o <= 8; ++o) {  // clamped repeats at the code range's ends never win (strict <)
+        const int c = min(kMaxCode<UE>, max(1, (int)kb + o));
         // huber(e * sc, sigma) = sc^2 * huber(e, sigma / sc): errors in grid units, one rescale per candidate
-        const float sc = mul(nvfp4a::e4m3_value((uint32_t)c), gd), isc = __frcp_rn(sc), dl = mul(sigma, isc);
+        const float sc = mul(nvfp4a::scale_val<UE>((uint32_t)c), gd), isc = __frcp_rn(sc), dl = mul(sigma, isc);
         float D = 0.0f;
 #pragma unroll
         for (int i = 0; i < kQ; ++i) {
@@ -223,7 +226,7 @@ __global__ __launch_bounds__(256) void qat_step_kernel(Lattice L, Hyper h, const
     const int mag = abs(S) - 16 * h.period;
     S = mag > 0 ? (S > 0 ? mag : -mag) : 0;
     if (abs(S) > h.hq) {
-      kn = (uint32_t)min(126, max(1, (int)kb + (S > 0 ? 1 : -1)));
+      kn = (uint32_t)min(kMaxCode<UE>, max(1, (int)kb + (S > 0 ? 1 : -1)));
       S = 0;
     }
     if (ql == 0) { st.cusum[blk] = (int16_t)S; st.next[blk] = (uint8_t)kn; }
@@ -237,7 +240,7 @@ __global__ __launch_bounds__(256) void qat_step_kernel(Lattice L, Hyper h, const
 
   // a move keeps the master values: re-express u and qbar against the new sigma
   if (kn != kb) {
-    const float ratio = __fdiv_rn(sm, nvfp4a::e4m3_value(kn));
+    const float ratio = __fdiv_rn(sm, nvfp4a::scale_val<UE>(kn));
 #pragma unroll
     for (int i = 0; i < kQ; ++i) {
       uf[i] = g_inv(mul(g_of(uf[i]), ratio));
@@ -258,8 +261,8 @@ __global__ __launch_bounds__(256) void qat_step_kernel(Lattice L, Hyper h, const
   *reinterpret_cast<uint16_t *>(L.data + e0 / 2) = (uint16_t)codes;
 }
 
-// qat_step_kernel<GT> over `grid` blocks of 256 threads (adamw_qat_inst.cu instantiates one GT per object)
-template <int GT>
+// qat_step_kernel<GT, UE> over `grid` blocks of 256 threads (adamw_qat_inst.cu: one (GT, UE) per object)
+template <int GT, bool UE>
 void launch_step(const Lattice &L, const Hyper &h, const void *grad, const mlops_adamw_qat_state &st, int grid,
                  cudaStream_t stream);
 

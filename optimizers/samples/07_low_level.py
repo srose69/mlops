@@ -49,7 +49,7 @@ print(f"master vs NVFP4 weight: max |diff| {(st.master() - st.weight.dequantize(
 # ---- reference.step: the same step in PyTorch, bit for bit ----------------------------------------------
 # Clone the NVFP4 tensor and the state, step both ways with the same seed, compare every byte.
 q_ref = nvfp4effma.NVFP4Tensor(st.weight.data.clone(), st.weight.scales.view(torch.uint8).clone(),
-                               amax=st.weight.amax.clone(), scale_max=st.weight.scale_max)
+                               amax=st.weight.amax.clone(), scale_max=st.weight.scale_max, ue5m3=st.weight.ue5m3)
 state_ref = st.state.clone()
 g8, gs = functional.fp8_grad(grad_q, torch.float8_e5m2)
 st.step(g8, lr=1e-3, step=2, weight_decay=0.1, grad_scale=gs, seed=123)

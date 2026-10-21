@@ -15,11 +15,11 @@ import torch
 from mlops.optim import functional, reference
 
 
-def run(rows, cols, grad_dtype, steps, swizzled=False, seed=0):
+def run(rows, cols, grad_dtype, steps, swizzled=False, scale_dtype="e4m3", seed=0):
     torch.manual_seed(seed)
     w = torch.randn(rows, cols, device="cuda") * 0.02
     target = torch.randn(rows, cols, device="cuda") * 0.02
-    st = functional.QATState(w)
+    st = functional.QATState(w, scale_dtype=scale_dtype)
     if swizzled:
         st.weight = st.weight.with_scale_layout(True)
     worst = {}
@@ -34,7 +34,7 @@ def run(rows, cols, grad_dtype, steps, swizzled=False, seed=0):
         kw = dict(lr=1e-3, step=t, weight_decay=0.1, grad_scale=gs, seed=3)
         st.step(gq, **kw)
         qref = nvfp4effma.NVFP4Tensor(data_ref, scales_ref, amax=st.weight.global_scale.clone(),
-                                      scale_max=st.weight.scale_max, swizzled=st.weight.swizzled)
+                                      scale_max=st.weight.scale_max, swizzled=st.weight.swizzled, ue5m3=st.weight.ue5m3)
         reference.step(qref, state_ref, gq, **kw)
         a, b = reference.carve(st.state, rows, cols), reference.carve(state_ref, rows, cols)
         for k in ("r", "s", "qbar", "s_exp", "cusum", "hnum", "hden"):
@@ -50,12 +50,15 @@ def run(rows, cols, grad_dtype, steps, swizzled=False, seed=0):
 
 def main():
     fails = 0
-    for rows, cols, gdt, steps, swz in ((64, 1024, torch.float32, 60, False), (128, 512, torch.float8_e5m2, 60, False),
-                                        (256, 256, torch.float8_e4m3fn, 40, True)):
-        worst = run(rows, cols, gdt, steps, swz)
+    for rows, cols, gdt, steps, swz, sdt in ((64, 1024, torch.float32, 60, False, "e4m3"),
+                                             (128, 512, torch.float8_e5m2, 60, False, "e4m3"),
+                                             (256, 256, torch.float8_e4m3fn, 40, True, "e4m3"),
+                                             (64, 1024, torch.float32, 60, False, "ue5m3"),
+                                             (256, 256, torch.float8_e5m2, 40, True, "ue5m3")):
+        worst = run(rows, cols, gdt, steps, swz, sdt)
         ok = all(v >= 0.999 for k, v in worst.items() if k != "u within 1") and worst["u within 1"] == 1.0
         fails += not ok
-        name = f"{rows}x{cols} grad={str(gdt).split('.')[-1]}{' swizzled' if swz else ''}, {steps} steps"
+        name = f"{sdt.upper()} {rows}x{cols} grad={str(gdt).split('.')[-1]}{' swizzled' if swz else ''}, {steps} steps"
         print(f"[{'PASS' if ok else 'FAIL'}] {name}: worst identical fraction " +
               ", ".join(f"{k} {v:.5f}" for k, v in worst.items()))
     print("\nall passed" if not fails else f"\n{fails} FAILED")

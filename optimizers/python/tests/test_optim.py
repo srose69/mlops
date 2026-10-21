@@ -110,29 +110,36 @@ def test_qat():
     x = torch.randn(512, 128, device="cuda")
     y = x @ target.t()
 
-    lin = optim.QATLinear(128, 64, weight=w0)
-    opt = optim.AdamWQAT([lin.weight], lr=1e-3, weight_decay=0.0, seed=5)
-    st = functional.QATState(w0)  # the same step through the low-level API, same stream (parameter 1)
-    losses = []
-    for t in range(1, 301):
-        loss = ((lin(x) - y) ** 2).mean()
-        loss.backward()
-        g = lin.weight.grad.clone()
-        opt.step(); opt.zero_grad()
-        st.step(g, lr=1e-3, step=t, weight_decay=0.0, seed=(5 + 0x9E3779B9) & 0xFFFFFFFF)
-        losses.append(loss.item())
-    a, b = reference.carve(lin.qat_state, 64, 128), reference.carve(st.state, 64, 128)
-    same = all(torch.equal(a[k], b[k]) for k in ("u", "r", "s", "qbar", "s_exp", "cusum", "hnum", "hden")) and \
-        torch.equal(lin.nvfp4_data, st.weight.data) and torch.equal(lin.nvfp4_scales, st.weight.scales.view(torch.uint8))
-    f += check(same, "QATLinear + AdamWQAT == QATState.step on the same gradients, 300 steps (state and codes bit-identical)")
-    f += check(losses[-1] < 0.2 * losses[0], f"QATLinear + AdamWQAT fits a linear map: loss {losses[0]:.3e} -> {losses[-1]:.3e}")
+    for sdt in ("ue5m3", "e4m3"):  # E4M3 last: the checks below use its layer
+        lin = optim.QATLinear(128, 64, weight=w0, scale_dtype=sdt)
+        opt = optim.AdamWQAT([lin.weight], lr=1e-3, weight_decay=0.0, seed=5)
+        st = functional.QATState(w0, scale_dtype=sdt)  # the same step through the low-level API, same stream (parameter 1)
+        losses = []
+        for t in range(1, 301):
+            loss = ((lin(x) - y) ** 2).mean()
+            loss.backward()
+            g = lin.weight.grad.clone()
+            opt.step(); opt.zero_grad()
+            st.step(g, lr=1e-3, step=t, weight_decay=0.0, seed=(5 + 0x9E3779B9) & 0xFFFFFFFF)
+            losses.append(loss.item())
+        a, b = reference.carve(lin.qat_state, 64, 128), reference.carve(st.state, 64, 128)
+        same = all(torch.equal(a[k], b[k]) for k in ("u", "r", "s", "qbar", "s_exp", "cusum", "hnum", "hden")) and \
+            torch.equal(lin.nvfp4_data, st.weight.data) and torch.equal(lin.nvfp4_scales, st.weight.scales.view(torch.uint8))
+        f += check(same, f"{sdt.upper()}: QATLinear + AdamWQAT == QATState.step on the same gradients, 300 steps (state and codes bit-identical)")
+        f += check(losses[-1] < 0.2 * losses[0], f"{sdt.upper()}: QATLinear + AdamWQAT fits a linear map: loss {losses[0]:.3e} -> {losses[-1]:.3e}")
     f += check(lin.weight.untyped_storage().nbytes() == 4, "the weight handle holds 4 bytes (the weight is the NVFP4 buffers)")
 
     buf = io.BytesIO()
     torch.save(lin.state_dict(), buf)
     lin2 = optim.QATLinear(128, 64)
     lin2.load_state_dict(torch.load(io.BytesIO(buf.getvalue())))
-    f += check(torch.equal(lin2(x), lin(x)), f"state_dict round trip: same output (keys {sorted(lin.state_dict())})")
+    f += check(torch.equal(lin2(x), lin(x)) and lin2.scale_dtype == "e4m3",
+               f"state_dict round trip, E4M3 checkpoint into a UE5M3 layer: same output, format restored "
+               f"(keys {sorted(lin.state_dict())})")
+    old = {k: v for k, v in lin.state_dict().items() if k != "nvfp4_format"}  # a checkpoint from before UE5M3
+    lin3 = optim.QATLinear(128, 64)
+    lin3.load_state_dict(old)
+    f += check(torch.equal(lin3(x), lin(x)) and lin3.scale_dtype == "e4m3", "a checkpoint without nvfp4_format loads as E4M3")
 
     xh = x.half()
     ref = lin(xh)
@@ -140,6 +147,38 @@ def test_qat():
     out = model(xh)
     f += check(out.dtype == torch.float16 and lin2.weight.dtype == torch.float32 and torch.equal(out, ref),
                "model.half(): NVFP4 buffers and the float32 handle untouched, same output")
+    return f
+
+
+def test_to_e4m3():
+    """to_e4m3: a trained UE5M3 weight as E4M3 scales, the same values; refused when the scales do not fit."""
+    import nvfp4effma
+    f = 0
+    torch.manual_seed(4)
+    x = torch.randn(64, 256, device="cuda")
+    lin = optim.QATLinear(256, 128)
+    opt = optim.AdamWQAT([lin.weight], lr=1e-3)
+    for _ in range(200):
+        (lin(x) - x[:, :128]).pow(2).mean().backward(); opt.step(); opt.zero_grad()
+    q = lin.nvfp4_weight()
+    for swz in (False, True):
+        qs = q.with_scale_layout(swz)
+        e = optim.to_e4m3(qs)
+        same = torch.equal(e.dequantize(torch.float32), q.dequantize(torch.float32)) and \
+            torch.equal(nvfp4effma.linear(x, e, act="exact"), nvfp4effma.linear(x, q, act="exact"))
+        f += check(not e.ue5m3 and e.swizzled == swz and same,
+                   f"to_e4m3 of a trained UE5M3 weight ({'swizzled' if swz else 'linear'}): E4M3 scales, dequantized "
+                   f"weight and nvfp4effma.linear output bit-identical")
+    w = torch.randn(16, 64, device="cuda")
+    w[0] *= 1e6; w[1] *= 1e-6                                          # 40 binades between two blocks
+    wide = nvfp4effma.quantize(w, scale_dtype="ue5m3")
+    import warnings
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        kept = optim.to_e4m3(wide)
+    f += check(kept is wide and kept.ue5m3 and len(caught) == 1 and "NOT E4M3" in str(caught[0].message),
+               f"to_e4m3 of scales spanning more than E4M3 holds: returned as is (UE5M3) with a warning "
+               f"({caught[0].message if caught else 'none'})")
     return f
 
 
@@ -182,7 +221,7 @@ def test_act():
 
 
 def main():
-    f = test_adamw() + test_refusals() + test_qat() + test_fp8() + test_act()
+    f = test_adamw() + test_refusals() + test_qat() + test_to_e4m3() + test_fp8() + test_act()
     print("\nall passed" if not f else f"\n{f} FAILED")
     sys.exit(1 if f else 0)
 

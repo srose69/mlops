@@ -17,7 +17,7 @@ from mlops.optim import AdamW, AdamWQAT, QATLinear, split_params
 torch.manual_seed(0)
 dim, hidden = 256, 1024  # QATLinear needs in_features % 64 == 0
 
-# QATLinear: bias-free linear layer whose weight is stored as NVFP4 (4-bit codes + E4M3 block scales).
+# QATLinear: bias-free linear layer whose weight is stored as NVFP4 (4-bit codes + UE5M3 block scales).
 # grad_dtype=float8_e5m2: the weight gradient reaches the optimizer as FP8 (smaller, what the kernel reads).
 model = nn.Sequential(
     nn.LayerNorm(dim),

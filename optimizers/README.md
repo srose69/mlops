@@ -14,6 +14,33 @@ for AdamW on an FP32 master plus NVFP4 re-quantization, with half the memory (6.
 and trains a small NVFP4 transformer to the same validation loss
 ([details](adamw/README.md#performance)).
 
+## Block scales: UE5M3 by default
+
+An NVFP4 weight's block scales are 8-bit. Transformer Engine uses E4M3 (`2^-9 .. 448`). `QATLinear` and
+`QATState` default to **UE5M3**: unsigned, 5 exponent bits, the same 3 mantissa bits, `2^-17 .. 114688`
+([Graphcore, arXiv:2609.02846](https://arxiv.org/abs/2609.02846)). There, on Nemotron-H 8B over 190B tokens,
+Transformer Engine's native NVFP4 had repeated loss spikes once its BF16 layers and Hadamard transform were
+removed. UE5M3 scales trained smoothly with every linear in FP4 and a tensor scale refreshed only every 50
+steps; E4M3 leaves a tensor at its amax no room to grow (their section 5.2). Here the global scale never
+changes after initialization, so the scale format sets how far a block's weights can grow during training:
+
+| | growth of a block scale | when weights outgrow it |
+|---|---|---|
+| E4M3 | 8x | the scale stops at 448, the block's largest weights saturate |
+| UE5M3 | 256x (23 binades left below the largest block) | — |
+
+* **Nothing else changes.** While no E4M3 scale would leave its range, both formats train bit for bit the
+  same: same values, moments and codes, only the scale bytes differ by a constant. The step is 0.5-1% faster.
+* **Where it matters** (`make qat`): when weights grow 32x, every UE5M3 block still represents them exactly;
+  about a third of the E4M3 blocks stop at the top with 18% error.
+* **Export.** Blackwell's native NVFP4 (cuBLASLt, Transformer Engine, ModelOpt, vLLM) reads E4M3 scales.
+  `mlops.optim.to_e4m3(layer.nvfp4_weight())` converts with the same values bit for bit: one power of two
+  per row between the scales and the global. If training spread a row's scales over more than E4M3 spans,
+  it returns the weight as is, still UE5M3 (`.ue5m3`), with a warning instead of changing it.
+  `nvfp4effma` runs UE5M3 tensors directly.
+* `scale_dtype="e4m3"` selects E4M3; `four_over_six` (an E4M3 recipe) selects it by itself. The format is
+  saved in `state_dict` (`nvfp4_format`); checkpoints without it load as E4M3.
+
 ## Install
 
 Nothing is downloaded during installation; install these first:
@@ -79,11 +106,13 @@ Both are regular `torch.optim.Optimizer`s: parameter groups, `lr` changes throug
   the block-scale moves, in null standard deviations, default 3) and `seed` (stochastic rounding; each
   parameter gets its own stream from its position in the optimizer). Its moments live in the layers'
   buffers, so a checkpoint needs `model.state_dict()`; `opt_qat.state_dict()` carries only step counts.
-* **`QATLinear(in, out, weight=None, init_std=0.02, four_over_six=None, grad_dtype=None, act="exact")`**:
+* **`QATLinear(in, out, weight=None, init_std=0.02, four_over_six=None, scale_dtype=None, grad_dtype=None, act="exact")`**:
   bias-free linear layer, `in` a multiple of 64. The initial weight is quantized by `nvfp4effma.quantize`
-  (1 × 16 blocks, amax global, optionally 4over6). The forward is NVFP4EffMA's GEMM on the NVFP4 tensor; the
-  backward is exact for the GEMM performed (`grad_q = gy.T @ A(x)`, `grad_x = gy @ q`). `act` is the
-  format A of the activations, as in `nvfp4effma.linear`; the backward keeps A(x), not x:
+  (1 × 16 blocks, amax global, optionally 4over6). `scale_dtype`: `"ue5m3"` (the default) or `"e4m3"`
+  (the default with `four_over_six`), see [block scales](#block-scales-ue5m3-by-default). The forward is
+  NVFP4EffMA's GEMM on the NVFP4 tensor; the backward is exact for the GEMM performed
+  (`grad_q = gy.T @ A(x)`, `grad_x = gy @ q`). `act` is the format A of the activations, as in
+  `nvfp4effma.linear`; the backward keeps A(x), not x:
 
   | `act` | A(x) | kept for backward |
   |---|---|---|
@@ -110,7 +139,7 @@ from mlops.optim import functional, reference
 
 functional.adamw(param, grad, exp_avg, exp_avg_sq, lr=1e-3, step=t, weight_decay=0.1)
 
-st = functional.QATState(w)                  # w: dense [out, in] init, not kept
+st = functional.QATState(w)                  # w: dense [out, in] init, not kept; UE5M3 scales (scale_dtype)
 y = nvfp4effma.linear(x, st.weight)          # forward on the NVFP4 tensor itself
 g8, gs = functional.fp8_grad(grad_q)         # grad_q = dL/d(st.weight.dequantize()); E5M2 + decode factor
 st.step(g8, lr=1e-3, step=t, weight_decay=0.1, grad_scale=gs)   # rewrites st.weight in place
@@ -141,8 +170,9 @@ Runnable examples to copy from, in [`samples/`](samples):
 | `03_groups_schedule_clip.py` | parameter groups, warm-up + cosine LR, global gradient clipping including FP8 gradients |
 | `04_checkpoint_resume.py` | what is saved where; resuming that is bit-identical to an uninterrupted run |
 | `05_accumulation_amp.py` | gradient accumulation, bfloat16 autocast, `act` = exact / int8 / nvfp4 |
-| `06_inference_export.py` | inference, export without optimizer state, `nvfp4effma` access, dense copy |
+| `06_inference_export.py` | inference, export without optimizer state, `nvfp4effma` access, dense copy, `to_e4m3` for Blackwell / TE |
 | `07_low_level.py` | `functional.adamw`, `QATState`, `fp8_grad`, the bit-identical PyTorch reference |
+| `08_transformer_training.py` | a 3-layer transformer with RoPE learns to sort: NVFP4 weights, FP8 gradients, 6 B instead of 16 B per weight, within a few points of the dense model; `ue5m3` for UE5M3 block scales (needs mlops-positional) |
 
 ## C / C++
 

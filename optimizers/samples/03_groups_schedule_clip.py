@@ -44,7 +44,7 @@ opt = AdamW([
 ], lr=1e-3, betas=(0.9, 0.95))
 
 # NVFP4 groups work the same way, e.g. a smaller lr for the output projection.
-# scale_z: how much evidence a 16-weight block needs before its E4M3 scale moves (default 3).
+# scale_z: how much evidence a 16-weight block needs before its scale moves (default 3).
 opt_qat = AdamWQAT([
     {"params": [model.up.weight]},
     {"params": [model.down.weight], "lr": 5e-4},

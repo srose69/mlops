@@ -7,6 +7,7 @@
                     weight + 8 per 16-weight block.
 * ``QATLinear``     bias-free linear layer with an NVFP4 weight (NVFP4EffMA's GEMM), ``QATParameter`` its handle.
 * ``split_params``  (dense, QAT) parameters of a model, for the two optimizers.
+* ``to_e4m3``       an NVFP4 weight's UE5M3 block scales as E4M3 ones, the same values (export to TE / cuBLASLt).
 * ``functional``    the kernels as functions (``adamw``, ``QATState``, ``fp8_grad``); ``reference`` the QAT step in
                     PyTorch, bit-identical to the kernel.
 
@@ -34,6 +35,7 @@ def _check_nvfp4effma():
 _check_nvfp4effma()
 
 from . import functional, reference  # noqa: E402
-from .optim import AdamW, AdamWQAT, QATLinear, QATParameter, split_params  # noqa: E402
+from .optim import AdamW, AdamWQAT, QATLinear, QATParameter, split_params, to_e4m3  # noqa: E402
 
-__all__ = ["AdamW", "AdamWQAT", "QATLinear", "QATParameter", "split_params", "functional", "reference", "__version__"]
+__all__ = ["AdamW", "AdamWQAT", "QATLinear", "QATParameter", "split_params", "to_e4m3", "functional", "reference",
+           "__version__"]

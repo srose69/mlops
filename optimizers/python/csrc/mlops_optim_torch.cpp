@@ -105,7 +105,7 @@ mlops_adamw_qat_state bind_state(const Tensor &state, int64_t rows, int64_t cols
 
 int64_t qat_state_bytes(int64_t rows, int64_t cols) { return (int64_t)mlops_adamw_qat_state_bytes((int)rows, (int)cols); }
 
-// q: w already quantized by nvfp4effma.quantize (1x16 blocks, E4M3 scales)
+// q: w already quantized by nvfp4effma.quantize (1x16 blocks, E4M3 or UE5M3 scales)
 void qat_init_quantized(Tensor w, Tensor state, Tensor q_data, Tensor q_scales, OptT q_global, int64_t q_flags,
                         int64_t q_smax) {
   const auto dev = w.device();

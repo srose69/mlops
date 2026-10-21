@@ -86,28 +86,30 @@ int main() {
   const size_t sbytes = mlops_adamw_qat_state_bytes(rows, cols);
   cudaMalloc(&sb, sbytes);
   mlops_adamw_qat_state st; mlops_adamw_qat_state_bind(sb, rows, cols, &st);
-  nvfp4a_tensor q{qd, NVFP4A_NVFP4, qs, 0, qg, nullptr, NVFP4A_GLOBAL_AMAX, 0};
-  nvfp4a_quant_config qc{}; qc.tile_rows = 1; qc.compute_amax = 1;
-  if (mlops_adamw_qat_init(rows, cols, w, MLOPS_ADAMW_FP32, &q, &qc, &st, 0) != MLOPS_ADAMW_OK) {
-    fprintf(stderr, "qat_init: %s\n", mlops_adamw_last_error()); return 1;
-  }
-  {  // positive secant accumulators everywhere (BF16 1.0): every voting block runs its scale window
-    std::vector<uint16_t> one(nb, 0x3F80);
-    cudaMemcpy(st.hnum, one.data(), nb * 2, cudaMemcpyHostToDevice);
-    cudaMemcpy(st.hden, one.data(), nb * 2, cudaMemcpyHostToDevice);
-  }
-  mlops_adamw_qat_config qcfg{};
-  qcfg.lr = 1e-3f; qcfg.beta1 = 0.9f; qcfg.beta2 = 0.999f; qcfg.eps = 1e-12f; qcfg.weight_decay = 0.1f;
-  qcfg.step = 100; qcfg.grad_scale = 1; qcfg.seed = 1;
   const double per_block = 1 /* scale */ + 2 /* s_exp */ + 4 /* cusum */ + 8 /* hnum, hden */ + 3 /* next + commit */;
-  for (mlops_adamw_dtype gdt : {MLOPS_ADAMW_FP32, MLOPS_ADAMW_E5M2}) {
-    char name[48]; snprintf(name, sizeof name, "adamw_qat grad=%s", dtn(gdt));
-    if (!bench_want(name)) continue;
-    const void *g = gdt == MLOPS_ADAMW_FP32 ? (const void *)gf : (const void *)g8;
-    qcfg.grad_scale = gdt == MLOPS_ADAMW_FP32 ? 1.0f : 1.0f / 1024;
-    // one step per call; the step number advances so the vote phase rotates as in training
-    row(name, bench.run([&] { ++qcfg.step; mlops_adamw_qat(&qcfg, rows, cols, g, gdt, &q, &st, 0); }, 100),
-        (double)n * (esz(gdt) + 2 * (2 + 1 + 1 + 1 + 0.5)) + (double)nb * per_block);
+  for (bool ue : {false, true}) {  // block scales E4M3 / UE5M3
+    nvfp4a_tensor q{qd, NVFP4A_NVFP4, qs, 0, qg, nullptr, NVFP4A_GLOBAL_AMAX | (ue ? NVFP4A_SCALES_UE5M3 : 0u), 0};
+    nvfp4a_quant_config qc{}; qc.tile_rows = 1; qc.compute_amax = 1;
+    if (mlops_adamw_qat_init(rows, cols, w, MLOPS_ADAMW_FP32, &q, &qc, &st, 0) != MLOPS_ADAMW_OK) {
+      fprintf(stderr, "qat_init: %s\n", mlops_adamw_last_error()); return 1;
+    }
+    {  // positive secant accumulators everywhere (BF16 1.0): every voting block runs its scale window
+      std::vector<uint16_t> one(nb, 0x3F80);
+      cudaMemcpy(st.hnum, one.data(), nb * 2, cudaMemcpyHostToDevice);
+      cudaMemcpy(st.hden, one.data(), nb * 2, cudaMemcpyHostToDevice);
+    }
+    mlops_adamw_qat_config qcfg{};
+    qcfg.lr = 1e-3f; qcfg.beta1 = 0.9f; qcfg.beta2 = 0.999f; qcfg.eps = 1e-12f; qcfg.weight_decay = 0.1f;
+    qcfg.step = 100; qcfg.grad_scale = 1; qcfg.seed = 1;
+    for (mlops_adamw_dtype gdt : {MLOPS_ADAMW_FP32, MLOPS_ADAMW_E5M2}) {
+      char name[64]; snprintf(name, sizeof name, "adamw_qat grad=%s scales=%s", dtn(gdt), ue ? "UE5M3" : "E4M3");
+      if (!bench_want(name)) continue;
+      const void *g = gdt == MLOPS_ADAMW_FP32 ? (const void *)gf : (const void *)g8;
+      qcfg.grad_scale = gdt == MLOPS_ADAMW_FP32 ? 1.0f : 1.0f / 1024;
+      // one step per call; the step number advances so the vote phase rotates as in training
+      row(name, bench.run([&] { ++qcfg.step; mlops_adamw_qat(&qcfg, rows, cols, g, gdt, &q, &st, 0); }, 100),
+          (double)n * (esz(gdt) + 2 * (2 + 1 + 1 + 1 + 0.5)) + (double)nb * per_block);
+    }
   }
   return 0;
 }

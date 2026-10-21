@@ -17,7 +17,7 @@ from typing import Optional, Tuple
 import torch
 
 from . import _C, reference
-from .optim import _flat, _fp8_encode, _init_qat
+from .optim import _flat, _fp8_encode, _init_qat, _scale_dtype
 
 __all__ = ["adamw", "QATState", "fp8_grad"]
 
@@ -36,16 +36,16 @@ def fp8_grad(grad: torch.Tensor, dtype: torch.dtype = torch.float8_e5m2) -> Tupl
 
 class QATState:
     """An NVFP4 weight [rows, cols] (cols a multiple of 16) and its mlops_adamw_qat state, initialized
-    from ``w`` (any dense dtype; not kept). 1x16 blocks, E4M3 scales, amax global (raised 8x at init so
-    every block scale can grow)."""
+    from ``w`` (any dense dtype; not kept). 1x16 blocks, UE5M3 or E4M3 scales (``scale_dtype``, as QATLinear's),
+    amax global (raised at init so every block scale can grow: 256x with UE5M3, 8x with E4M3)."""
 
-    def __init__(self, w: torch.Tensor, four_over_six: Optional[str] = None):
+    def __init__(self, w: torch.Tensor, four_over_six: Optional[str] = None, scale_dtype: Optional[str] = None):
         if w.dim() != 2 or w.shape[1] % 16:
             raise ValueError(f"w must be 2-D with cols a multiple of 16, got {tuple(w.shape)}")
         rows, cols = w.shape
         self.shape = (rows, cols)
         self.state = torch.zeros(_C.qat_state_bytes(rows, cols), dtype=torch.uint8, device=w.device)  # deterministic scratch
-        self.weight = _init_qat(w, self.state, four_over_six)
+        self.weight = _init_qat(w, self.state, four_over_six, _scale_dtype(scale_dtype, four_over_six))
 
     def _q(self):
         return _flat(self.weight)
@@ -63,6 +63,6 @@ class QATState:
         st = reference.carve(self.state, rows, cols)
         u = st["u"].view(rows, cols).float() * 2 ** -12
         sidx = reference.scale_index(self.weight, rows, cols // 16, u.device)
-        sigma = reference.dec_e4m3(self.weight.scales.view(torch.uint8).reshape(-1)[sidx]) * \
+        sigma = reference.dec_scale(self.weight.scales.view(torch.uint8).reshape(-1)[sidx], self.weight.ue5m3) * \
             reference.gdec_of(self.weight, rows, u.device).repeat_interleave(cols // 16)
         return reference.g_of(u) * sigma.view(rows, cols // 16).repeat_interleave(16, dim=1)

@@ -8,8 +8,9 @@
  * Lattice. E2M1 magnitudes {0, .5, 1, 1.5, 2, 3, 4, 6} are anchors at integer coordinates joined
  * by secants: g(u) is piecewise linear with slope g' = 0.5 / 1 / 2 (the 4-bit code read as an
  * integer, made continuous). Element i of block b has the master and the forward value
- *     w_i = sigma_b * g(u_i),   q_i = sigma_b * g(round(u_i)),   sigma_b = E4M3(k_b) * gdec
- * u_i a Q3.12 coordinate, k_b the block's scale byte, gdec the global decode factor (fixed).
+ *     w_i = sigma_b * g(u_i),   q_i = sigma_b * g(round(u_i)),   sigma_b = S(k_b) * gdec
+ * u_i a Q3.12 coordinate, k_b the block's scale byte, S its decode (E4M3 or UE5M3), gdec the global
+ * decode factor (fixed).
  *
  * Element step (grad = dL/dq, exact). AdamW on q in weight units, mapped to u through the Jacobian
  * J = sigma~ * g'(u); 1 / sigma~ is interpolated linearly between the neighbouring block centers along
@@ -32,7 +33,7 @@
  * H_b is used only when significant: with H = 0 the numerator is a sum of independent terms with
  * E[grad^2] = v, so its null variance is (1 - b2)/(1 + b2) (1 + b2^t)/(1 - b2^t) mean(v) EMA[sum d^2];
  * the block votes when the numerator exceeds z of those standard deviations (z = scale_z).
- * The block's preferred byte minimizes the representation loss of w* over one E4M3 octave each way,
+ * The block's preferred byte minimizes the representation loss of w* over one octave (8 codes) each way,
  *     k* = argmin_{|k - k_b| <= 8} sum_i huber(w*_i - Q_k(w*_i), delta = sigma_b)
  * and a two-sided CUSUM on the vote x = sign(k* - k_b) (0 without a significant H_b) decides the move:
  *     S <- sign(S + P x) * max(0, |S + P x| - P / 16);   |S| > h = 4 z^2  ->  k_b += sign(S), S = 0
@@ -43,10 +44,10 @@
  * for the new sigma (SR), only the representation changes; at a fixed w* the argmin never revisits the
  * byte it left, so there is no oscillation between two scales.
  *
- * Layout and limits. Rowwise NVFP4, 1x16 blocks, E4M3 block scales (linear or swizzled), global per
- * tensor or per row; no columnwise copy. q is part of the state: initialized from the initial weight
- * (mlops_adamw_qat_init_quantized / mlops_adamw_qat_init), every step rewrites its codes and scales in
- * place. cols % 16 == 0.
+ * Layout and limits. Rowwise NVFP4, 1x16 blocks, E4M3 or UE5M3 (NVFP4A_SCALES_UE5M3) block scales (linear
+ * or swizzled), global per tensor or per row; no columnwise copy. q is part of the state: initialized from
+ * the initial weight (mlops_adamw_qat_init_quantized / mlops_adamw_qat_init), every step rewrites its codes
+ * and scales in place. cols % 16 == 0.
  * Gradients E5M2 or E4M3 (decoded value times grad_scale: the per-tensor scale of an FP8 GEMM output)
  * or FP32, 16-byte aligned, finite (FP8 Inf / NaN codes decode as Inf / NaN from sm_89 on, as large
  * finite values below: outside the contract). Every architecture sm_50..sm_90 computes the same bits.
@@ -89,10 +90,13 @@ size_t mlops_adamw_qat_state_bytes(int rows, int cols);
 mlops_adamw_status mlops_adamw_qat_state_bind(void *buffer, int rows, int cols, mlops_adamw_qat_state *st);
 
 /* Initial state from the initial weight w (rows x cols, BF16/FP16/FP32) and q, w already quantized into
- * it by NVFP4EffMA (1x16 blocks, E4M3 scales; e.g. nvfp4a_quantize_ex, nvfp4effma.quantize in Python):
- * sets u_i = g^-1(w_i / sigma_b) (RNE to Q3.12) and zeroes the rest of the state. The global is then
- * raised 2^3 and every block byte lowered 24 codes (exact for normals), so every block scale can grow 8x.
- * Without a global (global_scale NULL) blocks at the E4M3 maximum stay pinned there. w is not needed
+ * it by NVFP4EffMA (1x16 blocks, E4M3 or UE5M3 scales; e.g. nvfp4a_quantize_ex, nvfp4effma.quantize in
+ * Python): sets u_i = g^-1(w_i / sigma_b) (RNE to Q3.12) and zeroes the rest of the state. The global is
+ * then raised 2^H and every block byte lowered 8 H codes (exact for normals), so every block scale can grow
+ * 2^H: H = 3 with E4M3 scales (2^-9 .. 448), 8 with UE5M3 (2^-17 .. 114688, 23 binades left below the
+ * largest block). While no E4M3 scale would leave its range the two train bit-identically (same values,
+ * moments and codes; the bytes differ by a constant). Without a global (global_scale NULL) blocks at the
+ * format's maximum stay pinned there. w is not needed
  * afterwards. Needs no NVFP4EffMA code at link time. */
 mlops_adamw_status mlops_adamw_qat_init_quantized(int rows, int cols, const void *w, mlops_adamw_dtype w_dtype,
                                                   const nvfp4a_tensor *q, const mlops_adamw_qat_state *st,

@@ -9,12 +9,15 @@
   usable with nvfp4effma.linear directly, without mlops.optim.
 * For deployment you only need codes, scales and amax; the optimizer state (`qat_state`) can be dropped.
 * .dequantize() gives the exact dense weight the model computes with, e.g. to build a plain nn.Linear.
+* to_e4m3: the weights with E4M3 block scales, the same values bit for bit -- the NVFP4 that Transformer
+  Engine, cuBLASLt's FP4 GEMM on Blackwell and ModelOpt read. If training spread a weight's scales wider than
+  E4M3 spans, it stays UE5M3 (with a warning): check .ue5m3.
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mlops.optim import AdamWQAT, QATLinear, split_params
+from mlops.optim import AdamWQAT, QATLinear, split_params, to_e4m3
 import nvfp4effma
 
 torch.manual_seed(0)
@@ -58,3 +61,10 @@ with torch.no_grad():
     y_dense = dense_model(x)
 rel = ((y_dense - y).norm() / y.norm()).item()
 print(f"dense copy vs NVFP4 model: relative difference {rel:.1e} (float32 summation order only)")
+
+# 4. E4M3 block scales for Blackwell's native NVFP4 (Transformer Engine, cuBLASLt, ModelOpt): the layers train
+#    with UE5M3 scales; to_e4m3 moves each scale and the global by one power of two, exact -- or, if the scales
+#    no longer fit E4M3, returns the weight unchanged (still UE5M3) and warns.
+q8 = to_e4m3(lin.nvfp4_weight())
+same = torch.equal(q8.dequantize(torch.float32), lin.nvfp4_weight().dequantize(torch.float32))
+print(f"to_e4m3: {q8}; E4M3: {not q8.ue5m3}; same weight: {same}")

@@ -3,7 +3,7 @@
 """PyTorch reference of mlops_adamw_qat (include/mlops_adamw_qat.h, adamw/src/adamw_qat_kernels.cuh).
 
 It steps the same objects the CUDA kernel steps -- an ``nvfp4effma.NVFP4Tensor`` (rowwise, 1x16 blocks,
-E4M3 scales, linear or swizzled, amax or decode global) and the uint8 state buffer of
+E4M3 or UE5M3 scales, linear or swizzled, amax or decode global) and the uint8 state buffer of
 ``mlops.optim.functional.QATState`` -- in the same arithmetic order, with the same stochastic-rounding stream, so the
 two can be swapped on one state. FMA is emulated in float64 (a rare double rounding differs in the last
 bit). Readable rather than fast: one tensor per quantity, the kernel's per-thread loops written out.
@@ -67,6 +67,21 @@ def step_key(seed: int, step: int) -> int:
 # ---- formats ---------------------------------------------------------------------------------------------
 def dec_e4m3(b):
     return b.to(torch.uint8).view(torch.float8_e4m3fn).float()
+
+
+def dec_ue5m3(b):
+    """UE5M3 byte (unsigned, 5 exponent bits, bias 15, 3 mantissa bits) -> exact float32: b << 20 is the value
+    times 2^-112 in float32 (subnormals included)."""
+    return flt((b.long() & 0xFF) << 20) * 2.0 ** 112
+
+
+def dec_scale(b, ue5m3: bool):
+    return dec_ue5m3(b) if ue5m3 else dec_e4m3(b)
+
+
+def max_code(ue5m3: bool) -> int:
+    """The largest finite block-scale code: E4M3 0x7E (448), UE5M3 0xFE (114688)."""
+    return 0xFE if ue5m3 else 0x7E
 
 
 def dec_e5m2(b):
@@ -200,7 +215,7 @@ def gdec_of(q, rows: int, dev) -> torch.Tensor:
     g = (g if g.numel() > 1 else g.expand(rows)).float()
     if not q.global_is_amax:
         return g
-    smax = float(q.scale_max or 448)
+    smax = float(q.scale_max or (114688 if q.ue5m3 else 448))
     s_enc = torch.clamp(_f(smax * 6.0, dev) / g, max=3.4028234663852886e38)
     return torch.where((g == 0) | (s_enc == 0), torch.ones_like(g), 1.0 / s_enc)
 
@@ -235,16 +250,17 @@ def step(q, state: torch.Tensor, grad: torch.Tensor, lr: float, step: int, betas
     # lattice
     sidx = scale_index(q, rows, nb, dev)
     scales = q.scales.view(torch.uint8).reshape(-1)
+    dec, top = (lambda c: dec_scale(c, q.ue5m3)), max_code(q.ue5m3)
     row = torch.arange(rows, device=dev).repeat_interleave(nb)
     bcol = torch.arange(nb, device=dev).repeat(rows)
     gd = gdec_of(q, rows, dev)[row]                                       # [nblk]
     kb = scales[sidx].long()
-    sm = dec_e4m3(kb)
+    sm = dec(kb)
     sigma = sm * gd
     left = scales[scale_index(q, rows, nb, dev).view(rows, nb)[row, (bcol - 1).clamp(min=0)]].long()
     right = scales[scale_index(q, rows, nb, dev).view(rows, nb)[row, (bcol + 1).clamp(max=nb - 1)]].long()
     im = 1.0 / sigma
-    i_left, i_right = 1.0 / (dec_e4m3(left) * gd), 1.0 / (dec_e4m3(right) * gd)
+    i_left, i_right = 1.0 / (dec(left) * gd), 1.0 / (dec(right) * gd)
 
     # element state, [nblk, 16]
     data = q.data.reshape(-1)
@@ -315,8 +331,8 @@ def step(q, state: torch.Tensor, grad: torch.Tensor, lr: float, step: int, betas
     best = torch.full((nblk,), float("inf"), device=dev)
     kbest = kb.clone()
     for o in range(-8, 9):
-        c = (kb + o).clamp(1, 126)
-        sc = dec_e4m3(c) * gd
+        c = (kb + o).clamp(1, top)
+        sc = dec(c) * gd
         isc = 1.0 / sc
         dl = sigma * isc
         a = ws * isc[:, None]
@@ -333,7 +349,7 @@ def step(q, state: torch.Tensor, grad: torch.Tensor, lr: float, step: int, betas
     mag = S.abs() - 16 * period
     S = torch.where(mag > 0, torch.sign(S) * mag, torch.zeros_like(S))
     move = votes & (S.abs() > hq)
-    kn = torch.where(move, (kb + torch.sign(S)).clamp(1, 126), kb)
+    kn = torch.where(move, (kb + torch.sign(S)).clamp(1, top), kb)
     S = torch.where(move, torch.zeros_like(S), S)
     st["cusum"].copy_(torch.where(votes, S, st["cusum"].long()).to(torch.int16))
     st["next"].copy_(torch.where(votes, kn, st["next"].long()).to(torch.uint8))
@@ -348,7 +364,7 @@ def step(q, state: torch.Tensor, grad: torch.Tensor, lr: float, step: int, betas
 
     # a move keeps the master values
     moved = (kn != kb)[:, None]
-    ratio = (sm / dec_e4m3(kn))[:, None]
+    ratio = (sm / dec(kn))[:, None]
     uf = torch.where(moved, g_inv(g_of(uf) * ratio), uf)
     qb = torch.where(moved, qb * ratio, qb)
     un = sr_fixed(uf, 4096.0, -32768.0, 32767.0, Uu)

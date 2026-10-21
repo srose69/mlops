@@ -21,10 +21,11 @@ HDRS      = include/mlops_optimizers.h include/mlops_adamw.h include/mlops_adamw
 ADAMW_H   = $(HDRS) adamw/src/adamw_kernels.cuh
 QAT_H     = $(HDRS) adamw/src/adamw_qat_kernels.cuh adamw/src/qat_codec.cuh
 # one object per kernel instance so the build runs in parallel: AdamW per (param, grad) dtype pair (codes
-# BF16 0, FP16 1, FP32 2), the QAT step per gradient type (FP32 2, E4M3 3, E5M2 4); adamw_qat_init.o holds
+# BF16 0, FP16 1, FP32 2), the QAT step per gradient type (FP32 2, E4M3 3, E5M2 4) x block-scale type (E4M3 0,
+# UE5M3 1); adamw_qat_init.o holds
 # the only reference to NVFP4EffMA's library, so a static link takes it only into programs that call it
 DT    = 0 1 2
-INST  = $(foreach p,$(DT),$(foreach g,$(DT),adamw_inst_$(p)_$(g))) $(foreach g,2 3 4,adamw_qat_inst_$(g))
+INST  = $(foreach p,$(DT),$(foreach g,$(DT),adamw_inst_$(p)_$(g))) $(foreach g,2 3 4,$(foreach u,0 1,adamw_qat_inst_$(g)_$(u)))
 OBJS  = adamw adamw_qat adamw_qat_init $(INST)
 NVCC_THREADS := $(shell t=$$(( $(JOBS) / $(words $(OBJS)) )); [ $$t -lt 1 ] && t=1; a=$(words $(ARCHS)); [ $$t -gt $$a ] && t=$$a; echo $$t)
 word_ = $(word $(1),$(subst _, ,$(2)))
@@ -43,7 +44,7 @@ $(1)/adamw_qat.o: adamw/src/adamw_qat.cu $(QAT_H) | $(1)
 $(1)/adamw_qat_init.o: adamw/src/adamw_qat_init.cu $(QAT_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) $$(call dep_inc,$(3)) -c -o $$@ $$<
 $(1)/adamw_qat_inst_%.o: adamw/src/adamw_qat_inst.cu $(QAT_H) | $(1)
-	$(NVCC) $(FLAGS) $(2) $$(call dep_inc,$(3)) -DMLOPS_QAT_GT=$$* -c -o $$@ $$<
+	$(NVCC) $(FLAGS) $(2) $$(call dep_inc,$(3)) -DMLOPS_QAT_GT=$$(call word_,1,$$*) -DMLOPS_QAT_UE=$$(call word_,2,$$*) -c -o $$@ $$<
 $(1)/libmlops_optimizers.a: $(foreach o,$(OBJS),$(1)/$(o).o)
 	rm -f $$@ && ar rcs $$@ $$^
 $(1):

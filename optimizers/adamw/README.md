@@ -149,8 +149,15 @@ representation changes. At a fixed `w*` the argmin never returns to a byte it le
 oscillate between two scales.
 
 **Initialization** quantizes the dense initial weight with amax scaling (`nvfp4a_quantize_ex`), then
-raises the global 8x and lowers every block byte by 24 codes (exact for normals): the same values, but no
-block starts pinned at the top of E4M3.
+raises the global `2^H` and lowers every block byte by `8 H` codes (exact for normals): the same values, but
+no block starts pinned at the top of its scale format. With E4M3 scales (`2^-9 .. 448`) `H = 3`: a block
+scale can grow 8x, then it stays at 448 and the block's largest weights saturate. With UE5M3 scales
+(unsigned, `2^-17 .. 114688`, `NVFP4A_SCALES_UE5M3`) `H = 8`: 256x of growth with 23 binades still below the
+largest block. That is the room Graphcore's UE5M3 recipe ([arXiv:2609.02846](https://arxiv.org/abs/2609.02846))
+gets from a tensor scale refreshed every 50 steps; here no amax is ever recomputed. While no E4M3 scale
+would leave its range, both formats train bit-identically (same values, moments and codes; the scale bytes
+differ by a constant). `make qat` checks the difference: when the weights grow 32x, every UE5M3 block follows
+them exactly, while about a third of the E4M3 blocks stop at the top with 18% error.
 
 ### State
 
@@ -220,6 +227,10 @@ after a boost warm-up (`make bench`):
 | `mlops_adamw` FP32 + NVFP4 re-quantization (0.56 ms) | 2.22 ms | | |
 | `mlops_adamw_qat`, E5M2 grad | 1.33 ms | 13.1 | 166 GB/s (52%) |
 | `mlops_adamw_qat`, FP32 grad | 1.34 ms | 16.1 | 202 GB/s (63%) |
+| `mlops_adamw_qat`, UE5M3 scales, E5M2 / FP32 grad | 1.30 / 1.33 ms | 13.1 / 16.1 | 169 / 203 GB/s |
+
+UE5M3 scales cost nothing: their decode has no sign bit to handle (the step kernel is 6 SASS instructions
+shorter), 0.5-1% faster on the GTX 1080 and the Tesla P4 alike.
 
 Against the NVFP4 baseline it replaces (AdamW on an FP32 master plus re-quantization) the QAT step is
 1.67x faster; against plain BF16 AdamW it is on par while moving 40% fewer bytes. On the GTX 1080 it is not
@@ -246,7 +257,7 @@ half the memory, QAT trains as well as an FP32 master here. Activations enter th
 
 ### Limits
 
-* Rowwise NVFP4 with 1x16 blocks and E4M3 scales (linear or swizzled), global per tensor or per row; no
+* Rowwise NVFP4 with 1x16 blocks and E4M3 or UE5M3 scales (linear or swizzled), global per tensor or per row; no
   columnwise copy (a backward that needs `W^T` dequantizes or transposes).
 * The scale of a block whose curvature never becomes significant stays where initialization put it.
 * Under pure-noise gradients about 1% of the block scales move in 2000 steps (`make qat`).
@@ -257,7 +268,7 @@ half the memory, QAT trains as well as an FP32 master here. Activations enter th
 |---|---|
 | `../include/mlops_adamw.h`, `../include/mlops_adamw_qat.h` | C API, the exact order of operations |
 | `src/adamw_kernels.cuh`, `src/adamw_inst.cu`, `src/adamw.cu` | AdamW kernel, its 9 (param, grad) dtype instances, host side |
-| `src/adamw_qat_kernels.cuh`, `src/adamw_qat_inst.cu`, `src/adamw_qat.cu` | QAT step kernel, its 3 gradient-type instances, host side (state, init, scale commit) |
+| `src/adamw_qat_kernels.cuh`, `src/adamw_qat_inst.cu`, `src/adamw_qat.cu` | QAT step kernel, its 6 instances (gradient type x scale format), host side (state, init, scale commit) |
 | `src/adamw_qat_init.cu` | `mlops_adamw_qat_init`: NVFP4EffMA's quantization + init (the only code that links NVFP4EffMA) |
 | `src/qat_codec.cuh` | SR encodes, secant maps, Quake rsqrt, uniforms, the FP8 codec selection |
 | `tests/`, `bench/` | `make test`, `make qat`, `make bench` (in `optimizers/`) |

@@ -12,8 +12,6 @@ namespace mlops_qat_detail {
 mlops_adamw_status make_lattice(const nvfp4a_tensor *q, int rows, int cols, Lattice *L) {
   if (!q || !q->data || !q->block_scale)
     return MLOPS_ADAMW_FAIL(MLOPS_ADAMW_INVALID_VALUE, "mlops_adamw_qat: q (data, block_scale) is required");
-  if (q->flags & NVFP4A_SCALES_UE5M3)
-    return MLOPS_ADAMW_FAIL(MLOPS_ADAMW_INVALID_VALUE, "mlops_adamw_qat: block scales must be E4M3 (the scale lattice is E4M3's)");
   if (rows <= 0 || cols <= 0 || cols % kB)
     return MLOPS_ADAMW_FAIL(MLOPS_ADAMW_INVALID_VALUE, "mlops_adamw_qat: rows > 0 and cols a positive multiple of 16 required");
   L->rows = rows; L->nb = cols / kB; L->by_nb = Divisor::of((uint32_t)L->nb);
@@ -26,7 +24,7 @@ mlops_adamw_status make_lattice(const nvfp4a_tensor *q, int rows, int cols, Latt
   L->global = q->global_scale;
   L->amax_global = q->flags & NVFP4A_GLOBAL_AMAX;
   L->per_row = q->flags & NVFP4A_GLOBAL_PER_ROW;
-  L->scale_max = q->scale_max ? (float)q->scale_max : 448.0f;
+  L->scale_max = q->scale_max ? (float)q->scale_max : (q->flags & NVFP4A_SCALES_UE5M3) ? 114688.0f : 448.0f;
   return MLOPS_ADAMW_OK_();
 }
 
@@ -43,19 +41,23 @@ __global__ void qat_commit_scales(Lattice L, Hyper h, const uint8_t *__restrict_
   if (blk < L.rows * L.nb && votes(h, blk)) L.scale[L.sidx(blk / L.nb, blk % L.nb)] = next[blk];
 }
 
-// Headroom: amax scaling puts the tensor's largest block scale at the top of E4M3, where it could
-// never grow. Init moves the global up by 2^kHead and every block byte down by 8 * kHead codes (one
-// binade = 8 E4M3 codes, exact for normals), so values are unchanged and every block can grow 2^kHead.
-constexpr int kHead = 3;
+// Headroom: amax scaling puts the tensor's largest block scale at the top of the scale format, where it
+// could never grow. Init moves the global up by 2^kHead and every block byte down by 8 * kHead codes (one
+// binade = 8 codes in both formats, exact for normals), so values are unchanged and every block can grow
+// 2^kHead. E4M3 (2^-9 .. 448) affords 2^3; UE5M3's 31 binades (2^-17 .. 114688) afford 2^8 -- the room
+// Graphcore's UE5M3 recipe gets from a tensor scale refreshed only every 50 steps -- while keeping 23
+// binades below the largest block.
+template <bool UE> constexpr int kHead = UE ? 8 : 3;
 
+template <bool UE>
 __global__ void qat_init_kernel(Lattice L, const void *__restrict__ w, mlops_adamw_dtype wdt, mlops_adamw_qat_state st) {
   const int blk = blockIdx.x * blockDim.x + threadIdx.x;
   if (blk >= L.rows * L.nb) return;
   const int r = blk / L.nb, b = blk % L.nb;
   const size_t e0 = (size_t)blk * kB;
-  const float sv = mul(nvfp4a::e4m3_value(L.scale[L.sidx(r, b)]), pow2(-kHead));  // same sigma under the moved global
-  const uint32_t byte = max(1u, nvfp4a::f32_to_e4m3(sv));
-  const float sigma = mul(mul(nvfp4a::e4m3_value(byte), L.gdec(r)), pow2(kHead));
+  const float sv = mul(nvfp4a::scale_val<UE>(L.scale[L.sidx(r, b)]), pow2(-kHead<UE>));  // same sigma, moved global
+  const uint32_t byte = max(1u, UE ? nvfp4a::f32_to_ue5m3(sv) : nvfp4a::f32_to_e4m3(sv));
+  const float sigma = mul(mul(nvfp4a::scale_val<UE>(byte), L.gdec(r)), pow2(kHead<UE>));
   uint32_t lo = 0, hi = 0;
   for (int j = 0; j < kB; ++j) {
     const float un = fminf(fmaxf(roundf(mul(g_inv(__fdiv_rn(mlops_adamw_load_f32(w, wdt, e0 + j), sigma)), 4096.0f)),
@@ -78,9 +80,10 @@ __global__ void qat_gdec(Lattice L, float *__restrict__ out, int n) {
   if (i < n) out[i] = L.gdec(i);
 }
 
+template <bool UE>
 __global__ void qat_init_global(float *global, int n) {  // after qat_init_kernel has read it
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) global[i] = __fmul_rn(global[i], (float)(1 << kHead));
+  if (i < n) global[i] = __fmul_rn(global[i], (float)(1 << kHead<UE>));
 }
 
 size_t align16(size_t n) { return (n + 15) & ~(size_t)15; }
@@ -120,11 +123,14 @@ extern "C" mlops_adamw_status mlops_adamw_qat_init_quantized(int rows, int cols,
   if (!w || !st) return MLOPS_ADAMW_FAIL(MLOPS_ADAMW_INVALID_VALUE, "mlops_adamw_qat_init_quantized: null argument");
   if (w_dtype != MLOPS_ADAMW_BF16 && w_dtype != MLOPS_ADAMW_FP16 && w_dtype != MLOPS_ADAMW_FP32)
     return MLOPS_ADAMW_FAIL(MLOPS_ADAMW_INVALID_VALUE, "mlops_adamw_qat_init_quantized: w must be BF16, FP16 or FP32");
-  const int nblk = rows * (cols / kB);
-  qat_init_kernel<<<(nblk + 127) / 128, 128, 0, stream>>>(L, w, w_dtype, *st);
-  if (q->global_scale) {
-    const int ng = L.per_row ? rows : 1;
-    qat_init_global<<<(ng + 255) / 256, 256, 0, stream>>>(const_cast<float *>(q->global_scale), ng);
+  const int nblk = rows * (cols / kB), ng = L.per_row ? rows : 1;
+  float *global = const_cast<float *>(q->global_scale);
+  if (q->flags & NVFP4A_SCALES_UE5M3) {
+    qat_init_kernel<true><<<(nblk + 127) / 128, 128, 0, stream>>>(L, w, w_dtype, *st);
+    if (global) qat_init_global<true><<<(ng + 255) / 256, 256, 0, stream>>>(global, ng);
+  } else {
+    qat_init_kernel<false><<<(nblk + 127) / 128, 128, 0, stream>>>(L, w, w_dtype, *st);
+    if (global) qat_init_global<false><<<(ng + 255) / 256, 256, 0, stream>>>(global, ng);
   }
   MLOPS_ADAMW_CUDA_CHECK(cudaGetLastError());
   return MLOPS_ADAMW_OK_();
@@ -162,10 +168,11 @@ extern "C" mlops_adamw_status mlops_adamw_qat(const mlops_adamw_qat_config *cfg,
   const int nblk = rows * (cols / kB);
   const int grid = (int)(((size_t)nblk * 4 + 255) / 256), ng = L.per_row ? rows : 1;
   qat_gdec<<<(ng + 255) / 256, 256, 0, stream>>>(L, st->gdec, ng);
+  const bool ue = q->flags & NVFP4A_SCALES_UE5M3;
   switch (grad_dtype) {
-    case MLOPS_ADAMW_E5M2: launch_step<MLOPS_ADAMW_E5M2>(L, h, grad, *st, grid, stream); break;
-    case MLOPS_ADAMW_E4M3: launch_step<MLOPS_ADAMW_E4M3>(L, h, grad, *st, grid, stream); break;
-    default: launch_step<MLOPS_ADAMW_FP32>(L, h, grad, *st, grid, stream); break;
+    case MLOPS_ADAMW_E5M2: (ue ? launch_step<MLOPS_ADAMW_E5M2, true> : launch_step<MLOPS_ADAMW_E5M2, false>)(L, h, grad, *st, grid, stream); break;
+    case MLOPS_ADAMW_E4M3: (ue ? launch_step<MLOPS_ADAMW_E4M3, true> : launch_step<MLOPS_ADAMW_E4M3, false>)(L, h, grad, *st, grid, stream); break;
+    default: (ue ? launch_step<MLOPS_ADAMW_FP32, true> : launch_step<MLOPS_ADAMW_FP32, false>)(L, h, grad, *st, grid, stream); break;
   }
   qat_commit_scales<<<(nblk + 255) / 256, 256, 0, stream>>>(L, h, st->next);
   MLOPS_ADAMW_CUDA_CHECK(cudaGetLastError());

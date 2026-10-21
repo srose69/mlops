@@ -4,13 +4,15 @@
  *   1. codecs: SR into E4M3 / E5M2 (E[s^2] = v) / BF16 / fixed point is unbiased, the Quake rsqrt stays
  *      within 6.5e-4, e2m1_round agrees with NVFP4EffMA's f32_to_e2m1 on every 7th float in [0, 8).
  *   2. one step vs an independent double-precision reference of include/mlops_adamw_qat.h, linear and
- *      swizzled scales: every stored s, r is one of the two SR neighbours of the exact value, u and qbar
- *      are within one quantum, code == round(u), the secant accumulators are BF16 neighbours, voting
- *      blocks update the CUSUM and move exactly as the reference (a move keeps the master values),
- *      silent blocks keep their CUSUM and scale.
- *   3. behaviour over many steps: pure-noise gradients leave the block scales put; blocks whose optimum
- *      is exactly representable 3 E4M3 codes up find that scale; a constant gradient walks one element
- *      down its cells at lr / cell width per step.
+ *      swizzled scales, E4M3 and UE5M3 scales: every stored s, r is one of the two SR neighbours of the
+ *      exact value, u and qbar are within one quantum, code == round(u), the secant accumulators are BF16
+ *      neighbours, voting blocks update the CUSUM and move exactly as the reference (a move keeps the
+ *      master values), silent blocks keep their CUSUM and scale.
+ *   3. behaviour over many steps, with E4M3 and with UE5M3 scales: pure-noise gradients leave the block
+ *      scales put; blocks whose optimum is exactly representable 3 codes up find that scale; a constant
+ *      gradient walks one element down its cells at lr / cell width per step.
+ *   4. headroom: weights growing 32x -- every UE5M3 block follows exactly; E4M3 blocks that fit follow,
+ *      the others settle at their vote's optimum within E4M3.
  */
 #include "mlops_adamw_qat.h"
 #include "../src/qat_codec.cuh"
@@ -38,6 +40,10 @@ static double e5m2(uint32_t b) {
   const uint32_t e = (b >> 2) & 31u, m = b & 3u;
   const double v = e ? ldexp(1 + m / 4.0, (int)e - 15) : ldexp(m, -16);
   return (b & 0x80u) ? -v : v;
+}
+static double ue5m3(uint32_t b) {  // unsigned, 5 exponent bits (bias 15), 3 mantissa bits
+  const uint32_t e = (b >> 3) & 31u, m = b & 7u;
+  return e ? ldexp(1 + m / 8.0, (int)e - 15) : ldexp(m, -17);
 }
 static double e2m1(uint32_t n) { static const double t[8] = {0, .5, 1, 1.5, 2, 3, 4, 6}; return (n & 8u) ? -t[n & 7u] : t[n & 7u]; }
 static double gof(double u) { const double a = fabs(u); return copysign(a < 4 ? a / 2 : a < 6 ? a - 2 : 2 * a - 8, u); }
@@ -107,15 +113,16 @@ static int test_codecs() {
 
 // ---- device helpers --------------------------------------------------------------------------------
 struct Q {
-  int rows, cols, nb; bool swz; size_t sbytes;
+  int rows, cols, nb; bool swz, ue; size_t sbytes;
   uint8_t *data, *sc; float *g; void *state; mlops_adamw_qat_state st; nvfp4a_tensor t;
-  Q(int r, int c, bool swizzled) : rows(r), cols(c), nb(c / 16), swz(swizzled) {
+  Q(int r, int c, bool swizzled, bool ue5m3) : rows(r), cols(c), nb(c / 16), swz(swizzled), ue(ue5m3) {
     sbytes = swz ? (size_t)((rows + 127) / 128) * (((nb + 3) / 4 * 4) / 4) * 512 : (size_t)rows * nb;
     CK(cudaMalloc(&data, (size_t)rows * cols / 2)); CK(cudaMalloc(&sc, sbytes)); CK(cudaMemset(sc, 0, sbytes));
     CK(cudaMalloc(&g, 4)); CK(cudaMemset(g, 0, 4));
     CK(cudaMalloc(&state, mlops_adamw_qat_state_bytes(rows, cols)));
     ST(mlops_adamw_qat_state_bind(state, rows, cols, &st));
-    t = {data, NVFP4A_NVFP4, sc, 0, g, nullptr, NVFP4A_GLOBAL_AMAX | (swz ? NVFP4A_SCALES_SWIZZLED : 0u), 0};
+    t = {data, NVFP4A_NVFP4, sc, 0, g, nullptr,
+         NVFP4A_GLOBAL_AMAX | (swz ? NVFP4A_SCALES_SWIZZLED : 0u) | (ue ? NVFP4A_SCALES_UE5M3 : 0u), 0};
   }
   ~Q() { cudaFree(data); cudaFree(sc); cudaFree(g); cudaFree(state); }
   size_t sidx(int r, int b) const {
@@ -130,8 +137,10 @@ struct Q {
   }
   double gdec() const {
     float amax; CK(cudaMemcpy(&amax, g, 4, cudaMemcpyDeviceToHost));
-    return 1.0 / (double)std::min(448.0f * 6.0f / amax, 3.40282347e38f);
+    return 1.0 / (double)std::min((ue ? 114688.0f : 448.0f) * 6.0f / amax, 3.40282347e38f);
   }
+  double sdec(uint32_t b) const { return ue ? ue5m3(b) : e4m3(b); }  // a block-scale byte
+  int maxcode() const { return ue ? 0xFE : 0x7E; }
 };
 template <class T> static std::vector<T> down(const T *p, size_t n) { std::vector<T> h(n); CK(cudaMemcpy(h.data(), p, n * sizeof(T), cudaMemcpyDeviceToHost)); return h; }
 template <class T> static void up(T *p, const std::vector<T> &h) { CK(cudaMemcpy(p, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice)); }
@@ -149,10 +158,10 @@ static bool sr_ok(double got, double x, double (*dec)(uint32_t), int ncodes, dou
 }
 
 // ---- 2. one step vs double reference ----------------------------------------------------------------
-static int test_reference(bool swz) {
+static int test_reference(bool swz, bool ue) {
   const int rows = 8, cols = 1024, n = rows * cols, nb = cols / 16, nblk = rows * nb;
-  Q q(rows, cols, swz);
-  std::mt19937 rng(swz ? 21 : 20); std::normal_distribution<float> N(0, 1); std::uniform_real_distribution<float> U(0, 1);
+  Q q(rows, cols, swz, ue);
+  std::mt19937 rng((swz ? 21 : 20) + (ue ? 10 : 0)); std::normal_distribution<float> N(0, 1); std::uniform_real_distribution<float> U(0, 1);
   std::vector<float> w(n); for (auto &x : w) x = 0.02f * N(rng);
   q.init(w);
   // a nontrivial state: random moments and qbar, positive secant accumulators on most blocks (every 7th
@@ -195,8 +204,8 @@ static int test_reference(bool swz) {
       const int blk = rr * nb + b;
       const bool votes = (17 + blk / 64) % P == 0;
       const uint32_t kb = sc0[q.sidx(rr, b)];
-      const double sm = e4m3(kb), sigma = sm * gdec;
-      const double sl = e4m3(sc0[q.sidx(rr, std::max(b - 1, 0))]), sr_ = e4m3(sc0[q.sidx(rr, std::min(b + 1, nb - 1))]);
+      const double sm = q.sdec(kb), sigma = sm * gdec;
+      const double sl = q.sdec(sc0[q.sidx(rr, std::max(b - 1, 0))]), sr_ = q.sdec(sc0[q.sidx(rr, std::min(b + 1, nb - 1))]);
       double sum_ed = 0, sum_dd = 0, sum_v = 0, xmax = 0;
       double v[16], x[16], rn[16], uf[16], qbn[16];
       for (int j = 0; j < 16; j++) {
@@ -247,9 +256,9 @@ static int test_reference(bool swz) {
           voted++;
           double best = 1e300, second = 1e300; int kbest = (int)kb;
           for (int o = -8; o <= 8; o++) {
-            const int c = std::min(126, std::max(1, (int)kb + o));
-            if (o > -8 && c == std::min(126, std::max(1, (int)kb + o - 1))) continue;  // clamped repeat
-            const double sc = e4m3(c) * gdec;
+            const int c = std::min(q.maxcode(), std::max(1, (int)kb + o));
+            if (o > -8 && c == std::min(q.maxcode(), std::max(1, (int)kb + o - 1))) continue;  // clamped repeat
+            const double sc = q.sdec(c) * gdec;
             double D = 0;
             for (int j = 0; j < 16; j++) {
               const double ws = fabs((qbn[j] * sigma - rn[j] * x[j] * den / num) * rbc1);
@@ -264,13 +273,13 @@ static int test_reference(bool swz) {
         int S = cus[blk] + 256 * P * vote;
         const int mag = abs(S) - 16 * P;
         S = mag > 0 ? (S > 0 ? mag : -mag) : 0;
-        if (abs(S) > hq) { kn = (uint32_t)std::min(126, std::max(1, (int)kb + (S > 0 ? 1 : -1))); S = 0; }
+        if (abs(S) > hq) { kn = (uint32_t)std::min(q.maxcode(), std::max(1, (int)kb + (S > 0 ? 1 : -1))); S = 0; }
         if (check_scale && cus1[blk] != S) { bad_scale++; printf("  blk %d: cusum %d, ref %d\n", blk, cus1[blk], S); }
       } else if (cus1[blk] != cus[blk]) { bad_scale++; printf("  blk %d: silent block's cusum changed\n", blk); }
       if (check_scale && sc1[q.sidx(rr, b)] != kn) { bad_scale++; printf("  blk %d: byte %u, ref %u\n", blk, sc1[q.sidx(rr, b)], kn); }
       const uint32_t kgot = sc1[q.sidx(rr, b)];
       if (kgot != kb) moved++;
-      const double ratio = sm / e4m3(kgot);
+      const double ratio = sm / q.sdec(kgot);
       for (int j = 0; j < 16; j++) {
         const int i = blk * 16 + j;
         const double ue = kgot != kb ? ginv(gof(uf[j]) * ratio) : uf[j], qe = qbn[j] * ratio;
@@ -286,15 +295,16 @@ static int test_reference(bool swz) {
       }
     }
   char msg[300];
-  snprintf(msg, sizeof msg, "%s scales: one step vs double reference -- bad s %d, r %d, u %d, qbar %d, code %d, secant %d, "
+  snprintf(msg, sizeof msg, "%s %s scales: one step vs double reference -- bad s %d, r %d, u %d, qbar %d, code %d, secant %d, "
            "scale %d (%d el / %d blocks; %d voted, %d moved, %d near-ties skipped)",
-           swz ? "swizzled" : "linear  ", bad_s, bad_r, bad_u, bad_qb, bad_code, bad_h, bad_scale, n, nblk, voted, moved, ties);
+           ue ? "UE5M3" : "E4M3 ", swz ? "swizzled" : "linear  ", bad_s, bad_r, bad_u, bad_qb, bad_code, bad_h, bad_scale, n, nblk, voted, moved, ties);
   cudaFree(dg);
   return report(!bad_s && !bad_r && !bad_u && !bad_qb && !bad_code && !bad_h && !bad_scale && voted > 16 && moved > 0, msg);
 }
 
 // ---- 3. behaviour over many steps ------------------------------------------------------------------
-static int test_behaviour() {
+static int test_behaviour(bool ue) {
+  const char *fmt = ue ? "UE5M3" : "E4M3 ";
   int f = 0;
   const int rows = 64, cols = 256, n = rows * cols, nblk = n / 16;
   std::mt19937 rng(5); std::normal_distribution<float> N(0, 1); std::uniform_int_distribution<int> C(0, 15);
@@ -302,7 +312,7 @@ static int test_behaviour() {
   float *dg; CK(cudaMalloc(&dg, n * 4));
   mlops_adamw_qat_config cfg{}; cfg.lr = 3e-4f; cfg.beta1 = 0.9f; cfg.beta2 = 0.999f; cfg.eps = 1e-12f; cfg.grad_scale = 1; cfg.seed = 1;
   {  // pure noise
-    Q q(rows, cols, false); q.init(w);
+    Q q(rows, cols, false, ue); q.init(w);
     const auto s0 = down(q.sc, q.sbytes);
     std::vector<float> g(n);
     for (int t = 1; t <= 2000; t++) {
@@ -311,35 +321,35 @@ static int test_behaviour() {
     }
     const auto s1 = down(q.sc, q.sbytes); int changed = 0;
     for (size_t i = 0; i < s0.size(); i++) changed += s0[i] != s1[i];
-    char m[160]; snprintf(m, sizeof m, "pure-noise gradients, 2000 steps: %d of %d block scales changed (want <= 1%%)", changed, nblk);
+    char m[160]; snprintf(m, sizeof m, "%s pure-noise gradients, 2000 steps: %d of %d block scales changed (want <= 1%%)", fmt, changed, nblk);
     f += report(changed <= nblk / 100, m);
   }
   {  // optimum exactly representable 3 codes up: grad = q - target (H = 1)
-    Q q(rows, cols, false); q.init(w);
+    Q q(rows, cols, false, ue); q.init(w);
     const auto s0 = down(q.sc, q.sbytes);
     const double gdec = q.gdec();
     std::vector<float> target(n);
     std::vector<uint32_t> want(nblk);
     for (int b = 0; b < nblk; b++) {
       want[b] = s0[b] + 3;
-      for (int j = 0; j < 16; j++) target[b * 16 + j] = (float)(e2m1((uint32_t)C(rng)) * e4m3(want[b]) * gdec);
+      for (int j = 0; j < 16; j++) target[b * 16 + j] = (float)(e2m1((uint32_t)C(rng)) * q.sdec(want[b]) * gdec);
     }
     std::vector<float> g(n);
-    cfg.lr = (float)(1e-2 * e4m3(s0[0]) * gdec);  // a hundredth of a cell per step
+    cfg.lr = (float)(1e-2 * q.sdec(s0[0]) * gdec);  // a hundredth of a cell per step
     for (int t = 1; t <= 3000; t++) {
       const auto d = down(q.data, n / 2), sc = down(q.sc, q.sbytes);
-      for (int i = 0; i < n; i++) g[i] = (float)(e2m1((d[i / 2] >> (4 * (i & 1))) & 15u) * e4m3(sc[i / 16]) * gdec) - target[i];
+      for (int i = 0; i < n; i++) g[i] = (float)(e2m1((d[i / 2] >> (4 * (i & 1))) & 15u) * q.sdec(sc[i / 16]) * gdec) - target[i];
       up(dg, g); cfg.step = t; ST(mlops_adamw_qat(&cfg, rows, cols, dg, MLOPS_ADAMW_FP32, &q.t, &q.st, 0));
     }
     const auto s1 = down(q.sc, q.sbytes), d = down(q.data, n / 2);
     int found = 0; double err = 0, ref = 0;
     for (int b = 0; b < nblk; b++) found += s1[b] == want[b];
     for (int i = 0; i < n; i++) {
-      const double qv = e2m1((d[i / 2] >> (4 * (i & 1))) & 15u) * e4m3(s1[i / 16]) * gdec;
+      const double qv = e2m1((d[i / 2] >> (4 * (i & 1))) & 15u) * q.sdec(s1[i / 16]) * gdec;
       err += (qv - target[i]) * (qv - target[i]); ref += (double)target[i] * target[i];
     }
-    char m[200]; snprintf(m, sizeof m, "optimum on the lattice 3 codes up, 3000 steps: %d of %d blocks found that scale, rel. error %.4f",
-                          found, nblk, sqrt(err / ref));
+    char m[200]; snprintf(m, sizeof m, "%s optimum on the lattice 3 codes up, 3000 steps: %d of %d blocks found that scale, rel. error %.4f",
+                          fmt, found, nblk, sqrt(err / ref));
     f += report(found > nblk * 9 / 10 && sqrt(err / ref) < 0.05, m);
   }
   {  // one element under a constant gradient walks down its cells: block amax 6 -> sigma 1, cell width 1 at
@@ -348,7 +358,7 @@ static int test_behaviour() {
     std::vector<float> w2(M, 0.0f);
     for (int rr = 0; rr < R; rr++) for (int b = 0; b < Cc / 16; b++) w2[rr * Cc + b * 16] = 6.0f;
     const int probe = 3 * Cc + 16 + 5; w2[probe] = 3.0f;  // code 5
-    Q q(R, Cc, false); q.init(w2);
+    Q q(R, Cc, false, ue); q.init(w2);
     const auto u0 = down(q.st.u, M);
     std::vector<float> g(M, 0.0f); g[probe] = 1e-3f; up(dg, g);
     cfg.lr = 0.05f; cfg.weight_decay = 0;
@@ -358,19 +368,101 @@ static int test_behaviour() {
       const auto d = down(q.data, M / 2); code_at[t] = (d[probe / 2] >> (4 * (probe & 1))) & 7u;
     }
     const auto u1 = down(q.st.u, M);
-    char m[200]; snprintf(m, sizeof m, "constant gradient: u %.4f -> %.4f in 12 steps (want 5 -> 4.40 +- SR noise), code 5 at step 9: %d, code 4 at step 12: %d",
-                          u0[probe] / 4096.0, u1[probe] / 4096.0, code_at[9], code_at[12]);
+    char m[220]; snprintf(m, sizeof m, "%s constant gradient: u %.4f -> %.4f in 12 steps (want 5 -> 4.40 +- SR noise), code 5 at step 9: %d, code 4 at step 12: %d",
+                          fmt, u0[probe] / 4096.0, u1[probe] / 4096.0, code_at[9], code_at[12]);
     f += report(fabs(u1[probe] / 4096.0 - 4.40) < 0.03 && code_at[9] == 5 && code_at[12] == 4, m);
   }
   cudaFree(dg);
   return f;
 }
 
+// ---- 4. headroom: weights that grow 32x ---------------------------------------------------------------------
+// Init leaves 2^3 of growth with E4M3 scales (the top block 24 codes below 448) and 2^8 with UE5M3. Every
+// target weight is an exact lattice value of magnitude 0.5 .. 3 times a block scale that drifts up one code
+// every ~75 steps to 40 codes (32x) above the initial one, as growing weights do. A block fits if some code up
+// to the format's top puts all its weights on the E2M1 lattice (amax 3 needs UP - 8 codes up, 1.5 UP - 16);
+// a fitting block must represent its weights exactly. A block past the top settles where its vote is
+// minimal: the Huber distance (delta sigma) of its weights as the lattice sees them, |w| <= 8 sigma (u is
+// Q3.12), to each code's E2M1 lattice -- the top, or a code or two below when the saturated elements' losses
+// tie and the small ones prefer a finer scale. With UE5M3 every block fits.
+static int test_headroom(bool ue) {
+  const int rows = 16, cols = 256, n = rows * cols, nblk = n / 16, UP = 40, T = 4000, ramp = 3000;
+  std::mt19937 rng(9); std::normal_distribution<float> N(0, 1); std::uniform_int_distribution<int> C(0, 15);
+  std::vector<float> w(n); for (auto &x : w) x = 0.02f * N(rng);  // the blocks' scales within a few codes of the top
+  Q q(rows, cols, false, ue); q.init(w);
+  const auto s0 = down(q.sc, q.sbytes);
+  const double gdec = q.gdec();
+  // magnitudes 0.5 .. 3: every element can grow 2x before E2M1 saturates at 6, while its block scale follows
+  // (an element that saturates stops moving, and with it the evidence the scale moves on)
+  std::vector<uint32_t> code(n);
+  for (auto &c : code) c = (uint32_t)(1 + C(rng) % 5) | (C(rng) & 8u);
+  std::vector<float> target(n), g(n);
+  // the scale of code c, continued past the format's top (8 codes = one binade): where the weights go
+  const auto scale = [&](int c) { const int j = std::max(0, (c - q.maxcode() + 7) / 8); return ldexp(q.sdec(c - 8 * j), j); };
+  const auto tval = [&](int i, int k) { return e2m1(code[i]) * scale((int)s0[i / 16] + k) * gdec; };
+  float *dg; CK(cudaMalloc(&dg, n * 4));
+  mlops_adamw_qat_config cfg{}; cfg.beta1 = 0.9f; cfg.beta2 = 0.999f; cfg.eps = 1e-12f; cfg.grad_scale = 1; cfg.seed = 3;
+  for (int t = 1; t <= T; t++) {
+    const int k = std::min(UP, UP * t / ramp);
+    for (int i = 0; i < n; i++) target[i] = (float)tval(i, k);
+    const auto d = down(q.data, n / 2), sc = down(q.sc, q.sbytes);
+    for (int i = 0; i < n; i++) g[i] = (float)(e2m1((d[i / 2] >> (4 * (i & 1))) & 15u) * q.sdec(sc[i / 16]) * gdec) - target[i];
+    cfg.lr = (float)(2e-2 * q.sdec(sc[0]) * gdec);  // a fiftieth of a cell of block 0 per step
+    up(dg, g); cfg.step = t; ST(mlops_adamw_qat(&cfg, rows, cols, dg, MLOPS_ADAMW_FP32, &q.t, &q.st, 0));
+  }
+  const auto s1 = down(q.sc, q.sbytes), d1 = down(q.data, n / 2);
+  int fit = 0, exact = 0, past = 0, settled = 0;
+  double perr = 0;
+  for (int b = 0; b < nblk; b++) {
+    const auto sq_err = [&](double sc) {  // squared distance of the block's weights to code sc's lattice, and their norm
+      double e = 0, r = 0;
+      for (int j = 0; j < 16; j++) {
+        const double t = target[b * 16 + j], a = fabs(t) / sc, d = (a - e2m1_round_d(a)) * sc;
+        e += d * d; r += t * t;
+      }
+      return std::make_pair(e, r);
+    };
+    bool fits = false;
+    for (int c = 1; c <= q.maxcode() && !fits; c++) fits = sq_err(q.sdec(c) * gdec).first <= 1e-12 * sq_err(1).second;
+    double err = 0, ref = 0;
+    for (int j = 0; j < 16; j++) {
+      const int i = b * 16 + j;
+      const double qv = e2m1((d1[i / 2] >> (4 * (i & 1))) & 15u) * q.sdec(s1[b]) * gdec;
+      err += (qv - target[i]) * (qv - target[i]); ref += (double)target[i] * target[i];
+    }
+    if (fits) { fit++; exact += sqrt(err / ref) < 0.01; continue; }
+    past++; perr += sqrt(err / ref);
+    const double sg = q.sdec(s1[b]) * gdec;
+    double best = 1e300; int kbest = 0;
+    for (int c = 1; c <= q.maxcode(); c++) {
+      const double sc = q.sdec(c) * gdec;
+      double D = 0;
+      for (int j = 0; j < 16; j++) {
+        const double ws = std::min(fabs((double)target[b * 16 + j]), 8 * sg);
+        D += huber_d(ws - sc * e2m1_round_d(ws / sc), sg);
+      }
+      if (D < best) { best = D; kbest = c; }
+    }
+    settled += s1[b] == kbest;
+  }
+  cudaFree(dg);
+  char m[300];
+  snprintf(m, sizeof m, "%s headroom: weights growing 32x over %d steps: %d of %d blocks that fit represent them exactly; "
+           "%d of %d past the format's top settled at their vote's optimum (rel. error %.2f)", ue ? "UE5M3" : "E4M3 ", ramp,
+           exact, fit, settled, past, past ? perr / past : 0.0);
+  return report(exact >= fit * 9 / 10 && settled >= past * 9 / 10 && (ue ? fit == nblk : past > nblk / 4), m);
+}
+
 int main() {
   int f = test_codecs();
-  f += test_reference(false);
-  f += test_reference(true);
-  f += test_behaviour();
+  for (bool ue : {false, true}) {
+    f += test_reference(false, ue);
+    f += test_reference(true, ue);
+  }
+  f += test_behaviour(false);
+  f += test_behaviour(true);
+  f += test_headroom(false);
+  f += test_headroom(true);
   printf(f ? "\n%d FAILED\n" : "\nall passed\n", f);
   return f ? 1 : 0;
 }

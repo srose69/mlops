@@ -10,6 +10,7 @@
                   and optimizer state are module buffers (``state_dict`` saves them). ``grad_dtype=torch.float8_e5m2`` hands the optimizer FP8
                   gradients (``weight.grad_fp8``) instead of float32 ``weight.grad``.
 * ``split_params(model)``  -> (dense parameters, QAT parameters), for the two optimizers.
+* ``to_e4m3(q)``  an NVFP4 tensor with UE5M3 block scales as the same values with E4M3 ones (export).
 
     from mlops.optim import AdamW, AdamWQAT, split_params
     dense, qat = split_params(model)
@@ -17,6 +18,7 @@
     opt_qat = AdamWQAT(qat, lr=1e-3, weight_decay=0.1)
     loss.backward(); opt.step(); opt_qat.step(); opt.zero_grad(); opt_qat.zero_grad()
 """
+import warnings
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -27,6 +29,7 @@ from . import _C
 _DENSE = (torch.bfloat16, torch.float16, torch.float32)
 _ACTS = ("exact", "int8", "nvfp4", "auto")
 _FP8_MAX = {torch.float8_e5m2: 57344.0, torch.float8_e4m3fn: 448.0}
+_SCALE_DTYPES = ("e4m3", "ue5m3")
 
 
 def _fp8_encode(grad: torch.Tensor, dtype: torch.dtype) -> Tuple[torch.Tensor, float]:
@@ -41,13 +44,65 @@ def _flat(q):
     return q.data, q.scales.view(torch.uint8), q.global_scale, q.flags, q.scale_max
 
 
-def _init_qat(w: torch.Tensor, state: torch.Tensor, four_over_six: Optional[str]):
-    """The NVFP4 weight of a QAT state: ``w`` quantized by nvfp4effma.quantize (1x16 blocks, E4M3 scales, amax
-    global: Transformer Engine's current scaling, optionally 4over6), then ``state`` initialized from ``w`` and
-    it (mlops_adamw_qat_init_quantized). The NVFP4 tensor is part of the state from then on."""
+def to_e4m3(q):
+    """``q``, an nvfp4effma.NVFP4Tensor with UE5M3 block scales, as the same values bit for bit with E4M3 scales:
+    the NVFP4 of Transformer Engine, cuBLASLt's FP4 GEMM and ModelOpt. The formats share their 3 mantissa bits,
+    so dividing a row's scales and multiplying its global by one power of two -- the one putting the row's
+    largest scale (the tensor's, for a per-tensor global) in E4M3's top binade -- is exact for every scale it
+    leaves at 2^-6 or above, and for smaller ones on E4M3's subnormal grid. When a value would change (a row's
+    scales grew apart in training by more than E4M3 spans, about 16 binades), ``q`` is returned unchanged, still
+    UE5M3, with a warning: check ``.ue5m3`` on the result. E4M3 tensors are returned as they are."""
+    if not q.ue5m3:
+        return q
+    import nvfp4effma
+    from .reference import dec_ue5m3
+    lin = q.with_scale_layout(False)
+    rows, nb = q.rows, q.cols // 16
+    s = dec_ue5m3(lin.scales.view(torch.uint8).reshape(-1, lin.scales.shape[-1])[:rows, :nb])
+    top = s.amax(1) if q.per_row else s.amax().expand(rows)
+    m, e = torch.frexp(top)                                            # top = m 2^e, m in [0.5, 1)
+    j = torch.where(top > 0, torch.where(m <= 0.875, e - 9, e - 8), torch.zeros_like(e))  # 448 = 0.875 2^9
+    s2 = torch.ldexp(s, -j[:, None].float())
+    e8 = s2.to(torch.float8_e4m3fn)
+    if not torch.equal(e8.float(), s2):
+        return _not_e4m3(q, "its block scales grew apart in training by more binades than E4M3 spans")
+    jg = (j if q.per_row else j[:1]).float()
+    old = q.scale_max or 114688
+    new = old if old in (256, 448) else 448                            # new / old: 1 or 2^-8, exact
+    g = q.global_scale if q.global_scale is not None else torch.ones(1, device=s.device)
+    g = torch.ldexp(g, jg) * (new / old) if q.global_is_amax else torch.ldexp(g, jg)
+    kw = dict(amax=g) if q.global_is_amax else dict(global_scale=g)
+    out = nvfp4effma.NVFP4Tensor(q.data.reshape(rows, -1), e8, scale_max=new if q.global_is_amax else 0, cols=q.cols,
+                                 **kw).with_scale_layout(q.swizzled)
+    if not torch.equal(out.dequantize(torch.float32), q.dequantize(torch.float32)):
+        return _not_e4m3(q, "the global would be rounded")
+    return out
+
+
+def _not_e4m3(q, why: str):
+    warnings.warn(f"to_e4m3: kept as is, with UE5M3 block scales -- NOT E4M3: {why}. E4M3 would change the "
+                  f"weights; nvfp4effma runs it as it is, Blackwell's native NVFP4 cannot.", stacklevel=3)
+    return q
+
+
+def _scale_dtype(scale_dtype: Optional[str], four_over_six: Optional[str]) -> str:
+    """None -> UE5M3, or E4M3 with 4over6 (Transformer Engine's 4over6 is an E4M3 recipe)."""
+    if scale_dtype is None:
+        return "e4m3" if four_over_six else "ue5m3"
+    if scale_dtype not in _SCALE_DTYPES:
+        raise ValueError(f"scale_dtype must be 'e4m3' or 'ue5m3', got {scale_dtype!r}")
+    if scale_dtype == "ue5m3" and four_over_six:
+        raise ValueError("four_over_six needs E4M3 scales (scale_dtype='e4m3' or None)")
+    return scale_dtype
+
+
+def _init_qat(w: torch.Tensor, state: torch.Tensor, four_over_six: Optional[str], scale_dtype: str):
+    """The NVFP4 weight of a QAT state: ``w`` quantized by nvfp4effma.quantize (1x16 blocks, E4M3 or UE5M3
+    scales, amax global: Transformer Engine's current scaling, optionally 4over6), then ``state`` initialized
+    from ``w`` and it (mlops_adamw_qat_init_quantized). The NVFP4 tensor is part of the state from then on."""
     import nvfp4effma
     w = w.contiguous()
-    q = nvfp4effma.quantize(w, four_over_six=four_over_six)
+    q = nvfp4effma.quantize(w, four_over_six=four_over_six, scale_dtype=scale_dtype)
     _C.qat_init_quantized(w, state, *_flat(q))
     return q
 
@@ -132,15 +187,20 @@ class QATLinear(nn.Module):
 
     in_features must be a multiple of 64 (NVFP4EffMA's GEMM). The weight is initialized from ``weight``
     if given (any dense dtype, not kept), else from N(0, init_std^2). ``four_over_six``: None / "mae" /
-    "mse", Transformer Engine's 4over6 scale selection for the initial quantization. ``grad_dtype``: None
+    "mse", Transformer Engine's 4over6 scale selection for the initial quantization. ``scale_dtype``: the
+    block scales, "ue5m3" (unsigned, 2^-17 .. 114688: every block scale can grow 256x during training) or
+    "e4m3" (NVFP4 as Transformer Engine stores it: 8x, then the block's largest weights saturate); None is
+    "ue5m3", or "e4m3" with ``four_over_six`` (an E4M3 recipe). The two
+    train bit-identically until an E4M3 scale would leave its range; ``to_e4m3`` converts for export. The
+    format is saved with ``state_dict`` (checkpoints without it are E4M3). ``grad_dtype``: None
     (float32 ``weight.grad``) or torch.float8_e5m2 / torch.float8_e4m3fn (``weight.grad_fp8``, amax-scaled).
     ``act``: how the activations enter the GEMM, as in nvfp4effma.linear -- "exact" (W4A16, x in its own
     bfloat16 / float16 / float32), "int8" (W4A8, about 2x faster from sm_61 on: DP4A), "nvfp4" (W4A4) or
     "auto" (exact up to 2 rows, int8 beyond); the output always has x's dtype."""
 
     def __init__(self, in_features: int, out_features: int, weight: Optional[torch.Tensor] = None,
-                 init_std: float = 0.02, four_over_six: Optional[str] = None, grad_dtype: Optional[torch.dtype] = None,
-                 act: str = "exact", device="cuda"):
+                 init_std: float = 0.02, four_over_six: Optional[str] = None, scale_dtype: Optional[str] = None,
+                 grad_dtype: Optional[torch.dtype] = None, act: str = "exact", device="cuda"):
         super().__init__()
         if in_features % 64:
             raise ValueError(f"in_features ({in_features}) must be a multiple of 64 (NVFP4EffMA's GEMM)")
@@ -152,6 +212,7 @@ class QATLinear(nn.Module):
         if four_over_six not in (None, "mae", "mse"):
             raise ValueError(f"four_over_six must be None, 'mae' or 'mse', got {four_over_six!r}")
         self.in_features, self.out_features, self.grad_dtype = in_features, out_features, grad_dtype
+        scale_dtype = _scale_dtype(scale_dtype, four_over_six)
         dev = torch.device(device)
         if weight is None:
             weight = torch.empty(out_features, in_features, device=dev).normal_(std=init_std)
@@ -159,13 +220,16 @@ class QATLinear(nn.Module):
             raise ValueError(f"weight must be [{out_features}, {in_features}], got {tuple(weight.shape)}")
         # zeros, not empty: the kernel's scratch and padding bytes are saved with state_dict and must be deterministic
         state = torch.zeros(_C.qat_state_bytes(out_features, in_features), dtype=torch.uint8, device=dev)
-        q = _init_qat(weight.to(dev), state, four_over_six)
+        q = _init_qat(weight.to(dev), state, four_over_six, scale_dtype)
         self.register_buffer("nvfp4_data", q.data)
         self.register_buffer("nvfp4_scales", q.scales.view(torch.uint8))
         # the amax as 4 bytes: a module dtype cast (model.half()) must not touch it
         self.register_buffer("nvfp4_amax", q.global_scale.view(torch.uint8))
         self.register_buffer("qat_state", state)
-        self._scale_max = q.scale_max
+        # (UE5M3?, scale_max): how the bytes decode, saved with them; read back on load
+        self.register_buffer("nvfp4_format", torch.tensor([scale_dtype == "ue5m3", q.scale_max], dtype=torch.int32,
+                                                          device=dev))
+        self._scale_max, self.scale_dtype = q.scale_max, scale_dtype
         self.weight = QATParameter.placeholder(out_features, in_features, dev)
         self.weight.layer = self
 
@@ -184,17 +248,23 @@ class QATLinear(nn.Module):
             destination[prefix + name] = buf if keep_vars else buf.detach()
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        if prefix + "nvfp4_data" in state_dict and prefix + "nvfp4_format" not in state_dict:
+            # a checkpoint from before UE5M3: E4M3 scales, scale_max as this layer's 4over6 setting has it
+            state_dict[prefix + "nvfp4_format"] = torch.tensor([0, 0 if self.scale_dtype == "ue5m3" else self._scale_max],
+                                                               dtype=torch.int32)
         w = self._parameters.pop("weight")
         try:
             super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
         finally:
             self._parameters["weight"] = w
+        ue, smax = self.nvfp4_format.tolist()
+        self.scale_dtype, self._scale_max = ("ue5m3" if ue else "e4m3"), smax
 
     def nvfp4_weight(self):
         """The NVFP4 tensor the forward reads (views of this module's buffers)."""
         import nvfp4effma
         return nvfp4effma.NVFP4Tensor(self.nvfp4_data, self.nvfp4_scales, amax=self.nvfp4_amax.view(torch.float32),
-                                      scale_max=self._scale_max)
+                                      scale_max=self._scale_max, ue5m3=self.scale_dtype == "ue5m3")
 
     def _flat(self):
         return _flat(self.nvfp4_weight())
@@ -204,7 +274,8 @@ class QATLinear(nn.Module):
 
     def extra_repr(self):
         g = "" if self.grad_dtype is None else f", grad_dtype={self.grad_dtype}"
-        return f"in_features={self.in_features}, out_features={self.out_features}, NVFP4, act={self.act}{g}"
+        s = ", UE5M3 scales" if self.scale_dtype == "ue5m3" else ""
+        return f"in_features={self.in_features}, out_features={self.out_features}, NVFP4{s}, act={self.act}{g}"
 
 
 def split_params(model: nn.Module) -> Tuple[List[nn.Parameter], List[QATParameter]]:
