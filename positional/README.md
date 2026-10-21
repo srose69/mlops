@@ -77,6 +77,19 @@ patch_transformers("llama", "qwen2", "mistral")   # installs it into those model
 * **`patch_transformers`.** It is for models with the standard signature and half-split pairs. A patched Llama
   produces identical outputs.
 
+## Samples
+
+Short runnable examples in [`samples/`](samples):
+
+| sample | shows |
+|---|---|
+| `01_quickstart.py` | `RoPE` on q and k (GQA), positions vs offset, both layouts, `<q_m, k_n>` depending on `m − n` only |
+| `02_transformers_model.py` | `patch_transformers("llama")` on a model: identical outputs, faster forward |
+| `03_long_context_yarn.py` | a YaRN-extended model's frequencies and attention factor; accuracy at position 10M |
+| `04_training.py` | an attention layer with RoPE on a packed qkv projection, trained (autograd) |
+| `05_inference_decode.py` | prefill with left padding, then decode against a KV cache, in place |
+| `06_c_api.cu` | the C API: frequency table, rotate, rotate back, error reporting |
+
 ## C / C++
 
 [`include/mlops_rope.h`](include/mlops_rope.h) (all of the package: `mlops_positional.h`):
