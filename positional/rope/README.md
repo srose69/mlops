@@ -79,6 +79,24 @@ FP32 q:
 
 (every start from 128K to 10M, and both pair layouts of mlops, in the script's output.)
 
+With the context-extension recipes (`--scaling all`; YaRN factor 4 from 32K, Llama 3.1, linear 4, dynamic NTK 4,
+LongRoPE from 4K; transformers' copies again checked bit for bit against `LlamaRotaryEmbedding` at every start,
+with its frequencies computed where it computes them: on the CPU for the static recipes, as float32 tensor
+arithmetic on the GPU for dynamic NTK and LongRoPE), at 10M positions, RMS / max:
+
+| scaling | BF16: floor | BF16: transformers | BF16: mlops | FP32: transformers | FP32: mlops |
+|---|---|---|---|---|---|
+| none | 1.7e-3 / 3.8e-3 | 9.0e-2 / 6.7e-1 | 1.7e-3 / 3.8e-3 | 9.0e-2 / 6.7e-1 | 8.1e-8 / 4.2e-7 |
+| YaRN | 1.7e-3 / 3.8e-3 | 9.0e-2 / 6.7e-1 | 1.7e-3 / 3.8e-3 | 9.0e-2 / 6.7e-1 | 8.5e-8 / 4.2e-7 |
+| Llama 3.1 | 1.7e-3 / 3.8e-3 | 9.0e-2 / 6.7e-1 | 1.7e-3 / 3.8e-3 | 9.0e-2 / 6.7e-1 | 8.2e-8 / 4.2e-7 |
+| dynamic NTK | 1.7e-3 / 3.8e-3 | 7.4e-2 / 7.2e-1 | 1.7e-3 / 3.8e-3 | 7.4e-2 / 7.2e-1 | 7.3e-8 / 3.6e-7 |
+| LongRoPE | 1.7e-3 / 3.8e-3 | 2.9e-2 / 3.7e-1 | 1.7e-3 / 3.8e-3 | 2.9e-2 / 3.7e-1 | 8.3e-8 / 3.7e-7 |
+| linear 4 | 1.7e-3 / 3.8e-3 | 2.3e-2 / 1.7e-1 | 1.7e-3 / 3.8e-3 | 2.3e-2 / 1.7e-1 | 7.5e-8 / 3.7e-7 |
+
+YaRN, Llama 3 and dynamic NTK leave the highest frequency (1 rad per position) unscaled, so transformers' FP32
+angle error is the unscaled one. Linear and LongRoPE divide it, and its error with it. With every recipe, mlops
+stays at the floor in BF16 and at its constant few FP32 ulps.
+
 * **transformers and torchtune.** Their error grows linearly with the position. Both take the angle as one FP32
   product, whose rounding is half an ulp of the angle: up to 0.5 rad at 10M positions, where the RMS error is
   9 % and the worst pair is rotated ~0.7 rad off. In BF16, transformers additionally rounds cos / sin to BF16,
