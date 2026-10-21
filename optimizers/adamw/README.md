@@ -1,17 +1,19 @@
 # mlops/optimizers/adamw
 
-Two CUDA C++ optimizers with a C API and PyTorch bindings, for every GPU NVFP4EffMA supports: sm_50 ..
-sm_90, the ones without native FP4 (see [Build](#build-and-test)):
+The two optimizers of [mlops-optimizers](..) (`mlops.optim` in Python), for every GPU NVFP4EffMA supports:
+sm_50 .. sm_90, the ones without native FP4. This page has the math, the formats and the measurements;
+installation, the PyTorch API and the build are in [the package README](../README.md).
 
 | | weights | state per element | step |
 |---|---|---|---|
 | `mlops_adamw` | BF16 / FP16 / FP32 | 8 B (FP32 `m`, `v`) | AdamW |
 | `mlops_adamw_qat` | NVFP4, trained in place | 5 B (+ 8 B per 16-element block) | AdamW on the NVFP4 lattice, no master copy |
 
-`mlops_adamw_qat` builds on [NVFP4EffMA](../../../NVFP4EffMA) (NVFP4 tensors, E2M1 / E4M3 codecs, the
-initial quantization) and, below sm_89, [E5M2EffMA](../../../E5M2EffMA) (FP8 codecs); from sm_89 on, where
-FP8 is native, it uses the hardware `cvt` instead ([FP8 codecs](#fp8-codecs)). A PyTorch reference of its step,
-bit-identical to the kernel, is in [`binds/python/mlops_adamw/reference.py`](binds/python/mlops_adamw/reference.py).
+`mlops_adamw_qat` builds on [NVFP4EffMA](https://github.com/srose69/nvfp4effma) (NVFP4 tensors, E2M1 / E4M3
+codecs, the initial quantization) and, in the device code below sm_89,
+[E5M2EffMA](https://github.com/srose69/e5m2effma) (FP8 codecs); from sm_89 on, where FP8 is native, it uses the
+hardware `cvt` instead ([FP8 codecs](#fp8-codecs)). A PyTorch reference of its step, bit-identical to the
+kernel, is in [`mlops/optim/reference.py`](../python/mlops/optim/reference.py).
 
 ## `mlops_adamw`
 
@@ -26,7 +28,7 @@ p = p - lr wd p - lr (m / (1 - b1^t)) / (sqrt(v / (1 - b2^t)) + eps)
 Parameters and gradients BF16, FP16 or FP32 (any pair), moments FP32, 128-bit accesses; bit-reproducible
 against the host emulation in `tests/test_adamw.cu`. It does not touch NVFP4: QAT with it means an FP32
 master, this step, and a fresh `nvfp4a_quantize_ex` of the master afterwards (the `adamw` baseline in
-[`misc/`](../../../misc)).
+`misc/`).
 
 ## `mlops_adamw_qat`
 
@@ -186,12 +188,14 @@ source depends on the target:
 All of them are exact on finite codes, so every architecture computes the same bits:
 
 * `f32_to_e5m2` against NVIDIA's model of `cvt.rn.satfinite.e5m2x2.f32` (`cuda_fp8.h`'s
-  `__nv_cvt_float_to_fp8`): 0 mismatches over all 2^32 FP32 inputs. Both decodes against the f16 that
+  `__nv_cvt_float_to_fp8`): 0 mismatches over all 2^32 FP32 inputs. The host code (the tests' side of
+  the codecs) therefore uses `cuda_fp8.h`, so E5M2EffMA is needed only to build for GPUs below sm_89. Both decodes against the f16 that
   `cvt.rn.f16x2.*` returns: 0 mismatches over all 256 codes.
 * `make qat` runs the whole QAT test twice: once on the GPU's own path, once with `QAT_FP8_CVT_MODEL`,
   which routes the sm_89+ wrappers through `cuda_fp8.h` (NVIDIA's software model of the same
-  instructions) on any GPU. `tests/test_reference.py` with the extension built that way
-  (`NVCC_APPEND_FLAGS=-DQAT_FP8_CVT_MODEL`) is byte-identical to the PyTorch reference.
+  instructions) on any GPU. `python/tests/test_reference.py` with the extension built that way
+  (`NVCC_APPEND_FLAGS=-DQAT_FP8_CVT_MODEL`, see [the package README](../README.md#tests)) is
+  byte-identical to the PyTorch reference.
 * On sm_90, the wrappers and `cuda_fp8.h`'s intrinsics compile to the same SASS (`F2FP.F16.E5M2.UNPACK_B`,
   `F2FP.F16.E4M3.UNPACK_B`, `F2FP.SATFINITE.E5M2.F32.PACK_AB_MERGE_C`). The sm_89 kernels assemble with
   ptxas 12.6 into the same instructions.
@@ -201,8 +205,8 @@ They differ only on non-finite codes, which the step never stores (`r` saturates
 A gradient that holds Inf / NaN codes is outside the contract: `cvt` (like torch and the reference)
 decodes them as Inf / NaN, E5M2EffMA as large finite values.
 
-sm_89's `cvt` needs PTX ISA 8.1 (CUDA 12.1); with an older nvcc the build drops sm_89 (`Makefile`,
-`setup.py`) and `qat_codec.cuh` refuses it with an `#error`. sm_90 needs PTX ISA 7.8 (CUDA 11.8).
+sm_89's `cvt` needs PTX ISA 8.1 (CUDA 12.1); with an older nvcc the build drops sm_89
+(`build/arch.mk`, `build/torch_ext.py`) and `qat_codec.cuh` refuses it with an `#error`. sm_90 needs PTX ISA 7.8 (CUDA 11.8).
 
 ### Performance
 
@@ -226,7 +230,7 @@ so there the step should be closer to its memory bound; that is not measured.
 
 ### Training
 
-[`misc/train_nvfp4.py`](../../../misc/train_nvfp4.py): a 7-layer decoder (dim 64, SwiGLU 128, 4 heads,
+`misc/train_nvfp4.py` (a training script outside this repository): a 7-layer decoder (dim 64, SwiGLU 128, 4 heads,
 287k NVFP4 + 279k dense parameters) on WikiText-2's `wiki.train.raw` (byte-level BPE 4096, last 5% held
 out), NVFP4 forward through NVFP4EffMA's GEMM, 5000 steps of 20 x 256 tokens, lr 1e-3 with 100 warm-up
 steps and cosine decay to 1e-4, weight decay 0.1; the same hyperparameters for both optimizers:
@@ -247,47 +251,15 @@ half the memory, QAT trains as well as an FP32 master here. Activations enter th
 * The scale of a block whose curvature never becomes significant stays where initialization put it.
 * Under pure-noise gradients about 1% of the block scales move in 2000 steps (`make qat`).
 
-## Build and test
+## Code
 
-Targets are NVFP4EffMA's architectures: sm_50 52 53 60 61 62 70 72 75 80 86 87 89 90.
+| file | |
+|---|---|
+| `../include/mlops_adamw.h`, `../include/mlops_adamw_qat.h` | C API, the exact order of operations |
+| `src/adamw_kernels.cuh`, `src/adamw_inst.cu`, `src/adamw.cu` | AdamW kernel, its 9 (param, grad) dtype instances, host side |
+| `src/adamw_qat_kernels.cuh`, `src/adamw_qat_inst.cu`, `src/adamw_qat.cu` | QAT step kernel, its 3 gradient-type instances, host side (state, init, scale commit) |
+| `src/adamw_qat_init.cu` | `mlops_adamw_qat_init`: NVFP4EffMA's quantization + init (the only code that links NVFP4EffMA) |
+| `src/qat_codec.cuh` | SR encodes, secant maps, Quake rsqrt, uniforms, the FP8 codec selection |
+| `tests/`, `bench/` | `make test`, `make qat`, `make bench` (in `optimizers/`) |
 
-* The `Makefile` builds tests and bench, which run on GPU `GPU` (default 0). So it builds for that GPU's
-  architecture by default. `ARCHS="61 89"` or `ARCHS=all` select others.
-* `setup.py` uses the same list (see [Python](#python)).
-
-```
-make            # out/test_adamw, out/bench_adamw, out/test_adamw_qat, out/test_adamw_qat_cvt
-make test       # mlops_adamw vs its host emulation, every dtype pair, with and without bias correction
-make qat        # mlops_adamw_qat: codecs, one step vs a double-precision reference (linear and swizzled
-                # scales), noise / scale-finding / cell-walking behaviour; then the same through the
-                # sm_89+ FP8 path (QAT_FP8_CVT_MODEL, see FP8 codecs)
-make bench      # bandwidth of both, boost-warmed, NVML clocks
-make ARCHS=all  # every architecture (compile check; sm_89 needs nvcc 12.1+)
-```
-
-`NVFP4EFFMA` and `E5M2EFFMA` (default `../../../NVFP4EffMA`, `../../../E5M2EffMA`) point at the sibling
-checkouts; NVFP4EffMA's static library must be built with its own `make`.
-
-## Python
-
-```
-pip install ./NVFP4EffMA/binds/python --no-build-isolation                 # first: a dependency, not on PyPI
-pip install ./mlops/optimizers/adamw/binds/python --no-build-isolation
-```
-
-Architectures, as NVFP4EffMA's build chooses them, in this order:
-1. `MLOPS_ADAMW_ARCHS="61 89"` or `TORCH_CUDA_ARCH_LIST="6.1;8.9"`;
-2. else the GPUs visible at build time;
-3. else all of sm_50..sm_90.
-
-Anything outside that range is dropped. NVFP4EffMA's static library must have been built for the same
-architectures; its default `make` builds all of them.
-
-```python
-dense, qat = mlops_adamw.split_params(model)              # QATLinear weights vs everything else
-opt, opt_qat = mlops_adamw.AdamW(dense), mlops_adamw.AdamWQAT(qat, weight_decay=0.1)
-```
-
-[`binds/python/README.md`](binds/python/README.md): the `torch.optim` optimizers `AdamW` (dense) and
-`AdamWQAT` (only `QATLinear`'s NVFP4 weights, everything else refused), `QATLinear`, the low-level
-`mlops_adamw.adamw` / `QATState`, the reference, and the tests.
+Each kernel instance is its own object, so a build for all architectures runs in parallel.

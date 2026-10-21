@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
+// Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 /* Correctness test: GPU mlops_adamw vs. a double-precision host reference, for every
  * {param_dtype, grad_dtype} combination over BF16/FP16/FP32. */
 #include "mlops_adamw.h"

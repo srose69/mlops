@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
+// Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 #ifndef MLOPS_ADAMW_COMMON_CUH
 #define MLOPS_ADAMW_COMMON_CUH
 

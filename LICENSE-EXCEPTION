@@ -1,0 +1,71 @@
+                 LINKING AND ATTRIBUTION EXCEPTION
+        Additional permission and additional terms under section 7
+              of the GNU Affero General Public License, version 3
+
+This exception applies to a work (the "Library") whose copyright holders
+have placed it under the GNU Affero General Public License, version 3 (the
+"AGPL") together with this exception. The Library's name, its copyright
+holders, its home page and the exact attribution text are given in the
+NOTICE file distributed with the Library.
+
+0. Definitions.
+
+   An "Application" is any work that uses the Library without being a
+   modified version of it: code that is compiled against the Library's
+   headers, linked with the Library (statically or dynamically), loads the
+   Library or its language bindings at run time, or calls it through any
+   other interface the Library provides.
+
+   A "Modification" is any change to, or translation or derivative of,
+   the Library's own source files, including the removal of code from them.
+
+   "Attribution" is the notice "<Library name> (<home page>)", or the longer
+   attribution text, as stated in the Library's NOTICE file.
+
+1. Additional permission: Applications under terms of your choice.
+
+   As a special exception to the AGPL, the copyright holders give you
+   permission to combine an Application with the Library and to convey,
+   modify and make available (including over a network) the Application,
+   and the combination of the Application with the Library in object code
+   form, under terms of your choice, including proprietary terms, provided
+   that you meet both of the following conditions:
+
+   a) The Library, including any Modification of it that you convey or
+      make available, remains under the AGPL with this exception, and you
+      provide its Corresponding Source as the AGPL requires. This
+      permission does not extend to Modifications of the Library.
+
+   b) You meet the attribution term of section 2.
+
+   You may remove this additional permission from your copy of the
+   Library as section 7 of the AGPL allows; the additional terms of
+   sections 2 and 3 remain in effect.
+
+2. Additional term (AGPL section 7(b)): attribution.
+
+   Any work that contains or uses the Library, whether it is conveyed or
+   made available under the AGPL or under the permission of section 1,
+   must preserve the Library's copyright notices and its NOTICE file, and
+   must display the Attribution:
+
+   a) in its Appropriate Legal Notices, if it has any; and
+
+   b) in at least one place where users of the work will reasonably see
+      it, such as its documentation, its "about" information, its license
+      or credits listing, the output of its --version option, or, for a
+      library or service, its README or published documentation.
+
+   The Attribution must state that the work uses the Library; it must not
+   suggest that the copyright holders of the Library endorse the work.
+
+3. Additional term (AGPL section 7(c)): origin of modified versions.
+
+   You may not misrepresent the origin of the Library. A Modification that
+   you convey or make available must be marked as such in its source files
+   and in its NOTICE file, and must not be presented as the original
+   Library or under the Library's name alone.
+
+4. This exception is in addition to, and does not otherwise change, the
+   terms of the AGPL. If any part of it is held invalid, the remaining parts
+   stay in effect to the extent permitted by law.

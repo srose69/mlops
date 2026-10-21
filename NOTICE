@@ -1,0 +1,24 @@
+mlops
+Copyright (C) 2026 srose69
+Home page: https://github.com/srose69/mlops
+
+mlops is free software: you can redistribute it and/or modify it under the terms of the GNU Affero
+General Public License, version 3 (LICENSE), together with the Linking and Attribution Exception
+(LICENSE-EXCEPTION). It is distributed WITHOUT ANY WARRANTY; see the AGPL for details.
+
+In short:
+  - Programs that use mlops (link it, call it, load its Python packages) may be distributed or run as
+    a service under any license, including proprietary ones.
+  - Changes to mlops itself stay under the AGPL with the exception, with their source available, and
+    must be marked as modified.
+  - Every work that uses mlops must show the attribution below (LICENSE-EXCEPTION, section 2).
+
+mlops compiles device code from the headers of NVFP4EffMA (https://github.com/srose69/nvfp4effma) and,
+for GPUs below sm_89, E5M2EffMA (https://github.com/srose69/e5m2effma), both under the same license and
+exception; their attribution applies as well.
+
+Attribution
+-----------
+Short form:  mlops (https://github.com/srose69/mlops)
+Long form:   This product uses mlops, CUDA training ops for GPUs without native FP4
+             (https://github.com/srose69/mlops), Copyright (C) 2026 srose69.

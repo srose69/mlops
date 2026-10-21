@@ -1,9 +1,13 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
+// Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 // mlops_adamw_qat number formats the sibling repos do not have: stochastic rounding (SR) into E4M3,
 // E5M2 (E[s^2] exact), BF16 and fixed point, the secant maps of the E2M1 lattice, the Quake rsqrt and
 // the counter-based uniforms SR draws from. Decodes and RNE encodes are NVFP4EffMA's (E2M1, E4M3); the
-// FP8 ones (E5M2 encode, E4M3 / E5M2 x4 decode) are E5M2EffMA's below sm_89 and the native cvt from
-// sm_89 on (QAT_FP8_CVT). Host + device, so the tests run the same code on the CPU; arithmetic goes
-// through mul / add / sub / fmar so neither side contracts it differently.
+// FP8 ones (E5M2 encode, E4M3 / E5M2 x4 decode) are E5M2EffMA's in the device passes below sm_89, the
+// native cvt from sm_89 on (QAT_FP8_CVT) and cuda_fp8.h on the host (bit-identical to both on all 2^32
+// inputs), so E5M2EffMA is needed only to build for GPUs below sm_89. Host + device, so the tests run the
+// same code on the CPU; arithmetic goes through mul / add / sub / fmar so neither side contracts it
+// differently.
 #pragma once
 #include <cstdint>
 #include <cstring>
@@ -15,17 +19,16 @@
 //                      (PTX ISA 7.8 on sm_90, 8.1 = CUDA 12.1 on sm_89; the gating of CUTLASS's float8.h)
 //   QAT_FP8_CVT_MODEL  tests only: the same wrappers through cuda_fp8.h, NVIDIA's model of those cvt
 //                      instructions below sm_90, so the sm_89+ code path runs on any GPU
-//   otherwise          E5M2EffMA (sm_50..sm_87 device passes and the host pass)
+//   otherwise          E5M2EffMA in the sm_50..sm_87 device passes, cuda_fp8.h in the host pass
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
 #if __CUDA_ARCH__ == 890 && (__CUDACC_VER_MAJOR__ < 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ < 1))
 #error "mlops_adamw_qat for sm_89 needs CUDA 12.1+ (PTX ISA 8.1: cvt with .e4m3x2 / .e5m2x2); drop sm_89 or upgrade nvcc"
 #endif
 #define QAT_FP8_CVT 1
-#elif defined(__CUDA_ARCH__) && defined(QAT_FP8_CVT_MODEL)
-#include <cuda_fp8.h>
-#else
+#elif defined(__CUDA_ARCH__) && !defined(QAT_FP8_CVT_MODEL)
 #include <e5m2effma.cuh>
 #endif
+#include <cuda_fp8.h>  // host E5M2 encode; the cvt model
 
 #if defined(__CUDACC__)
 #define QAT_HD __host__ __device__ __forceinline__
@@ -39,7 +42,12 @@ namespace qat {
 // Finite codes decode exactly on every path (E5M2EffMA's raw-bits FMUL == cvt, checked on all 256 codes);
 // non-finite codes are outside the contract: cvt gives Inf / NaN (as torch and the PyTorch reference do),
 // E5M2EffMA large finite values. The stored r (E4M3, <= 0x7E) and s (E5M2, <= 123) are always finite.
-#if defined(__CUDA_ARCH__) && (defined(QAT_FP8_CVT) || defined(QAT_FP8_CVT_MODEL))
+#if defined(__CUDA_ARCH__) && !defined(QAT_FP8_CVT) && !defined(QAT_FP8_CVT_MODEL)
+template <bool E5M2> __device__ __forceinline__ void dec_fp8x4(uint32_t w, float &v0, float &v1, float &v2, float &v3) {
+  if (E5M2) e5ma::decode_e5m2x4(w, v0, v1, v2, v3);
+  else e5ma::decode_e4m3x4(w, v0, v1, v2, v3);
+}
+#else  // sm_89+ and the cvt model; the host pass only parses these device functions
 // bytes 0, 1 of the low half of w -> f16 halves 0, 1 of the result (cvt: byte k -> half k)
 template <bool E5M2> __device__ __forceinline__ uint32_t cvt_f16x2_fp8x2(uint32_t w16) {
   uint32_t h;
@@ -60,11 +68,6 @@ template <bool E5M2> __device__ __forceinline__ void dec_fp8x4(uint32_t w, float
   f16x2_to_f32(cvt_f16x2_fp8x2<E5M2>(w & 0xFFFFu), v0, v1);
   f16x2_to_f32(cvt_f16x2_fp8x2<E5M2>(w >> 16), v2, v3);
 }
-#else
-template <bool E5M2> __device__ __forceinline__ void dec_fp8x4(uint32_t w, float &v0, float &v1, float &v2, float &v3) {
-  if (E5M2) e5ma::decode_e5m2x4(w, v0, v1, v2, v3);
-  else e5ma::decode_e4m3x4(w, v0, v1, v2, v3);
-}
 #endif
 
 // FP32 -> E5M2 byte, RNE, saturating to +-57344 (cvt.rn.satfinite.e5m2x2.f32: b -> the low byte)
@@ -73,10 +76,10 @@ QAT_HD uint32_t enc_e5m2(float x) {
   uint16_t d;
   asm("cvt.rn.satfinite.e5m2x2.f32 %0, %1, %2;" : "=h"(d) : "f"(0.0f), "f"(x));
   return d & 0xFFu;
-#elif defined(__CUDA_ARCH__) && defined(QAT_FP8_CVT_MODEL)
-  return __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E5M2);
-#else
+#elif defined(__CUDA_ARCH__) && !defined(QAT_FP8_CVT_MODEL)
   return e5ma::f32_to_e5m2(x);
+#else
+  return __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E5M2);
 #endif
 }
 

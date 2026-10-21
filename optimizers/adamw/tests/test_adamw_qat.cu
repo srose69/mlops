@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
+// Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 /* mlops_adamw_qat tests.
  *   1. codecs: SR into E4M3 / E5M2 (E[s^2] = v) / BF16 / fixed point is unbiased, the Quake rsqrt stays
  *      within 6.5e-4, e2m1_round agrees with NVFP4EffMA's f32_to_e2m1 on every 7th float in [0, 8).

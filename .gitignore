@@ -1,8 +1,18 @@
 # build output
 out/
-build/
+*/python/build/
+meta/build/
 dist/
 *.egg-info/
 __pycache__/
 .pytest_cache/
 *.so
+# license files copied next to setup.py for the wheels (build/torch_ext.py)
+*/python/LICENSE
+*/python/LICENSE-EXCEPTION
+*/python/NOTICE
+meta/LICENSE
+meta/LICENSE-EXCEPTION
+meta/NOTICE
+# release tooling and artifacts (dev/release.sh -> dist/)
+dev/

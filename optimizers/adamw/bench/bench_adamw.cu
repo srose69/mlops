@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
+// Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 // mlops_adamw / mlops_adamw_qat bandwidth, n = 16Mi elements (a 4096 x 4096 weight).
 //   mlops_adamw:     grad (read), param (rw), exp_avg + exp_avg_sq (rw, FP32)
 //   mlops_adamw_qat: grad (read), u (rw, 2 B), r / s / qbar (rw, 1 B each), codes (rw, 0.5 B), plus per
