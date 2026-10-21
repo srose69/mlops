@@ -10,8 +10,9 @@ transformers' eager path (8.2×), and a decode step in 22 µs against 92-107 µs
 
 **Accuracy at long positions.** In BF16 it stays at the floor of the dtype from 128K to 10M positions: the exact
 rotation rounded once. transformers and torchtune take the angle as one FP32 product, so their error grows with
-the position, to 9 % RMS and 0.67 at the worst pair at 10M
-([table](rope/README.md#at-long-positions)).
+the position: with FP32 q it is 1.1e-3 already at 128K, 44 000× the float32 floor, and 9 % RMS (0.67 at the
+worst pair) at 10M. As a position, at 10M they place every token up to ±1.4 positions off and get the distance
+between two tokens wrong by up to 1.2 ([tables](rope/README.md#at-long-positions)).
 
 ## Install
 
@@ -86,7 +87,7 @@ Short runnable examples in [`samples/`](samples):
 | `01_quickstart.py` | `RoPE` on q and k (GQA), positions vs offset, both layouts, `<q_m, k_n>` depending on `m − n` only |
 | `02_transformers_model.py` | `patch_transformers("llama")` on a model: identical outputs, faster forward |
 | `03_long_context_yarn.py` | a YaRN-extended model's frequencies and attention factor; accuracy at position 10M |
-| `04_training.py` | an attention layer with RoPE on a packed qkv projection, trained (autograd) |
+| `04_training.py` | a 3-layer transformer with RoPE on a packed qkv projection learns to sort 24 numbers (autograd); with NVFP4 weights: mlops-optimizers' `samples/08_transformer_training.py` |
 | `05_inference_decode.py` | prefill with left padding, then decode against a KV cache, in place |
 | `06_c_api.cu` | the C API: frequency table, rotate, rotate back, error reporting |
 

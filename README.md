@@ -11,9 +11,36 @@ installs all of them.
 
 | package | Python | version | contents |
 |---|---|---|---|
-| [mlops-optimizers](optimizers) | `mlops.optim` | 0.1.0 | AdamW, and AdamWQAT: AdamW that trains NVFP4 weights in place, without a master copy |
-| [mlops-positional](positional) | `mlops.positional` | 0.1.0 | RoPE of q and k in one pass, no error growth with the position (BF16 at the floor up to 10M), YaRN / Llama 3 / LongRoPE scaling; a bit-exact drop-in for transformers' `apply_rotary_pos_emb` |
+| [mlops-optimizers](optimizers) | `mlops.optim` | 0.1.0 | AdamW, and AdamWQAT: AdamW that trains NVFP4 weights in place, on GPUs from Maxwell to Hopper. Transformer Engine trains NVFP4 only on Blackwell (sm_100+), through an FP32 or FP16 master copy re-quantized every step. AdamWQAT keeps no such copy: each weight's position lives on the NVFP4 lattice as a 16-bit coordinate, the moments in FP8, and block scales move only on significant evidence and, UE5M3 by default, can grow 256x without an amax recompute (`to_e4m3` exports Transformer Engine's E4M3 scales bit-exact when they fit, else keeps UE5M3 and warns). 6 B per weight for weight + optimizer state, against 12.6 B for an FP32 master with FP32 moments. |
+| [mlops-positional](positional) | `mlops.positional` | 0.1.0 | RoPE of q and k in one pass, 4–8× transformers' eager path, with YaRN / Llama 3 / LongRoPE scaling built in. Its error does not grow with the position: at the floor of the dtype up to 10M tokens. transformers and torchtune take the angle as one FP32 product: in FP32 their error is 1.1e-3 already at 128K, 44 000× the float32 floor, and 9 % RMS at 10M, where they place every token up to ±1.4 positions off. A bit-exact drop-in for transformers' `apply_rotary_pos_emb`. |
 | `mlops` | | 0.2.0 | meta package: every package above |
+
+**Why UE5M3 block scales by default.** NVFP4 as Transformer Engine stores it has E4M3 block scales
+(`2^-9 .. 448`). NVIDIA's NVFP4 pretraining ([arXiv:2509.25149](https://arxiv.org/abs/2509.25149)) diverges
+with every linear layer in FP4: the last layers need more range. The recipe keeps 16% of them in BF16, adds a
+Hadamard transform and recomputes every amax before each quantization. Graphcore
+([arXiv:2609.02846](https://arxiv.org/abs/2609.02846), section 5.2) shows that E4M3 scales leave a tensor at
+its amax no room to grow, while UE5M3 leaves about 137x. On Nemotron-H 8B over 190B tokens, Transformer
+Engine's native NVFP4 without the BF16 layers and the transform had repeated loss spikes. UE5M3 scales
+trained smoothly with every linear in FP4, refreshed the tensor scale only every 50 steps, and ended below
+Transformer Engine's full recipe. AdamWQAT never recomputes an amax, so the scale format alone sets how far
+a block can grow: 8x with E4M3, 256x with UE5M3. The two train bit-identically until E4M3 would run out
+([details](optimizers/README.md#block-scales-ue5m3-by-default)).
+
+**What FP32 angles cost at long context.** The angle error of a RoPE frequency, divided by the frequency,
+is a position error: where that frequency places the token. transformers and torchtune compute the angle as one
+FP32 product, and the error grows with the position. With FP32 q, measured by `make accuracy` in
+mlops-positional (Llama 3 frequencies):
+
+| context | token placed off by, max / RMS | distance between two tokens off by | mlops.positional |
+|---|---|---|---|
+| 1M | ±0.13 / 0.05 | 0.13 | ±0.09 / 0.007 |
+| 4M | ±0.54 / 0.19 | 0.49 | ±0.07 / 0.005 |
+| 10M | ±1.38 / 0.48 | 1.20 | ±0.05 / 0.004 |
+
+At 10M the pairs that tell neighbouring tokens apart (periods of 7-12 tokens) are turned up to 0.69 rad (39°)
+the wrong way. mlops' column does not grow: it is the float32 floor of the lowest frequencies (the exact
+rotation rounded once gives ±0.02).
 
 ```python
 from mlops.optim import AdamW, AdamWQAT, QATLinear, split_params

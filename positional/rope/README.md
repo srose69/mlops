@@ -79,6 +79,24 @@ FP32 q:
 
 (every start from 128K to 10M, and both pair layouts of mlops, in the script's output.)
 
+FP32 does not save transformers and torchtune: at 128K their error is already 1.1e-3, 44 000× the float32
+floor. **As a position.** A frequency's angle error divided by the frequency is where that frequency places the
+token. With FP32 q, in tokens: the shift max / RMS, and the largest error of the distance between two of the 64
+positions:
+
+| position | exact, rounded once | transformers | torchtune | mlops |
+|---|---|---|---|---|
+| 128K | ±0.018 / 0.001, 0.031 | ±0.035 / 0.006, 0.050 | ±0.034 / 0.006, 0.055 | ±0.030 / 0.003, 0.045 |
+| 1M | ±0.015 / 0.001, 0.027 | ±0.13 / 0.048, 0.13 | ±0.13 / 0.048, 0.13 | ±0.087 / 0.007, 0.115 |
+| 4M | ±0.016 / 0.001, 0.029 | ±0.54 / 0.19, 0.49 | ±0.54 / 0.19, 0.49 | ±0.073 / 0.005, 0.130 |
+| 10M | ±0.018 / 0.001, 0.032 | **±1.38 / 0.48, 1.20** | **±1.38 / 0.48, 1.20** | ±0.047 / 0.004, 0.066 |
+
+At 10M every token is placed up to 1.4 positions off, and the distance between two tokens is wrong by up to
+1.2 positions. The pairs that tell neighbouring tokens apart (periods of 7-12 tokens) are turned up to
+0.69 rad (39°) the wrong way. The error grows linearly with the position; above 2^24 = 16.7M FP32 cannot even hold
+the position exactly, and at 32M the shift reaches ±6 tokens. mlops stays at a few hundredths of a token at every position: the float32 floor of the lowest
+frequencies.
+
 With the context-extension recipes (`--scaling all`; YaRN factor 4 from 32K, Llama 3.1, linear 4, dynamic NTK 4,
 LongRoPE from 4K; transformers' copies again checked bit for bit against `LlamaRotaryEmbedding` at every start,
 with its frequencies computed where it computes them: on the CPU for the static recipes, as float32 tensor

@@ -113,6 +113,18 @@ def pair_errors(y, q, pos, inv64, interleaved, att=1.0):
     return float(torch.sqrt((e ** 2).mean())), float(e.max())
 
 
+def position_shifts(y, q, pos, inv64, interleaved):
+    """The rotation error as a position error: each pair's angle error over its frequency, in tokens -- where that
+    frequency puts the token. (max |shift|, RMS shift, max error of the distance m - n between the N positions)."""
+    _, _, r1, r2 = exact(q, pos, inv64, interleaved)
+    yd = y.double()
+    y1, y2 = (yd[..., 0::2], yd[..., 1::2]) if interleaved else yd.split(yd.shape[-1] // 2, dim=-1)
+    dth = torch.angle(torch.complex(y1, y2) * torch.complex(r1, -r2))    # [1, N, H, D/2]
+    d = dth / inv64.to(y.device)
+    dist = (d[0, :, None] - d[0, None, :]).abs().max()
+    return float(d.abs().max()), float(d.pow(2).mean().sqrt()), float(dist)
+
+
 def hf_config(D, base, scaling):
     from transformers import LlamaConfig
     params = dict(scaling or {"rope_type": "default"}, rope_theta=float(base))
@@ -217,6 +229,21 @@ def run(D, base, kind):
                 rms, mx = pair_errors(y, q, pos, inv64, inter, att)
                 cells.append(f"{rms:.1e} / {mx:.1e}")
             print(f"| {label(p)} | " + " | ".join(cells) + " |", flush=True)
+    if scaling:
+        return
+    print(f"\nFP32 q, the error as a position: where each frequency puts the token, in tokens -- max / RMS of the "
+          f"shift, and the largest error of the distance m - n between two of the {N} positions\n")
+    print("| position | exact, rounded once | transformers | torchtune | mlops |")
+    print("|---|---|---|---|---|")
+    for p in STARTS:
+        pos = torch.arange(p, p + N, device=dev)
+        q = torch.randn(1, N, H, D, device=dev)
+        inv64, _ = rope_frequencies(D, base, None, max_position_embeddings=MAX_POS, seq_len=p + N)
+        _, _, r1, r2 = exact(q, pos, inv64, False)
+        cells = [position_shifts(y, q, pos, inv64, inter) for y, inter in
+                 ((torch.cat((r1, r2), dim=-1).float(), False), (transformers_like(q, pos, inv32), False), (torchtune_like(q, pos, inv32), True),
+                  (ours_half(q, None, pos)[0], False))]
+        print(f"| {label(p)} | " + " | ".join(f"{a:.3f} / {b:.3f} / {c:.3f}" for a, b, c in cells) + " |", flush=True)
 
 
 def main():
