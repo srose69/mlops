@@ -23,7 +23,7 @@ CCBIN     ?= $(shell command -v g++-12 2>/dev/null)
 PYTHON    ?= python3
 GPU       ?= 0
 RUN        = CUDA_VISIBLE_DEVICES=$(GPU)
-DETECTED  := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i $(GPU) 2>/dev/null | head -1 | tr -d '.')
+DETECTED  := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i $(GPU) 2>/dev/null | head -1 | sed -n 's/^\([0-9][0-9]*\)\.\([0-9][0-9]*\)$$/\1\2/p')
 TEST_ARCH ?= $(if $(DETECTED),$(DETECTED),61)
 
 ALL_ARCHS := 50 52 53 60 61 62 70 72 75 80 86 87 89 90

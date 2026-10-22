@@ -16,3 +16,7 @@ meta/LICENSE-EXCEPTION
 meta/NOTICE
 # release tooling and artifacts (dev/release.sh -> dist/)
 dev/
+
+# local model captures and reusable baselines; benchmarks accept them but releases never contain them
+/attention/bench/*.pt
+/attention/bench/results/

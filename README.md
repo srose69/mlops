@@ -13,7 +13,8 @@ installs all of them.
 |---|---|---|---|
 | [mlops-optimizers](optimizers) | `mlops.optim` | 0.2.0 | AdamW, and AdamWQAT: AdamW that trains NVFP4 weights in place, on GPUs from Maxwell to Hopper. Transformer Engine trains NVFP4 only on Blackwell (sm_100+), through an FP32 or FP16 master copy re-quantized every step. AdamWQAT keeps no such copy: each weight's position lives on the NVFP4 lattice as a 16-bit coordinate, the moments in FP8, and block scales move only on significant evidence and, UE5M3 by default, can grow 256x without an amax recompute (`to_e4m3` exports Transformer Engine's E4M3 scales bit-exact when they fit, else keeps UE5M3 and warns). 6 B per weight for weight + optimizer state, against 12.6 B for an FP32 master with FP32 moments. |
 | [mlops-positional](positional) | `mlops.positional` | 0.1.0 | RoPE of q and k in one pass, 4–8× transformers' eager path, with YaRN / Llama 3 / LongRoPE scaling built in. Its error does not grow with the position: at the floor of the dtype up to 10M tokens. transformers and torchtune take the angle as one FP32 product: in FP32 their error is 1.1e-3 already at 128K, 44 000× the float32 floor, and 9 % RMS at 10M, where they place every token up to ±1.4 positions off. A bit-exact drop-in for transformers' `apply_rotary_pos_emb`. |
-| `mlops` | | 0.3.0 | meta package: every package above |
+| [mlops-attention](attention) | `mlops.attention` | 0.1.0 | FBLA (Flash Block Attention) compressed-KV FlashAttention decode for DP4A GPUs (sm_61+), in 3+3 and 4+2 modes. On GTX 1080 at 16K, 3+3/4+2 take ~170 us versus 8.94 ms for PyTorch BF16 SDPA (46–55×). On Qwen3-0.6B, 3+3 has delta loss +0.0003, versus +0.0019 for KIVI-4 and +0.599 for llama.cpp `q4_0`. |
+| `mlops` | | 0.4.0 | meta package: every package above |
 
 **Why UE5M3 block scales by default.** NVFP4 as Transformer Engine stores it has E4M3 block scales
 (`2^-9 .. 448`). NVIDIA's NVFP4 pretraining ([arXiv:2509.25149](https://arxiv.org/abs/2509.25149)) diverges
@@ -42,9 +43,29 @@ At 10M the pairs that tell neighbouring tokens apart (periods of 7-12 tokens) ar
 the wrong way. mlops' column does not grow: it is the float32 floor of the lowest frequencies (the exact
 rotation rounded once gives ±0.02).
 
+**What selective KV refinement buys.** FBLA keeps the attention sink and open group in BF16. Every closed
+group has one BF16 base/step per channel and a 6-bit code; only its high 3 or 4 bits are read initially. A
+16-token block's low plane is fetched when its coarse-softmax share `W_j` exceeds the mode's threshold. Unlike
+materialized blockwise attention, the coarse kernel already computes FA2 `(m,l,o)`; refinement adds a sparse
+`full - coarse` correction. On Qwen3-0.6B, two 16K windows, loss on the last 1,024 tokens:
+
+| attention | format-study K / V bits read | delta loss vs BF16 SDPA |
+|---|---:|---:|
+| BF16 SDPA | 16 | +0.0000 |
+| FBLA 3+3 CUDA kernel | physical traffic reported by `make -C attention bench` | **+0.0003** |
+| KIVI 4-bit | 5.0 | +0.0019 |
+| FBLA 4+2 CUDA kernel | physical traffic reported by `make -C attention bench` | +0.0025 |
+| FBLA 3+3 format, `W_j > 3e-4` | 3.60 | +0.0040 |
+
+
+On one 16K window / 2,048 tokens, FBLA 4+2's CUDA kernel has 96.04% top-1 agreement and mean
+`KL(BF16 || FBLA) = 0.00228`, against 95.56% and 0.00464 for KIVI-4. Full tails, loss ranges, format traffic
+and the 16K .. 1M native benchmark: [mlops-attention](attention).
+
 ```python
 from mlops.optim import AdamW, AdamWQAT, QATLinear, split_params
 from mlops.positional import RoPE
+from mlops.attention import encode, decode
 ```
 
 ## Install
@@ -101,6 +122,7 @@ build/          arch.mk (shared by the package Makefiles), torch_ext.py (shared 
 optimizers/     mlops-optimizers: include/ (C API), adamw/ (kernels, tests, bench, math), python/ (mlops.optim),
                 samples/
 positional/     mlops-positional: include/ (C API), rope/ (kernels, tests, math), python/ (mlops.positional), bench/
+attention/      mlops-attention: include/ (C API), fbla/ (kernels, tests, bench), python/ (mlops.attention), samples/
 meta/           the meta package "mlops"
 setup.sh        source installation
 ```

@@ -15,7 +15,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 PYTHON=${PYTHON:-python3}
-PACKAGES=(optimizers positional)  # directories with include/mlops_<name>.h and python/setup.py
+PACKAGES=(optimizers positional attention)  # directories with include/mlops_<name>.h and python/setup.py
 
 version() { sed -n "s/^#define MLOPS_${1^^}_VERSION \"\(.*\)\"/\1/p" "$1/include/mlops_$1.h"; }
 meta_version() { sed -n 's/^VERSION = "\(.*\)"/\1/p' meta/setup.py; }
