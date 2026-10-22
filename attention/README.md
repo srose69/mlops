@@ -1,6 +1,6 @@
 # mlops-attention
 
-FBLA compressed-KV FlashAttention decode for NVIDIA GPUs with DP4A (sm_61 .. sm_90): a C API
+FBLA (Flash Block Attention) - compressed-KV FlashAttention decode for NVIDIA GPUs with DP4A (sm_61 .. sm_90): a C API
 ([`include/`](include)) and a PyTorch package, `mlops.attention`. Every closed 128-token group is a 6-bit
 per-channel affine quantization split into an always-read coarse plane and a selectively read fine plane;
 the attention-sink group and the open group remain BF16. The format, arithmetic, kernels and full
@@ -70,7 +70,6 @@ rows are the format study; kernel rows run `mlops_fbla_decode` and include its Q
 | vLLM FP8 E4M3, per tensor | 8 | +0.0027 (-0.0014 .. +0.0068) |
 | FBLA 4+2, coarse only | 4.25 (refined 0.0%) | +0.0161 (+0.0148 .. +0.0174) |
 | FBLA 3+3, `W_j > 3e-4` | 3.60 (refined 11.7%) | +0.0040 (+0.0039 .. +0.0041) |
-
 | KIVI 2-bit | 3.0 | +0.1031 (+0.1011 .. +0.1050) |
 
 The CUDA kernel's physical traffic is not the format-study expression `coarse + fine × refined`: a selected
