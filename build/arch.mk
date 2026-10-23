@@ -40,7 +40,7 @@ ifneq ($(UNSUPPORTED),)
 endif
 NVCC_VER  := $(shell $(NVCC) --version 2>/dev/null | sed -n 's/.*release \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')
 NVCC_121  := $(shell set -- $(NVCC_VER); [ "$${1:-0}" -gt 12 ] || { [ "$${1:-0}" -eq 12 ] && [ "$${2:-0}" -ge 1 ]; } && echo 1)
-ifeq ($(SM89_FP8)$(NVCC_121)$(filter 89,$(ARCHS)),189)
+ifeq ($(SM89_FP8):$(NVCC_121):$(filter 89,$(ARCHS)),1::89)
   $(warning nvcc $(subst $(eval) ,.,$(NVCC_VER)) < 12.1: sm_89 dropped (FP8 cvt needs PTX ISA 8.1))
   override ARCHS := $(filter-out 89,$(ARCHS))
 endif

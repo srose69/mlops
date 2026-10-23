@@ -7,7 +7,7 @@
 #ifndef MLOPS_ATTENTION_H
 #define MLOPS_ATTENTION_H
 
-#define MLOPS_ATTENTION_VERSION "0.2.0"
+#define MLOPS_ATTENTION_VERSION "0.2.1"
 
 #include "mlops_fbla.h"
 

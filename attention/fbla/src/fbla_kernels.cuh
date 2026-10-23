@@ -1304,6 +1304,19 @@ inline int per_head(const void *kernel, int bound, const Args &a, long long work
   return (int)std::max<long long>(1, std::min<long long>({(long long)std::max(1, slots / heads), (long long)bound, by_work}));
 }
 
+// The select pass does not depend on the format: one copy of its kernels (the object built with
+// MLOPS_FBLA_DEFINE_SHARED, fbla_inst.cu), launched from both format objects through this host function.  From
+// CUDA 12.8 on a kernel template's launch stub is local to its object (-static-global-template-stub), so the
+// kernel itself cannot be shared.
+void launch_select(const Args &a, int qg, dim3 grid, cudaStream_t stream);
+#ifdef MLOPS_FBLA_DEFINE_SHARED
+void launch_select(const Args &a, int qg, dim3 grid, cudaStream_t stream) {
+  if (qg == 1) select_kernel<1><<<grid, 32 * W, 0, stream>>>(a);
+  else if (qg == 2) select_kernel<2><<<grid, 32 * W, 0, stream>>>(a);
+  else select_kernel<4><<<grid, 32 * W, 0, stream>>>(a);
+}
+#endif
+
 template <int CB, int FB, int QG> cudaError_t launch_qg(Args a, int bound, cudaStream_t stream) {
   const int heads = a.batch * a.kv_heads;
   const long long work = (long long)a.groups * SBG;
@@ -1320,7 +1333,7 @@ template <int CB, int FB, int QG> cudaError_t launch_qg(Args a, int bound, cudaS
   a.ctas = p1;
   if constexpr (QG == 4) coarse_kernel4<CB, FB><<<dim3(p1, heads), 32 * W, 0, stream>>>(a);
   else coarse_kernel<CB, FB, QG><<<dim3(p1, heads), 32 * W, 0, stream>>>(a);
-  select_kernel<QG><<<dim3(a.nslices, heads), 32 * W, 0, stream>>>(a);
+  launch_select(a, QG, dim3(a.nslices, heads), stream);
   if constexpr (QG == 4) refine_kernel4<CB, FB><<<dim3(p2, heads), 32 * W, 0, stream>>>(a);
   else refine_kernel<CB, FB, QG><<<dim3(p2, heads), 32 * W, 0, stream>>>(a);
   return cudaGetLastError();

@@ -128,8 +128,9 @@ __global__ void __launch_bounds__(128) close_kernel(const PrefillArgs a, int g0)
 
 // The sink (positions < 128) and the open group (the chunk's last group) take the chunk's tokens; a newly
 // opened group's unused rows are cleared.
-// Format-independent: defined in one object only (fbla_inst.cu, MLOPS_FBLA_DEFINE_SHARED), declared elsewhere.
-__global__ void __launch_bounds__(128) finish_kernel(const PrefillArgs a);
+// Format-independent: compiled into one object only (fbla_inst.cu, MLOPS_FBLA_DEFINE_SHARED) and launched from
+// both through launch_finish, as the select pass.
+void launch_finish(const PrefillArgs &a, int heads, cudaStream_t stream);
 #ifdef MLOPS_FBLA_DEFINE_SHARED
 __global__ void __launch_bounds__(128) finish_kernel(const PrefillArgs a) {
   const int bh = blockIdx.x, n1 = a.n0 + a.count, gl = (n1 - 1) / G;
@@ -148,6 +149,7 @@ __global__ void __launch_bounds__(128) finish_kernel(const PrefillArgs a) {
     }
   }
 }
+void launch_finish(const PrefillArgs &a, int heads, cudaStream_t stream) { finish_kernel<<<heads, 128, 0, stream>>>(a); }
 #endif
 
 // ---- attention: streaming GEMM tiles -------------------------------------------------------------------
@@ -425,17 +427,20 @@ __global__ void __launch_bounds__(PTH) stream_kernel(const PrefillArgs a) {
     const uint32_t half_mask = 0xffffu << (lane & 16);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      if (__ballot_sync(FULL, mb[i] > m[i] + 8.f) & half_mask) {  // uniform over the row's lanes
+      const uint32_t up = __ballot_sync(FULL, mb[i] > m[i] + 8.f);
+      if (up) {  // warp-uniform, so the whole warp shuffles (sm_70+ schedules its halves independently)
         float mx = mb[i];
 #pragma unroll
-        for (int o2 = 1; o2 < 16; o2 <<= 1) mx = fmaxf(mx, __shfl_xor_sync(FULL, mx, o2));
-        if (m[i] != -INFINITY) {
-          const float al = ex2(m[i] - mx);
-          l[i] *= al; Bg[i] *= al;
+        for (int o2 = 1; o2 < 16; o2 <<= 1) mx = fmaxf(mx, __shfl_xor_sync(FULL, mx, o2));  // within the half
+        if (up & half_mask) {  // uniform over the row's lanes
+          if (m[i] != -INFINITY) {
+            const float al = ex2(m[i] - mx);
+            l[i] *= al; Bg[i] *= al;
 #pragma unroll
-          for (int c = 0; c < 8; ++c) { o[i][c] *= al; A[i][c] *= al; }
+            for (int c = 0; c < 8; ++c) { o[i][c] *= al; A[i][c] *= al; }
+          }
+          m[i] = mx;
         }
-        m[i] = mx;
       }
       w[i] = mb[i] == -INFINITY ? 0.f : ex2(mb[i] - m[i]);
       if (!(b & (o0 - 1))) l[i] = fmaf(w[i], sp[i], l[i]);  // the block's leading lane
@@ -671,11 +676,14 @@ __global__ void __launch_bounds__(PTH) stream_kernel(const PrefillArgs a) {
     if (it < nhalf - NST) bar_arrive(BAR_EMPTY + it % NST, PTH);
   }
 
+  float lt[4];  // every lane reduces every row (row_l shuffles over the whole warp), before the validity test
+#pragma unroll
+  for (int i = 0; i < 4; ++i) lt[i] = row_l(i);
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     if (!valid[i]) continue;
     const size_t qr = qrow_of(a, bh, r0 + rr + i);
-    const float inv = 1.f / row_l(i);
+    const float inv = 1.f / lt[i];
     uint32_t w[4];
 #pragma unroll
     for (int c = 0; c < 4; ++c) w[c] = to_bf16(o[i][2 * c] * inv) | (uint32_t)to_bf16(o[i][2 * c + 1] * inv) << 16;
@@ -694,7 +702,7 @@ template <int CB, int FB> cudaError_t launch_prefill(const PrefillArgs &a, cudaS
     const dim3 grid((a.count * a.qg + PROWS - 1) / PROWS, heads);
     stream_kernel<CB, FB><<<grid, PTH, 0, stream>>>(a);
   }
-  finish_kernel<<<heads, 128, 0, stream>>>(a);
+  launch_finish(a, heads, stream);
   return cudaGetLastError();
 }
 
