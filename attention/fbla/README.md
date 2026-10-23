@@ -1,8 +1,9 @@
 # mlops/attention/fbla
 
-FBLA is a compressed-KV FlashAttention decode and prefill for head dimension 128. Closed 128-token groups use a
-6-bit per-channel affine code split into coarse and fine planes; in decode the fine K/V record of a 16-token block
-is read only when its normalized coarse-softmax mass is large enough, prefill reads full codes ([Prefill](#prefill)). Installation, PyTorch API and model-quality results:
+FBLA (Flash Block Attention) is a compressed-KV FlashAttention decode and prefill for head dimension 128. Closed
+128-token groups use a 6-bit per-channel affine code split into coarse and fine planes; in decode the fine K/V
+record of a 16-token block is read only when its normalized coarse-softmax mass is large enough, prefill reads
+full codes ([Prefill](#prefill)). Installation, PyTorch API and model-quality results:
 [the package README](../README.md). The normative physical layout and C contract are in
 [`../include/mlops_fbla.h`](../include/mlops_fbla.h).
 
