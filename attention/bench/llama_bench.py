@@ -9,7 +9,8 @@ layers, mlops.positional RoPE, FBLA prefill / decode), so its numbers sit beside
 As llama-bench: random tokens; `ppP` processes P prompt tokens in one batch, `tgN` generates N tokens one at a
 time; `@ dD` runs the test after a context of D tokens is already in the cache (not timed); one warm-up run,
 then -r timed runs on a fresh cache each, reported as mean +- standard deviation of tokens/s.  The model is
-placed once for the largest context; weights that do not fit stream from host memory (the column `GPU layers`).
+placed per depth (the cache first, then the layers that fit); the rest stream from host memory (the column
+`GPU layers`).
 """
 import argparse
 import importlib.util
