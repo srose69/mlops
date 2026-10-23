@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Build mlops-attention (import mlops.attention): FBLA compressed-KV FlashAttention decode.
+"""Build mlops-attention (import mlops.attention): FBLA compressed-KV FlashAttention prefill and decode.
 
     pip install ./attention/python --no-build-isolation        (from the mlops root; or ./setup.sh attention)
 
@@ -32,7 +32,7 @@ if not archs:
 setup(
     name=NAME,
     version=torch_ext.local_version(VERSION),
-    description="FBLA compressed-KV FlashAttention decode for DP4A NVIDIA GPUs",
+    description="FBLA compressed-KV FlashAttention prefill and decode for DP4A NVIDIA GPUs",
     long_description=open(os.path.join(PKG, "README.md")).read(),
     long_description_content_type="text/markdown",
     packages=["mlops.attention"],

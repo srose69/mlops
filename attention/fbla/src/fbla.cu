@@ -111,6 +111,50 @@ extern "C" mlops_fbla_status mlops_fbla_decode(const mlops_fbla_config *c, const
   return ok();
 }
 
+namespace {
+bool valid_prefill(const mlops_fbla_config *c, int count) {
+  if (!c || c->batch <= 0 || c->q_heads <= 0 || c->kv_heads <= 0 || c->tokens < 0 || count <= 0) return false;
+  if (c->q_heads % c->kv_heads) return false;
+  const long long n1 = (long long)c->tokens + count;
+  if ((c->capacity != 0 && c->capacity < n1) || n1 > MAX_SLICES * SLICE * MLOPS_FBLA_SUBBLOCK) return false;
+  const int r = c->q_heads / c->kv_heads;
+  return r == 1 || r == 2 || r == 4;
+}
+}  // namespace
+
+extern "C" mlops_fbla_status mlops_fbla_prefill(const mlops_fbla_config *c, int count, const uint16_t *q,
+                                                  const uint16_t *k, const uint16_t *v, const mlops_fbla_cache *cache,
+                                                  uint16_t *out, cudaStream_t stream) {
+  if (!c || !cache || !k || !v) return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: null argument");
+  if (q && !out) return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: q needs output");
+  if (!valid_prefill(c, count))
+    return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: batch, heads and count must be positive, tokens >= 0, "
+                "q_heads / kv_heads 1, 2 or 4, tokens + count <= capacity (0: tokens + count) and <= 2^26");
+  if (c->format != MLOPS_FBLA_3P3 && c->format != MLOPS_FBLA_4P2)
+    return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: invalid format");
+  if (!(c->scale >= 0.f)) return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: scale must be nonnegative");
+  const mlops_fbla_cache *x = cache;
+  if (!x->coarse || !x->fine || !x->meta || !x->exact_sink_k || !x->exact_sink_v || !x->exact_open_k || !x->exact_open_v)
+    return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: every cache pointer is required");
+  const void *ptrs[] = {k, v, q, out, x->coarse, x->fine, x->meta, x->exact_sink_k, x->exact_sink_v,
+                        x->exact_open_k, x->exact_open_v};
+  for (const void *p : ptrs)
+    if (!aligned(p, 16)) return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: pointers must be 16-byte aligned");
+
+  mlops_fbla_detail::PrefillArgs a{};
+  a.c = *cache; a.q = q; a.k = k; a.v = v; a.out = out;
+  a.batch = c->batch; a.q_heads = c->q_heads; a.kv_heads = c->kv_heads; a.qg = c->q_heads / c->kv_heads;
+  a.n0 = c->tokens; a.count = count;
+  const int capacity = c->capacity ? c->capacity : c->tokens + count;
+  a.cgroups = (capacity + MLOPS_FBLA_GROUP - 1) / MLOPS_FBLA_GROUP;
+  const float scale = c->scale == 0.f ? 1.f / sqrtf((float)MLOPS_FBLA_HEAD_DIM) : c->scale;
+  a.scale_log2 = scale * 1.4426950408889634f;
+  const cudaError_t e = c->format == MLOPS_FBLA_3P3 ? mlops_fbla_detail::launch_prefill<3, 3>(a, stream)
+                                                     : mlops_fbla_detail::launch_prefill<4, 2>(a, stream);
+  if (e != cudaSuccess) return fail(MLOPS_FBLA_CUDA_ERROR, "mlops_fbla_prefill: %s", cudaGetErrorString(e));
+  return ok();
+}
+
 extern "C" const char *mlops_fbla_status_string(mlops_fbla_status s) {
   switch (s) { case MLOPS_FBLA_OK: return "ok"; case MLOPS_FBLA_INVALID_VALUE: return "invalid value";
                case MLOPS_FBLA_CUDA_ERROR: return "cuda error"; default: return "unknown"; }

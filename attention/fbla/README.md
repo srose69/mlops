@@ -1,8 +1,8 @@
 # mlops/attention/fbla
 
-FBLA is a compressed-KV FlashAttention decode for head dimension 128. Closed 128-token groups use a 6-bit
-per-channel affine code split into coarse and fine planes; the fine K/V record of a 16-token block is read only
-when its normalized coarse-softmax mass is large enough. Installation, PyTorch API and model-quality results:
+FBLA is a compressed-KV FlashAttention decode and prefill for head dimension 128. Closed 128-token groups use a
+6-bit per-channel affine code split into coarse and fine planes; in decode the fine K/V record of a 16-token block
+is read only when its normalized coarse-softmax mass is large enough, prefill reads full codes ([Prefill](#prefill)). Installation, PyTorch API and model-quality results:
 [the package README](../README.md). The normative physical layout and C contract are in
 [`../include/mlops_fbla.h`](../include/mlops_fbla.h).
 
@@ -85,6 +85,31 @@ delta_o = o_full - o_coarse.
 The next item's records and metadata are fetched before the current item is evaluated. Corrections are reduced
 per CTA. The last CTA, detected by a per-head counter after `__threadfence`, combines both passes and writes
 BF16 output; a separate fourth launch is unnecessary.
+
+## Prefill
+
+`mlops_fbla_prefill` appends a chunk of tokens and attends its queries, causally, over the whole cache. It runs
+in three launches. `close_kernel` quantizes the groups the chunk closes, writing the encoder's bytes bit for
+bit. `stream_kernel` computes the attention. `finish_kernel` updates the sink and the open group.
+
+Prefill is compute-bound. A DP4A over 6-bit codes costs what one over the coarse plane does, so prefill reads
+every closed group through its full codes `c 2^FB + f`. This is the decode with every block refined, and
+the output does not depend on the mode. One FlashAttention pass then needs no selection, no second pass and
+no scratch.
+
+`stream_kernel` gives each CTA 8 query rows per consumer warp, as GEMM tiles. It first processes the BF16
+groups (the sink and the row's own group), then streams the closed groups newest first through a two-stage
+shared-memory ring:
+
+* Producer warps turn the coarse and fine records into swizzled tiles of full codes, so every fragment is one
+  conflict-free `LDS.128`. Each half group (64 tokens) gets K `[token][channel word]` and V
+  `[token word][channel]`.
+* Consumer warps quantize q per group (the decode's q-hat), then compute QK and PV by DP4A, with 4 rows × 4
+  tokens and 4 rows × 8 channels per lane. They use an online softmax whose maximum moves only when a
+  sub-block exceeds it by 2^8.
+
+The two sides meet only at named barriers. The block is 8 warps: 4+2 uses 7 consumers and 1 producer, while
+3+3 uses 6 consumers and 2 producers, because unpacking the 3-bit planes needs the second producer warp.
 
 ## Integer arithmetic
 
@@ -191,6 +216,7 @@ DRAM at short contexts.
 |---|---|
 | `../include/mlops_fbla.h` | C API and normative cache layout |
 | `src/fbla_kernels.cuh` | coarse, select and refinement kernels; DP4A/layout primitives |
+| `src/fbla_prefill.cuh` | prefill: group closing, the streaming attention kernel, sink / open update |
 | `src/fbla.cu` | validation, scratch geometry and format dispatch |
 | `src/fbla_inst.cu` | separate 3+3 and 4+2 instances |
 | `tests/test_fbla.cu` | float64 definition, independent packer, full CUDA test matrix |

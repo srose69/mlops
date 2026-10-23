@@ -26,7 +26,19 @@ struct Args {
   float scale_log2, log2_tau;
 };
 
+// One prefill (fbla_prefill.cuh): close, stream and finish launches.
+struct PrefillArgs {
+  mlops_fbla_cache c;
+  const uint16_t *q;      // [batch, q_heads, count, 128] BF16, or null (append only)
+  const uint16_t *k, *v;  // [batch, kv_heads, count, 128] BF16: the chunk's tokens
+  uint16_t *out;          // [batch, q_heads, count, 128] BF16
+  int batch, q_heads, kv_heads, qg, n0, count, cgroups;
+  float scale_log2;
+};
+
+// instantiated per format in fbla_inst.cu (one object each); fbla.cu sees only these declarations
 template <int CB, int FB> cudaError_t launch(const Args &, int bound, cudaStream_t);
+template <int CB, int FB> cudaError_t launch_prefill(const PrefillArgs &, cudaStream_t);
 
 __device__ __forceinline__ float bf16(uint16_t x) { return __uint_as_float((uint32_t)x << 16); }
 __device__ __forceinline__ uint16_t to_bf16(float x) {

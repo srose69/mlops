@@ -70,7 +70,7 @@ def encode(x: torch.Tensor, cfg: FBLAConfig) -> dict:
     lo, hi = xb.amin(-2, keepdim=True), xb.amax(-2, keepdim=True)
     L = 2 ** (cfg.coarse_bits + cfg.fine_bits) - 1
     base = _bf16(lo, -1)
-    step = _bf16((hi - base) / L, +1)
+    step = _bf16((hi - base) / torch.full_like(hi, L), +1)  # IEEE division (tensor / scalar multiplies by 1 / L)
     code = torch.where(step > 0, torch.round((xb - base) / step.clamp_min(1e-30)), torch.zeros_like(xb)).clamp(0, L)
     return dict(base=base, step=step, code=code.reshape(*lead, N, D))
 

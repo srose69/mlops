@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
  * Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
  *
- * FBLA decode attention over a compressed KV cache, sm_61+ (DP4A).  Head dim 128; tokens form groups of
- * 128 (per group and channel a BF16 base and step) and sub-blocks of 16 (the unit of selective refinement).
+ * FBLA attention over a compressed KV cache, sm_61+ (DP4A): decode, and prefill (mlops_fbla_prefill).  Head
+ * dim 128; tokens form groups of 128 (per group and channel a BF16 base and step) and sub-blocks of 16 (the unit
+ * of selective refinement).
  *
  * Format.  Every element of a closed group has a 6-bit code c, x = base + c * step (base = the group's
  * channel minimum rounded down, step = range / 63 rounded up, both BF16).  The code is stored as two planes,
@@ -60,10 +61,10 @@ typedef enum {
   MLOPS_FBLA_CUDA_ERROR = 2
 } mlops_fbla_status;
 
-typedef struct {
-  const uint8_t *coarse, *fine;
-  const uint16_t *meta;
-  const uint16_t *exact_sink_k, *exact_sink_v, *exact_open_k, *exact_open_v;
+typedef struct {  /* decode only reads the cache; prefill writes it (records, metadata, sink, open group) */
+  uint8_t *coarse, *fine;
+  uint16_t *meta;
+  uint16_t *exact_sink_k, *exact_sink_v, *exact_open_k, *exact_open_v;
 } mlops_fbla_cache;
 
 typedef struct {
@@ -84,6 +85,18 @@ size_t mlops_fbla_decode_scratch_bytes(const mlops_fbla_config *cfg);
 mlops_fbla_status mlops_fbla_decode(const mlops_fbla_config *cfg, const uint16_t *q,
                                     const mlops_fbla_cache *cache, uint16_t *output,
                                     void *scratch, size_t scratch_bytes, cudaStream_t stream);
+
+/* Prefill (and append): `count` new tokens.  k / v [batch, kv_heads, count, 128] BF16 are appended to the
+ * cache, which holds cfg->tokens (>= 0) tokens before the call and must have cfg->capacity >= tokens + count
+ * (capacity 0 means tokens + count): the groups they close are quantized into the records and metadata, the
+ * sink and open groups take their BF16 tokens.  With q non-null, q / output [batch, q_heads, count, 128] BF16:
+ * the query of position tokens + i attends to the tokens 0 .. tokens + i, the closed groups through their full
+ * 6-bit codes (every block refined: mlops_fbla_decode with tau -> 0 after appending them; cfg->tau is not
+ * used), the sink and its own group BF16.  q null: append only (output unused).  A zero-filled cache (tokens 0)
+ * of the capacity's size is an empty cache.  Up to three kernel launches on `stream`, no scratch. */
+mlops_fbla_status mlops_fbla_prefill(const mlops_fbla_config *cfg, int count, const uint16_t *q,
+                                     const uint16_t *k, const uint16_t *v, const mlops_fbla_cache *cache,
+                                     uint16_t *output, cudaStream_t stream);
 
 const char *mlops_fbla_status_string(mlops_fbla_status status);
 const char *mlops_fbla_last_error(void);

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-# mlops-attention: FBLA compressed-KV FlashAttention decode (fbla/).
+# mlops-attention: FBLA compressed-KV FlashAttention prefill and decode (fbla/).
 #   make lib        libmlops_attention.a for $(ARCHS) (default: every DP4A architecture sm_61..sm_90)
 #   make test       both formats against a float64 model; GQA 1/2/4, capacity, 384 .. 256K tokens (GPU $(GPU))
 #   make bench      local run: 3+3 / 4+2 at 16K .. 1M; KV heads 1/8, GQA 2/4, traffic and NVML clocks
@@ -22,7 +22,8 @@ endif
 
 VERSION := $(shell sed -n 's/^#define MLOPS_ATTENTION_VERSION "\(.*\)"/\1/p' include/mlops_attention.h)
 FLAGS   = $(if $(CCBIN),-ccbin $(CCBIN)) -O3 -std=c++17 -Xcompiler -ffp-contract=off,-fPIC -Iinclude -Ifbla/src
-HDRS    = include/mlops_attention.h include/mlops_fbla.h fbla/src/common.cuh fbla/src/fbla_kernels.cuh
+HDRS    = include/mlops_attention.h include/mlops_fbla.h fbla/src/common.cuh fbla/src/fbla_kernels.cuh \
+          fbla/src/fbla_prefill.cuh
 OBJS    = fbla fbla_inst_3p3 fbla_inst_4p2
 NVCC_THREADS := $(shell t=$$(( $(JOBS) / $(words $(OBJS)) )); [ $$t -lt 1 ] && t=1; a=$(words $(ARCHS)); [ $$t -gt $$a ] && t=$$a; echo $$t)
 
@@ -66,7 +67,7 @@ install: $(OBJDIR)/libmlops_attention.a
 	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib/pkgconfig
 	install -m 644 include/mlops_attention.h include/mlops_fbla.h $(DESTDIR)$(PREFIX)/include/
 	install -m 644 $(OBJDIR)/libmlops_attention.a $(DESTDIR)$(PREFIX)/lib/
-	printf 'prefix=%s\nincludedir=$${prefix}/include\nlibdir=$${prefix}/lib\n\nName: mlops-attention\nDescription: FBLA compressed-KV FlashAttention decode\nVersion: $(VERSION)\nCflags: -I$${includedir} -I$(CUDA_HOME)/include\nLibs: -L$${libdir} -lmlops_attention -L$(CUDA_HOME)/lib64 -lcudart -lstdc++\n' '$(PREFIX)' > $(DESTDIR)$(PREFIX)/lib/pkgconfig/mlops-attention.pc
+	printf 'prefix=%s\nincludedir=$${prefix}/include\nlibdir=$${prefix}/lib\n\nName: mlops-attention\nDescription: FBLA compressed-KV FlashAttention prefill and decode\nVersion: $(VERSION)\nCflags: -I$${includedir} -I$(CUDA_HOME)/include\nLibs: -L$${libdir} -lmlops_attention -L$(CUDA_HOME)/lib64 -lcudart -lstdc++ -lm\n' '$(PREFIX)' > $(DESTDIR)$(PREFIX)/lib/pkgconfig/mlops-attention.pc
 
 clean:
 	rm -rf out

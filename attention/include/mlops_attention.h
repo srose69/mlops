@@ -2,12 +2,12 @@
  * Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
  *
  * mlops-attention: every attention implementation of the package (libmlops_attention.a).
- *   mlops_fbla.h   FBLA compressed-KV FlashAttention decode: 3+3 / 4+2 selective-refinement caches
+ *   mlops_fbla.h   FBLA compressed-KV FlashAttention prefill and decode: 3+3 / 4+2 selective-refinement caches
  */
 #ifndef MLOPS_ATTENTION_H
 #define MLOPS_ATTENTION_H
 
-#define MLOPS_ATTENTION_VERSION "0.1.0"
+#define MLOPS_ATTENTION_VERSION "0.2.0"
 
 #include "mlops_fbla.h"
 

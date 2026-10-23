@@ -31,6 +31,7 @@ from mlops.attention import decode as fbla_decode, encode as fbla_encode  # noqa
 from mlops.attention import fbla_reference as fb  # noqa: E402
 from mlops.attention.fbla import FBLACache  # noqa: E402
 import kv_native as kn  # noqa: E402
+from termtable import Table  # noqa: E402
 
 torch.backends.cuda.matmul.allow_tf32 = False
 CUR = {}
@@ -162,8 +163,8 @@ def main():
     metric = "absolute LM loss" if a.absolute else "delta vs bf16 SDPA"
     print(f"{a.model}: {len(wins)} windows of {a.win} tokens, loss of the {what}; {metric} (mean, min .. max)\n")
     loss_heading = "LM loss" if a.absolute else "delta loss"
-    print(f"| attention | K / V bits per element read | {loss_heading} |")
-    print("|---|---|---|")
+    table = Table([("attention", 56, "<"), ("K / V bits per element read", 20, ">"),
+                   (loss_heading + " (mean, min .. max)", 30, ">")])
     if a.only:
         keys = a.only.split(",")
         use_cached_base = a.baseline_losses is not None
@@ -183,7 +184,7 @@ def main():
         if isinstance(mode, fb.FBLAConfig):
             st = CUR["stats"]; share = st["refined"] / max(st["quantized"], 1)
             bits = f"{mode.coarse_bits + 32 / G + mode.fine_bits * share:.2f} (refined {share:.1%})"
-        print(f"| {name} | {bits} | {dl.mean():+.4f} ({dl.min():+.4f} .. {dl.max():+.4f}) |", flush=True)
+        table.row(name, bits, f"{dl.mean():+.4f} ({dl.min():+.4f} .. {dl.max():+.4f})")
 
 
 if __name__ == "__main__":

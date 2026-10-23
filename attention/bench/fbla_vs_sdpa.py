@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from mlops.attention import decode, encode
+from termtable import Table
 from mlops.attention import fbla_reference as fr
 
 MODES = [("3+3", 3, 3, 3e-4), ("4+2", 4, 2, 1e-3)]
@@ -55,8 +56,7 @@ def accuracy(path, layers, M):
           f"relative error vs float64 attention, mean over {len(layers)} layers x {M} positions\n")
     names = ["FBLA 3+3 kernel", "FBLA 3+3 reference", "kernel vs reference", "FBLA 4+2 kernel",
              "FBLA 4+2 reference", "kernel vs reference", "SDPA BF16"]
-    print("| layer | " + " | ".join(names) + " |")
-    print("|---|" + "---|" * len(names))
+    t = Table([("layer", 5, ">")] + [(n, 9, ">") for n in names])
     sums = [0.0] * len(names)
     pos = torch.arange(N - M, N, device="cuda")
     for li in layers:
@@ -78,8 +78,9 @@ def accuracy(path, layers, M):
             sd = F.scaled_dot_product_attention(q[None, :, N - M:], kr[None], vr[None], attn_mask=mask, scale=scale)[0]
         row.append(rel(sd, exact))
         sums = [x + y for x, y in zip(sums, row)]
-        print(f"| {li} | " + " | ".join(f"{x:.2e}" for x in row) + " |", flush=True)
-    print("| mean | " + " | ".join(f"{x / len(layers):.2e}" for x in sums) + " |\n")
+        t.row(li, *(f"{x:.2e}" for x in row))
+    t.row("mean", *(f"{x / len(layers):.2e}" for x in sums))
+    print()
 
 
 def timed(fn, reps=20):
@@ -98,9 +99,11 @@ def timed(fn, reps=20):
 
 
 def speed(sizes):
-    print("decode latency (us), B = 1, 16 q heads / 8 KV heads, D = 128\n")
-    print("| context | SDPA FP16 efficient (KV repeated) | SDPA BF16 math | SDPA FP32 math | FBLA 3+3 | FBLA 4+2 | speed-up vs SDPA BF16 / FP32 |")
-    print("|---|---|---|---|---|---|---|")
+    print("decode latency (us), B = 1, 16 q heads / 8 KV heads, D = 128; speed-up = SDPA / FBLA 3+3, 4+2;\n"
+          "OOM: PyTorch ran out of GPU memory (SDPA repeats K / V to every query head, FP32 copies them first)\n")
+    t = Table([("context", 7, ">"), ("SDPA FP16 eff. (KV repeated)", 10, ">"), ("SDPA BF16 math", 10, ">"),
+               ("SDPA FP32 math", 10, ">"), ("FBLA 3+3", 8, ">"), ("FBLA 4+2", 8, ">"),
+               ("x vs BF16 math", 15, ">"), ("x vs FP32 math", 15, ">")])
     torch.manual_seed(0)
     for N in sizes:
         k = torch.randn(1, 8, N, 128, device="cuda", dtype=torch.bfloat16)
@@ -122,10 +125,9 @@ def speed(sizes):
             c = encode(k, v, mode)
             res.append(timed(lambda: decode(q[:, :, 0], c)))
             del c
-        print(f"| {N} | {t_eff:.1f} | {t_math:.1f} | {t_fp32:.1f} | {res[0]:.1f} | {res[1]:.1f} | "
-              f"{t_math / res[0]:.2f}x / {t_math / res[1]:.2f}x; "
-              f"{t_fp32 / res[0]:.2f}x / {t_fp32 / res[1]:.2f}x |",
-              flush=True)
+        us = lambda x: "OOM" if math.isnan(x) else f"{x:.1f}"  # timed() returns nan when PyTorch runs out of memory
+        up = lambda x: "-" if math.isnan(x) else f"{x / res[0]:.1f} / {x / res[1]:.1f}"
+        t.row(N, us(t_eff), us(t_math), us(t_fp32), us(res[0]), us(res[1]), up(t_math), up(t_fp32))
         del k, v
         torch.cuda.empty_cache()
 

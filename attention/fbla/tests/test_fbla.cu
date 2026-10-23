@@ -146,8 +146,10 @@ struct Case {
   }
 
   // float64 model of the definition
-  std::vector<double> reference() const {
-    const size_t pad = (size_t)groups * G;
+  // decode semantics at position P - 1 over its prefix of P tokens, queries qv [B, QH, D]
+  std::vector<double> reference_at(int P, const float *qv) const {
+    const int groups = (P + G - 1) / G, nb = groups * 8, N = P;
+    const size_t pad = (size_t)this->groups * G;
     const float sl = (1.f / sqrtf((float)D)) * 1.4426950408889634f;  // FP32, as the kernel scales q
     const double hoff = .5 * ((1 << fb) - 1);
     std::vector<double> out((size_t)B * QH * D);
@@ -156,7 +158,7 @@ struct Case {
         const int hk = hq / (QH / KH);
         const size_t h = (size_t)b * KH + hk;
         float qs[D];
-        for (int c = 0; c < D; ++c) qs[c] = q[((size_t)b * QH + hq) * D + c] * sl;
+        for (int c = 0; c < D; ++c) qs[c] = qv[((size_t)b * QH + hq) * D + c] * sl;
         // per sub-block: coarse and full scores
         std::vector<double> sc((size_t)nb * S, -INFINITY), sf(sc.size(), -INFINITY);
         std::vector<char> exact(nb, 0);
@@ -240,6 +242,8 @@ struct Case {
       }
     return out;
   }
+  std::vector<double> reference() const { return reference_at(N, q.data()); }
+
 };
 
 template <class T> static T *up(const std::vector<T> &h) {
@@ -282,6 +286,91 @@ static int run(int cb, int fb, int B, int QH, int KH, int N, float tau, unsigned
   return f;
 }
 
+// Prefill: an empty cache of capacity N filled by chunks; every chunk's queries (one per position and q head)
+// against the float64 model at their positions (a sample of them: the first and last of a chunk, around group
+// boundaries, and every 37th), then the records and metadata of every closed group against the host's
+// packing, bit for bit.  append_only: the chunks are appended with q = null, and the cache alone is checked.
+static int run_prefill(int cb, int fb, int B, int QH, int KH, int N, unsigned seed, std::vector<int> chunks,
+                       bool append_only = false) {
+  Case c(cb, fb, B, QH, KH, N, 1e-30f, seed, N);  // prefill refines every block
+  const size_t pad = (size_t)c.groups * G, heads = (size_t)B * KH;
+  std::mt19937 r(seed + 1000);
+  std::normal_distribution<float> n01(0.f, 1.f);
+  std::vector<float> qall((size_t)B * QH * N * D);  // [B, QH, N, D]
+  for (auto &x : qall) x = b2f(f2b(1.5f * n01(r)));
+  std::vector<uint8_t> zc(c.coarse.size(), 0), zf(c.fine.size(), 0);
+  std::vector<uint16_t> zm(c.meta.size(), 0), ze(heads * G * D, 0);
+  uint8_t *dc = up(zc), *df = up(zf);
+  uint16_t *dm = up(zm), *dsk = up(ze), *dsv = up(ze), *dok = up(ze), *dov = up(ze);
+  mlops_fbla_cache cache{dc, df, dm, dsk, dsv, dok, dov};
+  int f = 0, n0 = 0;
+  double err2 = 0, nrm2 = 0, worst = 0;
+  long checked = 0;
+  for (int cnt : chunks) {
+    std::vector<uint16_t> kh(heads * cnt * D), vh(kh.size()), qh((size_t)B * QH * cnt * D);
+    for (size_t h = 0; h < heads; ++h)
+      for (int t = 0; t < cnt; ++t)
+        for (int x = 0; x < D; ++x) {
+          kh[(h * cnt + t) * D + x] = f2b(c.k[(h * pad + n0 + t) * D + x]);
+          vh[(h * cnt + t) * D + x] = f2b(c.v[(h * pad + n0 + t) * D + x]);
+        }
+    for (size_t hq = 0; hq < (size_t)B * QH; ++hq)
+      for (int t = 0; t < cnt; ++t)
+        for (int x = 0; x < D; ++x) qh[(hq * cnt + t) * D + x] = f2b(qall[(hq * N + n0 + t) * D + x]);
+    uint16_t *dk = up(kh), *dv = up(vh), *dq = up(qh), *dout;
+    CK(cudaMalloc(&dout, qh.size() * 2));
+    mlops_fbla_config cfg{B, QH, KH, n0, 0.f, 0.f, cb == 3 ? MLOPS_FBLA_3P3 : MLOPS_FBLA_4P2, N};
+    if (mlops_fbla_prefill(&cfg, cnt, append_only ? nullptr : dq, dk, dv, &cache, append_only ? nullptr : dout, 0)) {
+      fprintf(stderr, "%s\n", mlops_fbla_last_error()); exit(1);
+    }
+    CK(cudaDeviceSynchronize());
+    if (!append_only) {
+      std::vector<uint16_t> got(qh.size());
+      CK(cudaMemcpy(got.data(), dout, got.size() * 2, cudaMemcpyDeviceToHost));
+      for (int t = 0; t < cnt; ++t) {
+        const int p = n0 + t;
+        if (!(t == 0 || t == cnt - 1 || p % G <= 1 || p % G == G - 1 || p % 37 == 0)) continue;
+        std::vector<float> qv((size_t)B * QH * D);
+        for (size_t hq = 0; hq < (size_t)B * QH; ++hq)
+          for (int x = 0; x < D; ++x) qv[hq * D + x] = qall[(hq * N + p) * D + x];
+        const std::vector<double> ref = c.reference_at(p + 1, qv.data());
+        for (size_t hq = 0; hq < (size_t)B * QH; ++hq)
+          for (int x = 0; x < D; ++x) {
+            const double e = b2f(got[(hq * cnt + t) * D + x]) - ref[hq * D + x];
+            err2 += e * e; nrm2 += ref[hq * D + x] * ref[hq * D + x]; worst = std::max(worst, fabs(e));
+          }
+        ++checked;
+      }
+    }
+    for (void *x : {(void *)dk, (void *)dv, (void *)dq, (void *)dout}) cudaFree(x);
+    n0 += cnt;
+  }
+  // the closed groups' records and metadata, bit for bit
+  const int closed = (N - 1) / G;
+  std::vector<uint8_t> gc(c.coarse.size()), gf(c.fine.size());
+  std::vector<uint16_t> gm(c.meta.size());
+  CK(cudaMemcpy(gc.data(), dc, gc.size(), cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(gf.data(), df, gf.size(), cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(gm.data(), dm, gm.size() * 2, cudaMemcpyDeviceToHost));
+  long bad = 0;
+  for (size_t h = 0; h < heads; ++h)
+    for (int g = 0; g < closed; ++g) {
+      const size_t hg = h * c.cgroups + g;
+      for (size_t e = 0; e < 8u * 2 * cb * 256; ++e) bad += gc[hg * 8 * 2 * cb * 256 + e] != c.coarse[hg * 8 * 2 * cb * 256 + e];
+      for (size_t e = 0; e < 8u * 2 * fb * 256; ++e) bad += gf[hg * 8 * 2 * fb * 256 + e] != c.fine[hg * 8 * 2 * fb * 256 + e];
+      for (size_t e = 0; e < 512; ++e) bad += gm[hg * 512 + e] != c.meta[hg * 512 + e];
+    }
+  const double rel = nrm2 > 0 ? sqrt(err2 / nrm2) : 0;
+  const bool ok = bad == 0 && (append_only || (rel < 4e-3 && worst < 2e-2));
+  printf("[%s] prefill %d+%d B=%d heads %d/%d N=%-6d chunks %-3zu%s: ", ok ? "PASS" : "FAIL", cb, fb, B, QH, KH, N,
+         chunks.size(), append_only ? " (append only)" : "");
+  if (!append_only) printf("%ld positions, rel. RMS error %.2e, max abs %.2e; ", checked, rel, worst);
+  printf("closed groups' bytes differing: %ld\n", bad);
+  f += !ok;
+  for (void *x : {(void *)dc, (void *)df, (void *)dm, (void *)dsk, (void *)dsv, (void *)dok, (void *)dov}) cudaFree(x);
+  return f;
+}
+
 int main() {
   int f = 0;
   for (int fmt = 0; fmt < 2; ++fmt) {
@@ -298,6 +387,16 @@ int main() {
     f += run(cb, fb, 1, 8, 2, 2048, 1e30f, 10);    // GQA 4, nothing refined
     f += run(cb, fb, 1, 8, 2, 2048, 1e-30f, 11);   // GQA 4, everything refined
     f += run(cb, fb, 1, 32, 8, 20000, 3e-4f, 12);  // GQA 4, Llama-3-8B geometry
+  }
+  for (int fmt = 0; fmt < 2; ++fmt) {
+    const int cb = fmt ? 4 : 3, fb = fmt ? 2 : 3;
+    f += run_prefill(cb, fb, 1, 2, 2, 100, 21, {100});                 // inside the first group
+    f += run_prefill(cb, fb, 1, 4, 2, 1000, 22, {1000});               // one chunk, open group of 104
+    f += run_prefill(cb, fb, 2, 8, 2, 2048, 23, {300, 212, 128, 1, 1407});  // chunk edges on and off groups
+    f += run_prefill(cb, fb, 1, 16, 8, 4096, 24, {1024, 1024, 2048});  // Qwen3 geometry
+    f += run_prefill(cb, fb, 1, 2, 2, 3000, 25, {1500, 1500});         // MHA, two chunks
+    f += run_prefill(cb, fb, 1, 8, 2, 3000, 26, {700, 2300});          // GQA 4
+    f += run_prefill(cb, fb, 1, 2, 2, 2000, 27, {1, 1, 254, 1744}, true);  // append only
   }
   printf(f ? "\n%d FAILED\n" : "\nall passed\n", f);
   return f != 0;

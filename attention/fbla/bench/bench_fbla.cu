@@ -69,7 +69,7 @@ __global__ void fill_meta(uint16_t *p, size_t n) {  // bases in [-0.25, 0.25), s
 struct Cache {
   int cb, fb, cap;
   uint8_t *coarse{}, *fine{};
-  uint16_t *meta{}, *ex{};
+  uint16_t *meta{}, *ex{}, *ex2{};
   Cache(int cb_, int fb_, int cap_, int KH) : cb(cb_), fb(fb_), cap(cap_) {
     const size_t sub = (size_t)KH * (cap / 16), groups = (size_t)KH * (cap / 128);
     CUDA_OK(cudaMalloc(&coarse, sub * 2 * cb * 256)); fill_bytes<<<1024, 256>>>(coarse, sub * 2 * cb * 256, 7u + cb);
@@ -78,9 +78,13 @@ struct Cache {
     CUDA_OK(cudaMalloc(&meta, groups * 1024));
     fill_meta<<<512, 256>>>(meta, groups * 512);
     CUDA_OK(cudaMalloc(&ex, (size_t)KH * 128 * 128 * 2)); fill_bf16<<<64, 256>>>(ex, (size_t)KH * 128 * 128, 11, -.5f, 1.f);
+    // prefill writes the sink and the open group: K / V of both, apart from the decode rows' shared `ex`
+    CUDA_OK(cudaMalloc(&ex2, (size_t)KH * 128 * 128 * 2 * 2)); fill_bf16<<<64, 256>>>(ex2, (size_t)KH * 128 * 128 * 2, 12, -.5f, 1.f);
+    CUDA_OK(cudaFree(ex)); CUDA_OK(cudaMalloc(&ex, (size_t)KH * 128 * 128 * 2 * 2));
+    fill_bf16<<<64, 256>>>(ex, (size_t)KH * 128 * 128 * 2, 11, -.5f, 1.f);
     CUDA_OK(cudaDeviceSynchronize());
   }
-  ~Cache() { for (void *p : {(void *)coarse, (void *)fine, (void *)meta, (void *)ex}) cudaFree(p); }
+  ~Cache() { for (void *p : {(void *)coarse, (void *)fine, (void *)meta, (void *)ex, (void *)ex2}) cudaFree(p); }
 };
 
 static void run_case(Bench &bench, double peak_gbs, const Cache &cc, int KH, int gqa, int tokens, void *scratch,
@@ -148,6 +152,37 @@ static void run_case(Bench &bench, double peak_gbs, const Cache &cc, int KH, int
   cudaFree(dq); cudaFree(dout);
 }
 
+// Prefill, streaming: the cache holds `ctx` tokens, a chunk of `chunk` new tokens (queries, keys, values) is
+// appended and attended.  Work = attended (query row, key) pairs: q_heads x sum over the chunk of (position + 1);
+// "equiv. TFLOPS" counts the 4 D floating-point operations a BF16 attention spends per pair (Q K^T and P V).
+static void run_prefill_case(Bench &bench, const Cache &cc, int KH, int gqa, int ctx, int chunk) {
+  const int QH = gqa * KH, D = 128;
+  const mlops_fbla_format fmt = cc.cb == 3 ? MLOPS_FBLA_3P3 : MLOPS_FBLA_4P2;
+  uint16_t *q, *k, *v, *out;
+  CUDA_OK(cudaMalloc(&q, (size_t)QH * chunk * D * 2)); CUDA_OK(cudaMalloc(&out, (size_t)QH * chunk * D * 2));
+  CUDA_OK(cudaMalloc(&k, (size_t)KH * chunk * D * 2)); CUDA_OK(cudaMalloc(&v, (size_t)KH * chunk * D * 2));
+  fill_bf16<<<256, 256>>>(q, (size_t)QH * chunk * D, 21, -2.f, 4.f);
+  fill_bf16<<<256, 256>>>(k, (size_t)KH * chunk * D, 22, -2.f, 4.f);
+  fill_bf16<<<256, 256>>>(v, (size_t)KH * chunk * D, 23, -1.f, 2.f);
+  mlops_fbla_config cfg{1, QH, KH, ctx, 0.f, 0.f, fmt, cc.cap};
+  mlops_fbla_cache cache{cc.coarse, cc.fine, cc.meta, cc.ex, cc.ex + KH * 128 * 128, cc.ex2, cc.ex2 + KH * 128 * 128};
+  auto call = [&] {
+    if (mlops_fbla_prefill(&cfg, chunk, q, k, v, &cache, out, 0)) {
+      fprintf(stderr, "%s\n", mlops_fbla_last_error()); exit(1);
+    }
+  };
+  call(); CUDA_OK(cudaDeviceSynchronize());
+  cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+  cudaEventRecord(e0); call(); cudaEventRecord(e1); cudaEventSynchronize(e1);
+  float est; cudaEventElapsedTime(&est, e0, e1);
+  const BenchRow row = bench.run(call, std::max(3, std::min(300, (int)(800.f / std::max(est, 1e-3f)))));
+  const double pairs = (double)QH * chunk * (ctx + 0.5 * (chunk + 1));
+  printf("%-6s %3d %3d %9d %7d %12.3f %12.2f %12.2f %8.0f\n", cc.cb == 3 ? "3+3" : "4+2", KH, gqa, ctx, chunk,
+         row.ms, pairs / (row.ms * 1e-3) * 1e-9, 4.0 * D * pairs / (row.ms * 1e-3) * 1e-12, row.mhz);
+  fflush(stdout);
+  for (void *x : {(void *)q, (void *)k, (void *)v, (void *)out}) cudaFree(x);
+}
+
 int main() {
   int dev = 0; CUDA_OK(cudaGetDevice(&dev));
   cudaDeviceProp p{}; CUDA_OK(cudaGetDeviceProperties(&p, dev));
@@ -204,5 +239,29 @@ int main() {
       }
       cudaFree(scratch);
     }
+
+  // ---- prefill -----------------------------------------------------------------------------------------
+  const int pcases[][2] = {{0, 2048}, {16384, 2048}, {65536, 512}, {65536, 2048}, {65536, 8192}, {262144, 2048}};
+  bool header = false;
+  for (int fmt = 0; fmt < 2; ++fmt) {
+    const int KH = 8, gqa = 2, cb = fmt ? 4 : 3, fb = fmt ? 2 : 3;
+    auto name = [&](char *s, size_t n, int ctx, int chunk) {
+      snprintf(s, n, "PREFILL %d+%d KV=%d GQA=%d ctx=%d chunk=%d", cb, fb, KH, gqa, ctx, chunk);
+    };
+    bool any = false;
+    for (const auto &pc : pcases) { char s[96]; name(s, sizeof s, pc[0], pc[1]); any |= bench_want(s); }
+    if (!any) continue;
+    if (!header) {
+      printf("\nprefill: a chunk appended to a cache of `context` tokens and attended (Qwen3-0.6B heads)\n"
+             "%-6s %3s %3s %9s %7s %12s %12s %12s %8s\n", "format", "KV", "GQA", "context", "chunk", "latency ms",
+             "Gpairs/s", "equiv. TFLOPS", "SM MHz");
+      header = true;
+    }
+    Cache cc(cb, fb, 1 << 19, KH);
+    for (const auto &pc : pcases) {
+      char s[96]; name(s, sizeof s, pc[0], pc[1]);
+      if (bench_want(s)) run_prefill_case(bench, cc, KH, gqa, pc[0], pc[1]);
+    }
+  }
   return 0;
 }

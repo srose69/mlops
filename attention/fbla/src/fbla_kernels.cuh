@@ -80,7 +80,6 @@ __device__ __forceinline__ uint4 lds128v(const void *p) {  // volatile: ordered 
   return v;
 }
 __device__ __forceinline__ uint4 ld128(const uint8_t *p) { return __ldg(reinterpret_cast<const uint4 *>(p)); }
-__device__ __forceinline__ uint2 ld64(const uint8_t *p) { return __ldg(reinterpret_cast<const uint2 *>(p)); }
 // Streamed record loads, volatile: ptxas keeps them in program order with the other volatile memory
 // operations (the P bytes in shared memory), so the next record's load is issued where it is written,
 // right after the registers it overwrites are read, instead of being sunk to the end of the loop.

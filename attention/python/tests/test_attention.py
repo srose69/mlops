@@ -76,14 +76,14 @@ def test_record_layout(mode, cb, fb):
     g = torch.Generator(device="cuda").manual_seed(1)
     k = torch.randn(1, 1, 512, 128, device="cuda", generator=g).bfloat16()
     v = torch.randn(1, 1, 512, 128, device="cuda", generator=g).bfloat16()
-    c = encode(k, v, mode)
+    c = encode(k, v, mode)  # 4 groups: 0 .. 2 closed (the GPU quantizer), 3 open
     for x, tensor in ((k, 0), (v, 1)):
         base, step, code = _quantize(x, 4)
-        code = code[0, 0].reshape(32, 16, 128).long()
-        coarse, fine = _unpack(c.coarse[0, 0], cb)[tensor], _unpack(c.fine[0, 0], fb)[tensor]
+        code = code[0, 0, :384].reshape(24, 16, 128).long()
+        coarse, fine = _unpack(c.coarse[0, 0, :24], cb)[tensor], _unpack(c.fine[0, 0, :24], fb)[tensor]
         assert torch.equal(coarse, code >> fb) and torch.equal(fine, code & ((1 << fb) - 1))
-        m = c.meta[0, 0].reshape(4, 2, 32, 2, 4)[:, tensor]  # group, lane, (base, step), channel
-        assert torch.equal(m[:, :, 0].reshape(4, 128), base[0, 0]) and torch.equal(m[:, :, 1].reshape(4, 128), step[0, 0])
+        m = c.meta[0, 0, :3].reshape(3, 2, 32, 2, 4)[:, tensor]  # group, lane, (base, step), channel
+        assert torch.equal(m[:, :, 0].reshape(3, 128), base[0, 0, :3]) and torch.equal(m[:, :, 1].reshape(3, 128), step[0, 0, :3])
 
 
 def _case(N, kv_heads=2, q_heads=4, seed=0):
@@ -187,3 +187,41 @@ def test_decode_close_to_exact_attention(mode):
     s = (q.double()[:, :, None] @ k.double().repeat_interleave(g, 1).transpose(-1, -2))[:, :, 0] / math.sqrt(128)
     exact = torch.softmax(s, -1)[:, :, None] @ v.double().repeat_interleave(g, 1)
     assert _rel(got, exact[:, :, 0]) < 0.05  # the 6-bit format's error on random data
+
+
+@pytest.mark.parametrize("mode", ["3+3", "4+2"])
+def test_append_matches_encode(mode):
+    """A cache grown token by token (closing groups on the way, starting inside the sink group) decodes exactly
+    like one encoded from scratch."""
+    from mlops.attention import append, decode, encode
+    q, k, v = _case(700, seed=7)
+    c = encode(k[:, :, :100], v[:, :, :100], mode, capacity=1024)
+    for t in range(100, 700):
+        append(c, k[:, :, t:t + 1], v[:, :, t:t + 1])
+        if t in (127, 128, 255, 256, 699):
+            assert torch.equal(decode(q, c, tau=1e-3), decode(q, encode(k[:, :, :t + 1], v[:, :, :t + 1], mode), tau=1e-3))
+    with pytest.raises(ValueError):
+        append(c, k[:, :, :400], v[:, :, :400])  # 700 + 400 > capacity 1024
+
+
+@pytest.mark.parametrize("mode", ["3+3", "4+2"])
+def test_prefill_matches_decode(mode):
+    """Chunked prefill from an empty cache: every position's output against append + decode of that position
+    with every block refined (the same attention; the two kernels round differently, so within BF16 output
+    rounding), and the cache it leaves against encode's."""
+    from mlops.attention import append, decode, empty, encode, prefill
+    _, k, v = _case(900, seed=11)
+    q = (1.5 * torch.randn(1, 4, 900, 128, device="cuda", generator=torch.Generator(device="cuda").manual_seed(12))).bfloat16()
+    c = empty(1, 2, 1024, mode)
+    outs = [prefill(q[:, :, a:b], k[:, :, a:b], v[:, :, a:b], c) for a, b in ((0, 300), (300, 384), (384, 900))]
+    out = torch.cat(outs, 2)
+    d = empty(1, 2, 1024, mode)
+    for t in range(900):
+        append(d, k[:, :, t:t + 1], v[:, :, t:t + 1])
+        if t % 61 == 0 or t in (127, 128, 383, 384, 899):
+            ref = decode(q[:, :, t], d, tau=1e-30)
+            assert _rel(out[:, :, t], ref) < 4e-3, t
+    e = encode(k, v, mode, capacity=1024)
+    assert c.tokens == e.tokens == 900
+    for x, y in ((c.coarse, e.coarse), (c.fine, e.fine), (c.meta, e.meta), (c.open_k, e.open_k), (c.sink_v, e.sink_v)):
+        assert torch.equal(x, y)

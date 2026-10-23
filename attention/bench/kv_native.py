@@ -109,8 +109,9 @@ def main():
     if a.lm_only:
         layers = []
     print("K logit error RMS (q . dk * scale, causal), per layer\n")
-    print("| scheme | K / V bits | " + " | ".join(f"L{L}" for L in layers) + " |")
-    print("|---|---|" + "---|" * len(layers))
+    from termtable import Table
+    width = max(len(s[0]) for s in SCHEMES)
+    t = Table([("scheme", width, "<"), ("K / V bits", 10, ">")] + [(f"L{L}", 6, ">") for L in layers])
     for name, fk, _, bits in SCHEMES:
         cells = []
         for L in layers:
@@ -120,7 +121,7 @@ def main():
             e = (q.view(H, g, N, D) @ dk[:, None].transpose(-1, -2)) * d["scale"]
             m = torch.tril(torch.ones(N, N, device="cuda", dtype=torch.bool)).expand_as(e)
             cells.append(f"{e[m].pow(2).mean().sqrt().item():.3f}")
-        print(f"| {name} | {bits} | " + " | ".join(cells) + " |", flush=True)
+        t.row(name, bits, *cells)
 
     cur = {}
 
@@ -138,8 +139,7 @@ def main():
     ids = tok("\n\n".join(open(f).read() for f in a.text), return_tensors="pt").input_ids
     wins = [ids[:, i:i + a.win].cuda() for i in range(0, ids.shape[1] - a.win + 1, a.win)][: a.windows]
     print(f"\nLM loss, {len(wins)} windows of {a.win} tokens: delta vs bf16 SDPA, mean (min .. max over windows)\n")
-    print("| scheme | K / V bits | delta loss |")
-    print("|---|---|---|")
+    t = Table([("scheme", width, "<"), ("K / V bits", 10, ">"), ("delta loss (mean, min .. max)", 30, ">")])
     base = None
     for name, fk, fv, bits in [("bf16 SDPA", None, None, "16 / 16")] + SCHEMES:
         cur["k"], cur["v"] = fk, fv
@@ -147,7 +147,7 @@ def main():
             ls = torch.tensor([model(w, labels=w).loss.item() for w in wins])
         base = ls if base is None else base
         dl = ls - base
-        print(f"| {name} | {bits} | {dl.mean():+.4f} ({dl.min():+.4f} .. {dl.max():+.4f}) |", flush=True)
+        t.row(name, bits, f"{dl.mean():+.4f} ({dl.min():+.4f} .. {dl.max():+.4f})")
 
 
 if __name__ == "__main__":
