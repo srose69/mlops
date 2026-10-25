@@ -29,12 +29,12 @@ int sm_count() {
   return n;
 }
 
-// Scratch carve-up: CTA counters first and of a size independent of the context (a zero-filled scratch
-// serves any length), then the per-call arrays.  CTAs per (batch, KV head) are at most 8 per SM over the heads.
+// Scratch carve-up: per-call arrays only, every one written before it is read (no initial contents needed).  CTAs
+// per (batch, KV head) are at most 8 per SM over the heads.
 constexpr int SLICE = 1024, MAX_SLICES = 4096;  // fbla_kernels.cuh
 struct Geometry {
   int groups, nblocks, nslices, ctas;
-  size_t counter, lse, part, dpart, row_lse, counts, items, bytes;
+  size_t lse, part, dpart, row_lse, counts, items, bytes;
 };
 Geometry geometry(const mlops_fbla_config *c) {
   Geometry g{};
@@ -43,8 +43,7 @@ Geometry geometry(const mlops_fbla_config *c) {
   g.nblocks = g.groups * (MLOPS_FBLA_GROUP / MLOPS_FBLA_SUBBLOCK);
   g.nslices = std::max(1, (g.nblocks + SLICE - 1) / SLICE);
   g.ctas = (int)std::max<size_t>(1, (8 * (size_t)sm_count() + heads - 1) / heads);
-  g.counter = 0;
-  g.lse = up256(heads * sizeof(int));
+  g.lse = 0;
   g.part = g.lse + up256(rows * g.nblocks * sizeof(float));
   g.dpart = g.part + up256(rows * g.ctas * (MLOPS_FBLA_HEAD_DIM + 2) * sizeof(float));
   g.row_lse = g.dpart + up256(rows * g.ctas * (MLOPS_FBLA_HEAD_DIM + 1) * sizeof(float));
@@ -94,7 +93,6 @@ extern "C" mlops_fbla_status mlops_fbla_decode(const mlops_fbla_config *c, const
   a.lse = reinterpret_cast<float *>(base + g.lse);
   a.part = reinterpret_cast<float *>(base + g.part);
   a.dpart = reinterpret_cast<float *>(base + g.dpart);
-  a.counter = reinterpret_cast<int *>(base + g.counter);
   a.row_lse = reinterpret_cast<float *>(base + g.row_lse);
   a.counts = reinterpret_cast<int *>(base + g.counts);
   a.items = reinterpret_cast<int *>(base + g.items);
@@ -118,7 +116,7 @@ bool valid_prefill(const mlops_fbla_config *c, int count) {
   const long long n1 = (long long)c->tokens + count;
   if ((c->capacity != 0 && c->capacity < n1) || n1 > MAX_SLICES * SLICE * MLOPS_FBLA_SUBBLOCK) return false;
   const int r = c->q_heads / c->kv_heads;
-  return r == 1 || r == 2 || r == 4;
+  return r == 1 || r == 2 || r == 4 || mlops_fbla_detail::prefill_tc_device();
 }
 }  // namespace
 
@@ -129,7 +127,8 @@ extern "C" mlops_fbla_status mlops_fbla_prefill(const mlops_fbla_config *c, int 
   if (q && !out) return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: q needs output");
   if (!valid_prefill(c, count))
     return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: batch, heads and count must be positive, tokens >= 0, "
-                "q_heads / kv_heads 1, 2 or 4, tokens + count <= capacity (0: tokens + count) and <= 2^26");
+                "q_heads a multiple of kv_heads (1, 2 or 4 times on the DP4A path), tokens + count <= capacity "
+                "(0: tokens + count) and <= 2^26");
   if (c->format != MLOPS_FBLA_3P3 && c->format != MLOPS_FBLA_4P2)
     return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: invalid format");
   if (!(c->scale >= 0.f)) return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: scale must be nonnegative");
@@ -140,9 +139,11 @@ extern "C" mlops_fbla_status mlops_fbla_prefill(const mlops_fbla_config *c, int 
                         x->exact_open_k, x->exact_open_v};
   for (const void *p : ptrs)
     if (!aligned(p, 16)) return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: pointers must be 16-byte aligned");
+  if (!aligned(x->tc_images, 128)) return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: tc_images must be 128-byte aligned");
 
   mlops_fbla_detail::PrefillArgs a{};
   a.c = *cache; a.q = q; a.k = k; a.v = v; a.out = out;
+  if (!c->capacity) a.c.tc_images = nullptr;  // (laid out for a capacity: with 0 the groups' stride moves with tokens)
   a.batch = c->batch; a.q_heads = c->q_heads; a.kv_heads = c->kv_heads; a.qg = c->q_heads / c->kv_heads;
   a.n0 = c->tokens; a.count = count;
   const int capacity = c->capacity ? c->capacity : c->tokens + count;
@@ -153,6 +154,12 @@ extern "C" mlops_fbla_status mlops_fbla_prefill(const mlops_fbla_config *c, int 
                                                      : mlops_fbla_detail::launch_prefill<4, 2>(a, stream);
   if (e != cudaSuccess) return fail(MLOPS_FBLA_CUDA_ERROR, "mlops_fbla_prefill: %s", cudaGetErrorString(e));
   return ok();
+}
+
+extern "C" size_t mlops_fbla_images_bytes(const mlops_fbla_config *c) {
+  if (!c || c->batch <= 0 || c->kv_heads <= 0 || c->capacity <= 0 || !mlops_fbla_detail::prefill_tc_device()) return 0;
+  const size_t cg = (size_t)((c->capacity + MLOPS_FBLA_GROUP - 1) / MLOPS_FBLA_GROUP);
+  return (size_t)c->batch * c->kv_heads * cg * (mlops_fbla_detail::IMAGE_BYTES + 4);
 }
 
 extern "C" const char *mlops_fbla_status_string(mlops_fbla_status s) {

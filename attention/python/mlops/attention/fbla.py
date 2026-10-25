@@ -59,6 +59,7 @@ class FBLACache:
     tokens: int
     capacity: int
     format: int
+    images: Optional[torch.Tensor] = None  # uint8, the tensor-core prefill's closed-group images (None: rebuilt every call)
 
 
 def _check_kv(k, v):
@@ -77,9 +78,13 @@ def empty(batch: int, kv_heads: int, capacity: int, mode: str = "3+3", device="c
     u8 = dict(device=device, dtype=torch.uint8)
     bf = dict(device=device, dtype=torch.bfloat16)
     ex = [torch.zeros((batch, kv_heads, 128, 128), **bf) for _ in range(4)]
+    dev = torch.device(device)
+    with torch.cuda.device(dev):  # (the size depends on the device: 0 where the prefill does not use tensor cores)
+        nimg = _C.images_bytes(batch, kv_heads, cg * 128)
+    images = torch.zeros(nimg, **u8) if nimg else None
     return FBLACache(torch.zeros((batch, kv_heads, cg * 8, 2 * cb * 256), **u8),
                      torch.zeros((batch, kv_heads, cg * 8, 2 * fb * 256), **u8),
-                     torch.zeros((batch, kv_heads, cg, 512), **bf), ex[0], ex[1], ex[2], ex[3], 0, capacity, fmt)
+                     torch.zeros((batch, kv_heads, cg, 512), **bf), ex[0], ex[1], ex[2], ex[3], 0, capacity, fmt, images)
 
 
 def _prefill(q, cache, k, v, scale):
@@ -92,7 +97,7 @@ def _prefill(q, cache, k, v, scale):
         raise ValueError(f"cache full: {c.tokens} + {n} tokens > capacity {c.capacity}")
     out = _C.prefill(q, k.to(torch.bfloat16).contiguous(), v.to(torch.bfloat16).contiguous(), c.coarse, c.fine,
                      c.meta, c.sink_k, c.sink_v, c.open_k, c.open_v, c.tokens, c.capacity,
-                     q.shape[1] if q is not None else k.shape[1], c.format, scale)
+                     q.shape[1] if q is not None else k.shape[1], c.format, scale, c.images)
     c.tokens += n
     return out
 
@@ -131,14 +136,14 @@ def prefill(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cache: FBLACache,
     return _prefill(q.contiguous(), cache, k, v, scale)
 
 
-_SCRATCH = {}  # (device, batch * kv_heads) -> zero-filled once, reused (mlops_fbla_decode_scratch_bytes)
+_SCRATCH = {}  # (device, batch * kv_heads) -> allocated once, reused (mlops_fbla_decode_scratch_bytes)
 
 
 def _scratch(device, heads, nbytes):
     key = (device, heads)
     s = _SCRATCH.get(key)
     if s is None or s.numel() < nbytes:
-        s = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+        s = torch.full((nbytes,), 0xFF, dtype=torch.uint8, device=device)
         _SCRATCH[key] = s
     return s
 

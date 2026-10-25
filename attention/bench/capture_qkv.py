@@ -5,13 +5,15 @@
 the GQA repeat), on one text, for bench/fbla_vs_sdpa.py --qkv. The dump is an optional local benchmark input;
 it is intentionally ignored by git and is not part of the repository.
 
-    python bench/capture_qkv.py MODEL_DIR TEXT_FILE [TEXT_FILE ...] --tokens 2048 --out qkv.pt
+    python bench/capture_qkv.py MODEL_DIR [TEXT_FILE ...] --tokens 2048 --out qkv.pt
 """
 import argparse
 
 import torch
 import torch.nn.functional as F
 from transformers import AttentionInterface, AutoModelForCausalLM, AutoTokenizer
+
+from fbla_lm import corpus
 
 CAPTURED = []
 
@@ -33,15 +35,14 @@ def capture(module, query, key, value, attention_mask, scaling=None, dropout=0.0
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
-    ap.add_argument("text", nargs="+")
+    ap.add_argument("text", nargs="*", help="text files; none: the WikiText-2 test split")
     ap.add_argument("--tokens", type=int, default=2048)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     AttentionInterface.register("capture", capture)
     tok = AutoTokenizer.from_pretrained(a.model)
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, attn_implementation="capture").cuda()
-    text = "\n\n".join(open(f).read() for f in a.text)
-    ids = tok(text, return_tensors="pt").input_ids[:, : a.tokens].cuda()
+    ids = tok(corpus(a.text), return_tensors="pt").input_ids[:, : a.tokens].cuda()
     if ids.shape[1] < a.tokens:
         raise SystemExit(f"the text has only {ids.shape[1]} tokens")
     with torch.no_grad():

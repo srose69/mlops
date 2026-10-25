@@ -89,14 +89,29 @@ BF16 output; a separate fourth launch is unnecessary.
 
 ## Prefill
 
-`mlops_fbla_prefill` appends a chunk of tokens and attends its queries, causally, over the whole cache. It runs
-in three launches. `close_kernel` quantizes the groups the chunk closes, writing the encoder's bytes bit for
-bit. `stream_kernel` computes the attention. `finish_kernel` updates the sink and the open group.
+`mlops_fbla_prefill` appends a chunk of tokens and attends its queries, causally, over the whole cache.
+`close_kernel` quantizes the groups the chunk closes, writing the encoder's bytes bit for bit. The attention
+runs on tensor cores on sm_75 .. sm_89 and on DP4A elsewhere. `finish_kernel` updates the sink and the open
+group.
 
-Prefill is compute-bound. A DP4A over 6-bit codes costs what one over the coarse plane does, so prefill reads
-every closed group through its full codes `c 2^FB + f`. This is the decode with every block refined, and
-the output does not depend on the mode. One FlashAttention pass then needs no selection, no second pass and
-no scratch.
+Prefill is compute-bound, so it reads every closed group through its full codes `c 2^FB + f` (every block
+refined); the output does not depend on the mode.
+
+### Tensor cores (`tensors/`)
+
+* `transcode_kernel` turns each closed group's records into an image of full 8-bit codes and metadata in the
+  order the mma fragments consume them. With `mlops_fbla_cache.tc_images` the images persist between calls and
+  only newly closed groups are transcoded (chunked prefill of a long prompt no longer re-reads the whole cache).
+* `prefill_tc_kernel`: a CTA is one q head × the positions of one group, 8 warps of 16 rows. q stays in
+  registers. Per closed group: the group's q-hat, QK by `s8 × u8` mma, one 128-token P block (integer P), PV by
+  `u8 × u8` mma, an exact FP32 fold. The sink and the own group run on the BF16 mma (sm_75: FFMA) with P rounded
+  to BF16 rather than to an integer (the sink's block holds the row's largest weight).
+* Closed groups go oldest first through two shared-memory slots; on sm_80+ an owner warp copies each image with
+  `cp.async`, and pairwise named barriers hand it to the other warps. Every CTA of a wave reads the same image at
+  the same time, so the L2 needs only a few images whatever its size.
+* Any integer GQA ratio (templates for 1, 2, 4, 8). Split-K below one wave of CTAs.
+
+### DP4A
 
 `stream_kernel` gives each CTA 8 query rows per consumer warp, as GEMM tiles. It first processes the BF16
 groups (the sink and the row's own group), then streams the closed groups newest first through a two-stage
@@ -174,9 +189,11 @@ creates one persistent wave subject to available work.
 
 `tests/test_fbla.cu` is a float64 implementation of the definition, written independently of the device
 helpers. It checks both formats at GQA 1/2/4, batch 2, partial open groups, an 8K-capacity cache decoded at 3K,
-default/no/all refinement and contexts through 256K. Every case runs twice against the same zero-initialized
-scratch and must reproduce its BF16 output bit for bit. The current sm_61 suite passes with relative RMS error
+default/no/all refinement and contexts through 256K. Every case runs twice against the same scratch, pre-filled
+with 0xFF bytes, and must reproduce its BF16 output bit for bit. The current sm_61 suite passes with relative RMS error
 below `2.1e-3` and max absolute error below `3.9e-3`; the difference is P8 and approximate SFU arithmetic.
+On tensor-core devices the prefill cases run against the model with the tensor-core P blocks (128 / 64, BF16 P
+in the BF16 groups), with and without persistent images, including GQA 3 and 8.
 
 The Python tests independently unpack every code of every record, compare the kernel with a float64 model and
 check a capacity-padded cache against a tightly laid-out one.
@@ -205,6 +222,22 @@ Controlled GTX 1080 run, Qwen geometry (8 KV heads, GQA 2), D2D-copy baseline 28
 | 512K | 2.506 ms | 248.5 | 2.553 ms | 253.2 |
 | 1M | 5.197 ms | 239.4 | 5.184 ms | 249.4 |
 
+Tensor-core prefill, L40S (sm_89), 8 KV heads, a chunk attended over a cache of `context` tokens, persistent
+images, against flash-attn 2.8.3 (BF16 K / V, causal); median of 50 calls with 200 ms idle before each (2520 MHz
+measured during the calls):
+
+| GQA | context | chunk | FBLA 4+2 | FA2 | FA2 / FBLA |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 64K | 2048 | 3.31 ms | 5.12 ms | 1.55 |
+| 1 | 64K | 2048 | 1.77 ms | 2.66 ms | 1.50 |
+| 4 | 64K | 2048 | 6.35 ms | 9.99 ms | 1.57 |
+| 8 | 64K | 2048 | 12.41 ms | 18.78 ms | 1.51 |
+| 2 | 16K | 2048 | 1.06 ms | 1.50 ms | 1.42 |
+| 2 | 64K | 8192 | 13.06 ms | 19.73 ms | 1.51 |
+| 2 | 256K | 2048 | 12.24 ms | 19.78 ms | 1.62 |
+
+Back to back the card is power-bound (300 W): FA2 runs at ~1.3 GHz, FBLA at ~1.8 GHz, ratio 1.7 .. 1.9.
+
 The package README keeps the Qwen-geometry summary. Full tables and run conditions are in
 [`../benches/table.md`](../benches/table.md), with one linked file per GPU; benchmark methodology and the
 controlled runner are documented in [`../docs/performance.md`](../docs/performance.md). Single-KV-head rows
@@ -217,7 +250,11 @@ DRAM at short contexts.
 |---|---|
 | `../include/mlops_fbla.h` | C API and normative cache layout |
 | `src/fbla_kernels.cuh` | coarse, select and refinement kernels; DP4A/layout primitives |
-| `src/fbla_prefill.cuh` | prefill: group closing, the streaming attention kernel, sink / open update |
+| `src/fbla_prefill.cuh` | prefill: group closing, the DP4A attention kernel, the launchers, sink / open update |
+| `src/tensors/transcode.cuh` | closed groups → attention images (layout) |
+| `src/tensors/fn.cuh` | tensor-core prefill arithmetic: q-hat, QK, P, PV, fold, BF16 blocks |
+| `src/tensors/prefill_tc.cuh` | tensor-core prefill kernel: slots, owner copies, barriers, split-K merge |
+| `src/tensors/mma.cuh` | ldmatrix, mma, cp.async and barrier wrappers |
 | `src/fbla.cu` | validation, scratch geometry and format dispatch |
 | `src/fbla_inst.cu` | separate 3+3 and 4+2 instances |
 | `tests/test_fbla.cu` | float64 definition, independent packer, full CUDA test matrix |

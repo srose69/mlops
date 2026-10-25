@@ -1,21 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 // FBLA prefill, sm_61+: a chunk of `count` new tokens is appended to the cache and its queries attend to the
-// cache, query at position p reading the tokens 0 .. p: the closed groups through their full 6-bit codes (every
-// block refined: a decode with tau -> 0), the sink and its own group in BF16.  Three launches:
+// cache, query at position p reading the tokens 0 .. p: the closed groups through their full 6-bit codes, the sink
+// and its own group in BF16.  Launches:
 //
-//   close_kernel     quantizes the groups the chunk closes into their records and metadata (6-bit codes,
-//                    split into the coarse and fine planes), one CTA per (group, head), thread = channel
-//   stream_kernel    the attention of every query row: one FlashAttention pass over the BF16 groups and the
-//                    closed groups, streamed as GEMM tiles of full codes
+//   close_kernel     quantizes the groups the chunk closes into their records and metadata, one CTA per (group, head)
+//   attention        sm_75 .. sm_89: transcode_kernel (closed groups -> images) and prefill_tc_kernel
+//                    (tensors/prefill_tc.cuh); otherwise stream_kernel (DP4A, below)
 //   finish_kernel    the sink and the open group's BF16 tokens (after the attention, which reads the old ones)
-//
-// Prefill is compute-bound: a DP4A over 6-bit codes costs what one over the coarse plane does, so the refinement
-// rule, which saves the decode its fine-plane reads, would only cost a second pass here.
 #ifndef MLOPS_FBLA_PREFILL_CUH
 #define MLOPS_FBLA_PREFILL_CUH
 
 #include "fbla_kernels.cuh"
+#include <algorithm>
+#include <cstdlib>
 
 namespace mlops_fbla_detail {
 
@@ -72,6 +70,7 @@ __global__ void __launch_bounds__(128) close_kernel(const PrefillArgs a, int g0)
   const int g = g0 + blockIdx.x, bh = blockIdx.y, c = threadIdx.x;
   const size_t eh = (size_t)bh * G * D, ih = (size_t)bh * a.count * D;
   uint16_t *meta = const_cast<uint16_t *>(a.c.meta) + ((size_t)bh * a.cgroups + g) * 512;
+  if (a.c.tc_images && c == 0) image_flags(a.c, gridDim.y, a.cgroups)[(size_t)bh * a.cgroups + g] = 0u;  // its image is stale
 #pragma unroll
   for (int x = 0; x < 2; ++x) {
     const uint16_t *sink = (x ? a.c.exact_sink_v : a.c.exact_sink_k) + eh;
@@ -272,7 +271,7 @@ template <int CB, int FB> __device__ __forceinline__ void half_store(Stage &st, 
 }
 
 // q-hat of a group for the warp's 8 rows (exactly setup_group's codes): lanes (row 8 warp + lane / 4, channels
-// 32 (lane % 4) .. + 31).  Returns the lane's row's (sq, q . base_K): score = sq (q-hat . codes) + q . base_K.
+// 32 (lane % 4) .. + 31).  Returns the lane's row's (sq, sl q . base_K): score = sq (q-hat . codes) + sl q . base_K.
 // qv4: the lane's 32 channels of its row's q (BF16 pairs), loaded once per CTA
 __device__ __forceinline__ float2 quantize_warp(const PrefillArgs &a, const uint16_t *meta, uint32_t (*qhat)[32], int warp,
                                                 int lane, const uint4 (&qv4)[4]) {
@@ -289,8 +288,8 @@ __device__ __forceinline__ float2 quantize_warp(const PrefillArgs &a, const uint
       float kb[4], ks[4];
       bf16x4(km.x, km.y, kb); bf16x4(km.z, km.w, ks);
 #pragma unroll
-      for (int x = 0; x < 4; ++x) {
-        const float qf = q8[4 * hh + x] * a.scale_log2;
+      for (int x = 0; x < 4; ++x) {  // z = q step_K, exact (mlops_fbla.h)
+        const float qf = q8[4 * hh + x];
         z[8 * i + 4 * hh + x] = qf * ks[x];
         amax = fmaxf(amax, fabsf(z[8 * i + 4 * hh + x]));
         qb = fmaf(qf, kb[x], qb);
@@ -303,17 +302,17 @@ __device__ __forceinline__ float2 quantize_warp(const PrefillArgs &a, const uint
   asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(rc) : "f"(amax));
   rc = fmaf(fmaf(-amax, rc, 1.f), rc, rc);
   const float q0 = 127.f * rc, rq = amax > 0.f ? fmaf(fmaf(-amax, q0, 127.f), rc, q0) : 0.f;
-  const float sq = amax * (1.f / 127.f);
+  const float sq = amax * (a.scale_log2 * (1.f / 127.f));
 #pragma unroll
   for (int w = 0; w < 8; ++w) {
     uint32_t bq[4];
 #pragma unroll
-    for (int x = 0; x < 4; ++x) bq[x] = __float_as_uint(__fadd_rn(__fmul_rn(z[4 * w + x], rq), MAGICF));  // low byte = rint(fl(z r))
+    for (int x = 0; x < 4; ++x) bq[x] = __float_as_uint(fmaf(z[4 * w + x], rq, MAGICF));  // low byte = rint(z r), one rounding
     const uint32_t wq = prmt(prmt(bq[0], bq[1], 0x0040u), prmt(bq[2], bq[3], 0x0040u), 0x5410u);
     qhat[row][8 * qt + w] = wq;
   }
   __syncwarp();
-  return make_float2(sq, qb);
+  return make_float2(sq, qb * a.scale_log2);
 }
 
 // 4 rows x 4 tokens: q-hat . code values over the 32 channel words of a Kd tile.  The fragments of word quad
@@ -691,6 +690,113 @@ __global__ void __launch_bounds__(PTH) stream_kernel(const PrefillArgs a) {
   }
 }
 
+}  // namespace mlops_fbla_detail
+#include "tensors/prefill_tc.cuh"
+namespace mlops_fbla_detail {
+
+// The tensor-core attention, format-independent (compiled into one object, MLOPS_FBLA_DEFINE_SHARED): GQA template
+// 1, 2, 4, 8 (else the ratio at run time), split-K below a wave, the merge.  (Not stream-K: cutting CTAs at arbitrary
+// points spreads an image's reads over the whole call and leans on the L2.)
+cudaError_t launch_tc_attention(const PrefillArgs &a, const uint8_t *tiles, int tstride, int toff, int groups, cudaStream_t stream);
+#ifdef MLOPS_FBLA_DEFINE_SHARED
+// The device's dynamic shared memory for the TC kernel (0: DP4A).  The specialization is the compiled code's PTX version
+// (a compute_75 build JIT-compiled on a newer card runs the sm_75 path); sm_75 .. sm_89 with tc::smem_bytes available.
+// MLOPS_FBLA_DP4A=1 forces DP4A.  Cached per device.
+static int prefill_tc_smem() {
+  static int cache[16];
+  static const bool dp4a = getenv("MLOPS_FBLA_DP4A") && getenv("MLOPS_FBLA_DP4A")[0] == '1';
+  int dev = 0;
+  if (dp4a || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return 0;
+  if (!cache[dev]) {
+    int major = 0, minor = 0, optin = 0;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+    cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    cudaFuncAttributes fa{};
+    const int cc = 10 * major + minor;
+    const bool ok = cc >= 75 && cc <= 89 && cudaFuncGetAttributes(&fa, tc::prefill_tc_kernel<1>) == cudaSuccess && fa.ptxVersion >= 75 &&
+                    optin >= tc::smem_bytes(fa.ptxVersion);
+    cache[dev] = ok ? tc::smem_bytes(fa.ptxVersion) : -1;
+  }
+  return max(cache[dev], 0);
+}
+bool prefill_tc_device() { return prefill_tc_smem() > 0; }
+
+template <int GQA> static cudaError_t tc_attention(const PrefillArgs &a, const uint8_t *tiles, int tstride, int toff, int groups, int dev, int sms,
+                                                   cudaStream_t stream) {
+  static bool ready[16];  // (above 48 KiB of dynamic shared memory: once per device)
+  const int smem = prefill_tc_smem();
+  if (!ready[dev]) {
+    const cudaError_t e = cudaFuncSetAttribute(tc::prefill_tc_kernel<GQA>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (e != cudaSuccess) return e;
+    ready[dev] = true;
+  }
+  const int n1 = a.n0 + a.count, nblk = (n1 - 1) / G - a.n0 / G + 1, heads = a.batch * a.q_heads, base = nblk * heads;
+  const int nsplit = base < sms ? max(1, min(min(sms / base, 8), groups / 16)) : 1;  // pieces of >= 16 groups
+  float2 *part_ml = nullptr;
+  float *part_o = nullptr;
+  if (nsplit > 1) {
+    const size_t prow = (size_t)heads * a.count * nsplit;
+    cudaError_t e = cudaMallocAsync(reinterpret_cast<void **>(&part_ml), prow * sizeof(float2), stream);
+    if (e == cudaSuccess) e = cudaMallocAsync(reinterpret_cast<void **>(&part_o), prow * D * sizeof(float), stream);
+    if (e != cudaSuccess) return e;
+  }
+  tc::prefill_tc_kernel<GQA><<<dim3(nblk, heads, nsplit), tc::THREADS, smem, stream>>>(a, tiles, tstride, toff, part_ml, part_o);
+  if (nsplit > 1) {
+    tc::merge_kernel<><<<dim3((a.count + 15) / 16, heads), 256, 0, stream>>>(a, part_ml, part_o, nsplit);
+    cudaError_t e = cudaFreeAsync(part_ml, stream);
+    if (e == cudaSuccess) e = cudaFreeAsync(part_o, stream);
+    if (e != cudaSuccess) return e;
+  }
+  return cudaSuccess;
+}
+cudaError_t launch_tc_attention(const PrefillArgs &a, const uint8_t *tiles, int tstride, int toff, int groups, cudaStream_t stream) {
+  static int sms[16];
+  int dev = 0;
+  cudaGetDevice(&dev);  // (prefill_tc_device: dev < 16)
+  if (!sms[dev]) cudaDeviceGetAttribute(&sms[dev], cudaDevAttrMultiProcessorCount, dev);
+  switch (a.qg) {
+    case 1: return tc_attention<1>(a, tiles, tstride, toff, groups, dev, sms[dev], stream);
+    case 2: return tc_attention<2>(a, tiles, tstride, toff, groups, dev, sms[dev], stream);
+    case 4: return tc_attention<4>(a, tiles, tstride, toff, groups, dev, sms[dev], stream);
+    case 8: return tc_attention<8>(a, tiles, tstride, toff, groups, dev, sms[dev], stream);
+    default: return tc_attention<0>(a, tiles, tstride, toff, groups, dev, sms[dev], stream);
+  }
+}
+#endif
+
+// Images of the closed groups 1 .. last position's group - 1, then the attention.  With tc_images only the groups
+// close_kernel invalidated are transcoded; without, all of them into a per-call allocation (a pool that keeps memory).
+template <int CB, int FB> cudaError_t launch_prefill_tc(const PrefillArgs &a, cudaStream_t stream) {
+  const int heads = a.batch * a.kv_heads, groups = max(0, (a.n0 + a.count - 1) / G - 1);
+  if (a.c.tc_images) {
+    if (groups)
+      tc::transcode_kernel<CB, FB><<<dim3(groups, heads), tc::XT, 0, stream>>>(a, a.c.tc_images, a.cgroups, 0,
+                                                                              image_flags(a.c, heads, a.cgroups));
+    return launch_tc_attention(a, a.c.tc_images, a.cgroups, 0, groups, stream);
+  }
+  static bool ready[16];
+  int dev = 0;
+  cudaGetDevice(&dev);
+  if (!ready[dev]) {
+    cudaMemPool_t pool;  // (by default its memory goes back at every sync)
+    cudaError_t e = cudaDeviceGetDefaultMemPool(&pool, dev);
+    uint64_t keep = ~0ull;
+    if (e == cudaSuccess) e = cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep);
+    if (e != cudaSuccess) return e;
+    ready[dev] = true;
+  }
+  uint8_t *tiles = nullptr;
+  if (groups) {
+    const cudaError_t e = cudaMallocAsync(reinterpret_cast<void **>(&tiles), (size_t)heads * groups * tc::TGB, stream);
+    if (e != cudaSuccess) return e;
+    tc::transcode_kernel<CB, FB><<<dim3(groups, heads), tc::XT, 0, stream>>>(a, tiles, groups, 1, nullptr);
+  }
+  const cudaError_t e = launch_tc_attention(a, tiles, groups, 1, groups, stream);
+  if (e != cudaSuccess) return e;
+  return groups ? cudaFreeAsync(tiles, stream) : cudaSuccess;
+}
+
 // Groups closed by the chunk: those with 128 (g + 1) < n0 + count that were open before (the group of
 // position n0 - 1 onwards); a full open group closes when the next token arrives.
 template <int CB, int FB> cudaError_t launch_prefill(const PrefillArgs &a, cudaStream_t stream) {
@@ -698,9 +804,14 @@ template <int CB, int FB> cudaError_t launch_prefill(const PrefillArgs &a, cudaS
   const int g_first = a.n0 == 0 ? 0 : (a.n0 - 1) / G, g_end = (n1 - 1) / G;
   if (g_end > g_first) close_kernel<CB, FB><<<dim3(g_end - g_first, heads), 128, 0, stream>>>(a, g_first);
   if (a.q) {
-    constexpr int PROWS = Warps<CB>::PROWS;
-    const dim3 grid((a.count * a.qg + PROWS - 1) / PROWS, heads);
-    stream_kernel<CB, FB><<<grid, PTH, 0, stream>>>(a);
+    if (prefill_tc_device()) {
+      const cudaError_t e = launch_prefill_tc<CB, FB>(a, stream);
+      if (e != cudaSuccess) return e;
+    } else {
+      constexpr int PROWS = Warps<CB>::PROWS;
+      const dim3 grid((a.count * a.qg + PROWS - 1) / PROWS, heads);
+      stream_kernel<CB, FB><<<grid, PTH, 0, stream>>>(a);
+    }
   }
   launch_finish(a, heads, stream);
   return cudaGetLastError();

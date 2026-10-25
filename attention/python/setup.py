@@ -32,7 +32,7 @@ if not archs:
 setup(
     name=NAME,
     version=torch_ext.local_version(VERSION),
-    description="FBLA compressed-KV FlashAttention prefill and decode for DP4A NVIDIA GPUs",
+    description="FBLA compressed-KV FlashAttention prefill and decode for NVIDIA GPUs (DP4A; tensor-core prefill on sm_75 .. sm_89)",
     long_description=open(os.path.join(PKG, "README.md")).read(),
     long_description_content_type="text/markdown",
     packages=["mlops.attention"],

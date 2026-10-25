@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 // mlops_fbla_decode against a float64 host model of the format's definition (include/mlops_fbla.h): per
-// group q-hat = rint(z * fl(127 / max|z|)), z = q * (scale * log2 e) * step_K in FP32, sq = max|z| * fl(1 / 127),
+// group q-hat = rint(z * fl(127 / max|z|)) (one rounding), z = q * step_K exact, sq = max|z| * fl(sl / 127), sl = fl(scale * log2 e),
 // per 16-token sub-block the coarse or the full code by
 // W_j = 2^(lse_j - R) > tau (lse_j and R from the coarse scores), p = round(255 * 2^(s - m_block)), and
 // o = sum_j 2^m_j sum_t p_t v_t / sum_j 2^m_j sum_t p_t.  Both layouts, GQA 1 / 2 / 4, contexts that exercise
@@ -147,7 +147,10 @@ struct Case {
 
   // float64 model of the definition
   // decode semantics at position P - 1 over its prefix of P tokens, queries qv [B, QH, D]
-  std::vector<double> reference_at(int P, const float *qv) const {
+  // pc / pe: tokens of a P block (its maximum and weight) in the closed / the BF16 groups: 16 in decode and the
+  // DP4A prefill, 128 / 64 in the tensor-core prefill.  fpe: the BF16 groups' P = 255 2^(s - mb) rounded to BF16
+  // (the tensor-core prefill), else rint (every block's of decode and DP4A)
+  std::vector<double> reference_at(int P, const float *qv, int pc = S, int pe = S, bool fpe = false) const {
     const int groups = (P + G - 1) / G, nb = groups * 8, N = P;
     const size_t pad = (size_t)this->groups * G;
     const float sl = (1.f / sqrtf((float)D)) * 1.4426950408889634f;  // FP32, as the kernel scales q
@@ -167,16 +170,18 @@ struct Case {
           const int n = std::min(G, N - g * G);
           int8_t qh[D] = {};
           double sq = 0, qbs = 0, qsum = 0;
-          if (!ex) {
+          if (!ex) {  // z = q step exact; q-hat = rint(z r) of the exact product (z r in double: exact, then one rounding)
+            const float *qr = qv + ((size_t)b * QH + hq) * D;
             float amax = 0;
-            for (int c = 0; c < D; ++c) amax = std::max(amax, fabsf(qs[c] * b2f(kstep[(h * cgroups + g) * D + c])));
-            const float sqf = amax * (1.f / 127.f), rq = amax > 0 ? 127.f / amax : 0.f;
+            for (int c = 0; c < D; ++c) amax = std::max(amax, fabsf(qr[c] * b2f(kstep[(h * cgroups + g) * D + c])));
+            const float sqf = amax * (sl * (1.f / 127.f)), rq = amax > 0 ? 127.f / amax : 0.f;
             for (int c = 0; c < D; ++c) {
-              const float z = qs[c] * b2f(kstep[(h * cgroups + g) * D + c]);
-              qh[c] = (int8_t)nearbyintf(z * rq);
-              qbs += (double)qs[c] * b2f(kbase[(h * cgroups + g) * D + c]);
+              const float z = qr[c] * b2f(kstep[(h * cgroups + g) * D + c]);
+              qh[c] = (int8_t)nearbyint((double)z * rq);
+              qbs += (double)qr[c] * b2f(kbase[(h * cgroups + g) * D + c]);
               qsum += qh[c];
             }
+            qbs *= sl;
             sq = sqf;
           }
           for (int t = 0; t < n; ++t) {
@@ -197,37 +202,51 @@ struct Case {
           }
           for (int j = 0; j < 8; ++j) exact[g * 8 + j] = ex;
         }
-        auto block = [&](const std::vector<double> &s, int j, double &mb, double p[S], double &sp) {
+        // the P blocks: start token and length (pc or pe tokens, within a group)
+        std::vector<int> bs, bl;
+        for (int g = 0; g < groups; ++g) {
+          const int len = exact[g * 8] ? pe : pc;
+          for (int t0 = 0; t0 < G; t0 += len) { bs.push_back(g * G + t0); bl.push_back(len); }
+        }
+        const int nbk = (int)bs.size();
+        std::vector<double> p(G);
+        auto block = [&](const std::vector<double> &s, int j, double &mb, double &sp) {
           mb = -INFINITY;
-          for (int t = 0; t < S; ++t) mb = std::max(mb, s[j * S + t]);
+          for (int t = 0; t < bl[j]; ++t) mb = std::max(mb, s[bs[j] + t]);
           sp = 0;
-          for (int t = 0; t < S; ++t) { p[t] = std::isfinite(s[j * S + t]) ? nearbyint(255.0 * exp2(s[j * S + t] - mb)) : 0; sp += p[t]; }
+          const bool fp = fpe && exact[bs[j] / S];
+          for (int t = 0; t < bl[j]; ++t) {
+            const double x = std::isfinite(s[bs[j] + t]) ? 255.0 * exp2(s[bs[j] + t] - mb) : 0;
+            p[t] = fp ? b2f(f2b((float)x)) : nearbyint(x);
+            sp += p[t];
+          }
         };
         double R = -INFINITY;
-        std::vector<double> lse(nb, -INFINITY);
-        for (int j = 0; j < nb; ++j) {
-          double mb, p[S], sp;
-          block(sc, j, mb, p, sp);
+        std::vector<double> lse(nbk, -INFINITY);
+        for (int j = 0; j < nbk; ++j) {
+          double mb, sp;
+          block(sc, j, mb, sp);
           if (!std::isfinite(mb)) continue;
           lse[j] = mb + log2(sp);
           R = std::max(R, lse[j]) + log2(1 + exp2(-fabs(R - lse[j])));
         }
         double L = 0, O[D] = {};
-        for (int j = 0; j < nb; ++j) {
+        for (int j = 0; j < nbk; ++j) {
           if (!std::isfinite(lse[j])) continue;
-          const bool fine = !exact[j] && exp2(lse[j] - R) > tau;
-          double mb, p[S], sp;
-          block(fine ? sf : sc, j, mb, p, sp);
+          const bool ex = exact[bs[j] / S];
+          const bool fine = !ex && exp2(lse[j] - R) > tau;
+          double mb, sp;
+          block(fine ? sf : sc, j, mb, sp);
           const double w = exp2(mb - R);
           L += w * sp;
-          const int g = j / 8;
+          const int g = bs[j] / G;
           for (int c = 0; c < D; ++c) {
             double acc = 0;
-            for (int t = 0; t < S; ++t) {
-              const int tok = j * S + t;
+            for (int t = 0; t < bl[j]; ++t) {
+              const int tok = bs[j] + t;
               if (!p[t]) continue;
               double val;
-              if (exact[j]) val = v[(h * pad + tok) * D + c];
+              if (ex) val = v[(h * pad + tok) * D + c];
               else {
                 const int code = vcode[(h * pad + tok) * D + c];
                 const double base = b2f(vbase[(h * cgroups + g) * D + c]), st = b2f(vstep[(h * cgroups + g) * D + c]);
@@ -259,10 +278,10 @@ static int run(int cb, int fb, int B, int QH, int KH, int N, float tau, unsigned
   CK(cudaMalloc(&dout, ref.size() * 2));
   mlops_fbla_config cfg{B, QH, KH, N, 0.f, tau, cb == 3 ? MLOPS_FBLA_3P3 : MLOPS_FBLA_4P2, capacity};
   const size_t sz = mlops_fbla_decode_scratch_bytes(&cfg);
-  void *scratch; CK(cudaMalloc(&scratch, sz)); CK(cudaMemset(scratch, 0, sz));
+  void *scratch; CK(cudaMalloc(&scratch, sz)); CK(cudaMemset(scratch, 0xFF, sz));  // no initial contents required
   mlops_fbla_cache cache{dc, df, dmeta, dsk, dsv, dok, dov};
   int f = 0;
-  for (int rep = 0; rep < 2; ++rep) {  // twice: the CTA counter must reset itself, the result repeat bitwise
+  for (int rep = 0; rep < 2; ++rep) {  // twice: the result repeats bitwise on the used scratch
     if (mlops_fbla_decode(&cfg, dq, &cache, dout, scratch, sz, 0)) { fprintf(stderr, "%s\n", mlops_fbla_last_error()); exit(1); }
     CK(cudaDeviceSynchronize());
     std::vector<uint16_t> got(ref.size());
@@ -290,8 +309,22 @@ static int run(int cb, int fb, int B, int QH, int KH, int N, float tau, unsigned
 // against the float64 model at their positions (a sample of them: the first and last of a chunk, around group
 // boundaries, and every 37th), then the records and metadata of every closed group against the host's
 // packing, bit for bit.  append_only: the chunks are appended with q = null, and the cache alone is checked.
+// the prefill runs on tensor cores (P blocks of 128 tokens in the closed groups, 64 in the BF16 ones) on sm_75 ..
+// sm_89, unless MLOPS_FBLA_DP4A=1
+static bool tc_prefill() {
+  int dev = 0, major = 0, minor = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+  const char *e = getenv("MLOPS_FBLA_DP4A");
+  const int cc = 10 * major + minor;
+  return cc >= 75 && cc <= 89 && !(e && e[0] == '1');
+}
+
+static bool g_images = false;  // the cache carries the tensor-core prefill's persistent images (tc_images)
 static int run_prefill(int cb, int fb, int B, int QH, int KH, int N, unsigned seed, std::vector<int> chunks,
                        bool append_only = false) {
+  const bool tc = tc_prefill();
   Case c(cb, fb, B, QH, KH, N, 1e-30f, seed, N);  // prefill refines every block
   const size_t pad = (size_t)c.groups * G, heads = (size_t)B * KH;
   std::mt19937 r(seed + 1000);
@@ -303,6 +336,13 @@ static int run_prefill(int cb, int fb, int B, int QH, int KH, int N, unsigned se
   uint8_t *dc = up(zc), *df = up(zf);
   uint16_t *dm = up(zm), *dsk = up(ze), *dsv = up(ze), *dok = up(ze), *dov = up(ze);
   mlops_fbla_cache cache{dc, df, dm, dsk, dsv, dok, dov};
+  uint8_t *dimg = nullptr;
+  if (g_images) {  // zero-filled once, then kept over the chunks
+    const mlops_fbla_config icfg{B, QH, KH, 0, 0.f, 0.f, cb == 3 ? MLOPS_FBLA_3P3 : MLOPS_FBLA_4P2, N};
+    const size_t nb = mlops_fbla_images_bytes(&icfg);
+    CK(cudaMalloc(&dimg, nb)); CK(cudaMemset(dimg, 0, nb));
+    cache.tc_images = dimg;
+  }
   int f = 0, n0 = 0;
   double err2 = 0, nrm2 = 0, worst = 0;
   long checked = 0;
@@ -333,7 +373,7 @@ static int run_prefill(int cb, int fb, int B, int QH, int KH, int N, unsigned se
         std::vector<float> qv((size_t)B * QH * D);
         for (size_t hq = 0; hq < (size_t)B * QH; ++hq)
           for (int x = 0; x < D; ++x) qv[hq * D + x] = qall[(hq * N + p) * D + x];
-        const std::vector<double> ref = c.reference_at(p + 1, qv.data());
+        const std::vector<double> ref = c.reference_at(p + 1, qv.data(), tc ? G : S, tc ? 64 : S, tc);
         for (size_t hq = 0; hq < (size_t)B * QH; ++hq)
           for (int x = 0; x < D; ++x) {
             const double e = b2f(got[(hq * cnt + t) * D + x]) - ref[hq * D + x];
@@ -363,11 +403,11 @@ static int run_prefill(int cb, int fb, int B, int QH, int KH, int N, unsigned se
   const double rel = nrm2 > 0 ? sqrt(err2 / nrm2) : 0;
   const bool ok = bad == 0 && (append_only || (rel < 4e-3 && worst < 2e-2));
   printf("[%s] prefill %d+%d B=%d heads %d/%d N=%-6d chunks %-3zu%s: ", ok ? "PASS" : "FAIL", cb, fb, B, QH, KH, N,
-         chunks.size(), append_only ? " (append only)" : "");
+         chunks.size(), append_only ? " (append only)" : g_images ? " (images)" : "");
   if (!append_only) printf("%ld positions, rel. RMS error %.2e, max abs %.2e; ", checked, rel, worst);
   printf("closed groups' bytes differing: %ld\n", bad);
   f += !ok;
-  for (void *x : {(void *)dc, (void *)df, (void *)dm, (void *)dsk, (void *)dsv, (void *)dok, (void *)dov}) cudaFree(x);
+  for (void *x : {(void *)dc, (void *)df, (void *)dm, (void *)dsk, (void *)dsv, (void *)dok, (void *)dov, (void *)dimg}) cudaFree(x);
   return f;
 }
 
@@ -388,14 +428,20 @@ int main() {
     f += run(cb, fb, 1, 8, 2, 2048, 1e-30f, 11);   // GQA 4, everything refined
     f += run(cb, fb, 1, 32, 8, 20000, 3e-4f, 12);  // GQA 4, Llama-3-8B geometry
   }
-  for (int fmt = 0; fmt < 2; ++fmt) {
-    const int cb = fmt ? 4 : 3, fb = fmt ? 2 : 3;
+  for (int pass = 0; pass < (tc_prefill() ? 4 : 2); ++pass) {  // tensor cores: without and with persistent images
+    const int fmt = pass % 2, cb = fmt ? 4 : 3, fb = fmt ? 2 : 3;
+    g_images = pass >= 2;
     f += run_prefill(cb, fb, 1, 2, 2, 100, 21, {100});                 // inside the first group
     f += run_prefill(cb, fb, 1, 4, 2, 1000, 22, {1000});               // one chunk, open group of 104
     f += run_prefill(cb, fb, 2, 8, 2, 2048, 23, {300, 212, 128, 1, 1407});  // chunk edges on and off groups
     f += run_prefill(cb, fb, 1, 16, 8, 4096, 24, {1024, 1024, 2048});  // Qwen3 geometry
     f += run_prefill(cb, fb, 1, 2, 2, 3000, 25, {1500, 1500});         // MHA, two chunks
     f += run_prefill(cb, fb, 1, 8, 2, 3000, 26, {700, 2300});          // GQA 4
+    f += run_prefill(cb, fb, 1, 4, 2, 8177, 28, {6000, 2100, 77});     // short chunks on a long stream (split-K)
+    if (tc_prefill()) {                                                 // head ratios beyond DP4A's 1, 2, 4
+      f += run_prefill(cb, fb, 1, 16, 2, 3000, 29, {1100, 1900});       // GQA 8
+      f += run_prefill(cb, fb, 1, 6, 2, 2000, 30, {700, 1300});         // GQA 3 (the ratio at run time)
+    }
     f += run_prefill(cb, fb, 1, 2, 2, 2000, 27, {1, 1, 254, 1744}, true);  // append only
   }
   printf(f ? "\n%d FAILED\n" : "\nall passed\n", f);

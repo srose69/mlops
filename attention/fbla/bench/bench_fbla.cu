@@ -110,12 +110,11 @@ static void run_case(Bench &bench, double peak_gbs, const Cache &cc, int KH, int
   // no entries in that array; their mass is already present in row_lse through the coarse partials.
   call(); CUDA_OK(cudaDeviceSynchronize());
   std::vector<float> lse((size_t)B * QH * nb);
-  CUDA_OK(cudaMemcpy(lse.data(), (char *)scratch + 256, lse.size() * 4, cudaMemcpyDeviceToHost));
+  CUDA_OK(cudaMemcpy(lse.data(), scratch, lse.size() * 4, cudaMemcpyDeviceToHost));
   int dev = 0, sms = 1; CUDA_OK(cudaGetDevice(&dev));
   CUDA_OK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
   const int max_ctas = std::max(1, (8 * sms + KH - 1) / KH);
-  const size_t off_lse = up256((size_t)KH * sizeof(int));
-  const size_t off_part = off_lse + up256((size_t)QH * nb * sizeof(float));
+  const size_t off_part = up256((size_t)QH * nb * sizeof(float));
   const size_t off_dpart = off_part + up256((size_t)QH * max_ctas * (D + 2) * sizeof(float));
   const size_t off_row_lse = off_dpart + up256((size_t)QH * max_ctas * (D + 1) * sizeof(float));
   std::vector<float> row_lse(QH);
@@ -165,7 +164,9 @@ static void run_prefill_case(Bench &bench, const Cache &cc, int KH, int gqa, int
   fill_bf16<<<256, 256>>>(k, (size_t)KH * chunk * D, 22, -2.f, 4.f);
   fill_bf16<<<256, 256>>>(v, (size_t)KH * chunk * D, 23, -1.f, 2.f);
   mlops_fbla_config cfg{1, QH, KH, ctx, 0.f, 0.f, fmt, cc.cap};
-  mlops_fbla_cache cache{cc.coarse, cc.fine, cc.meta, cc.ex, cc.ex + KH * 128 * 128, cc.ex2, cc.ex2 + KH * 128 * 128};
+  mlops_fbla_cache cache{cc.coarse, cc.fine, cc.meta, cc.ex, cc.ex + KH * 128 * 128, cc.ex2, cc.ex2 + KH * 128 * 128, nullptr};
+  const size_t img_bytes = mlops_fbla_images_bytes(&cfg);  // the tensor-core prefill's persistent images (0: DP4A)
+  if (img_bytes) { CUDA_OK(cudaMalloc(&cache.tc_images, img_bytes)); CUDA_OK(cudaMemset(cache.tc_images, 0, img_bytes)); }
   auto call = [&] {
     if (mlops_fbla_prefill(&cfg, chunk, q, k, v, &cache, out, 0)) {
       fprintf(stderr, "%s\n", mlops_fbla_last_error()); exit(1);
@@ -180,7 +181,7 @@ static void run_prefill_case(Bench &bench, const Cache &cc, int KH, int gqa, int
   printf("%-6s %3d %3d %9d %7d %12.3f %12.2f %12.2f %8.0f\n", cc.cb == 3 ? "3+3" : "4+2", KH, gqa, ctx, chunk,
          row.ms, pairs / (row.ms * 1e-3) * 1e-9, 4.0 * D * pairs / (row.ms * 1e-3) * 1e-12, row.mhz);
   fflush(stdout);
-  for (void *x : {(void *)q, (void *)k, (void *)v, (void *)out}) cudaFree(x);
+  for (void *x : {(void *)q, (void *)k, (void *)v, (void *)out, (void *)cache.tc_images}) cudaFree(x);
 }
 
 int main() {
@@ -213,6 +214,7 @@ int main() {
   else
     printf("median after %d s idle; default repeats give about 1 s timed work per row; "
            "SM clock sampled through NVML\n", Bench::env("MLOPS_BENCH_COOL", 1));
+  if (bench.flushing()) printf("cold L2: a buffer of twice its size written before every timed call\n");
   printf("\n%-6s %3s %3s %9s %12s %14s %10s %10s %12s %9s %8s\n"
          "%-6s %3s %3s %9s %12s %14s %10s %10s %12s %9s %8s\n",
          "format", "KV", "GQA", "context", "latency us", "effective GB/s", "DRAM peak", "read MB",

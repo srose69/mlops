@@ -14,7 +14,7 @@ where they matter.
 
 Kernel arithmetic, per 16-token sub-block j of KV group g, for every query (log2 domain):
 
-    q' = q * scale * log2 e * step_K[g]  ->  int8 q_hat, sq        (once per query and group of 128)
+    z = q * step_K[g]  ->  int8 q_hat, sq = max|z| scale log2 e / 127   (once per query and group of 128)
     s[t] = q . base_K[g]  +  sq * sum_c q_hat[c] * code[t, c]       coarse: code = (hi << fb) + (2^fb - 1) / 2
     mb = max_t s;  m' = max(m, mb);  alpha = 2^(m - m');  p_blk = 2^(mb - m')
     refine (load the fb plane of K and V) when p_blk > tau: the sub-block's weight relative to the running maximum
@@ -46,11 +46,15 @@ class FBLAConfig:
     tau: float = 0.01
     q_bits: int = 8
     p_bits: int = 8
+    q_bits_coarse: int = 0          # q-hat and P bits of the coarse scores and of the unrefined blocks (0: as above)
+    p_bits_coarse: int = 0
+    tile: int = 1                   # consecutive queries sharing every refinement decision (any of them refines)
 
     def name(self):
         r = {"all": "all refined", "none": "coarse only", "norm": f"refine W_j > {self.tau:g}"}.get(
             self.refine, f"refine p_blk > {self.tau:g}")
-        return f"G={self.group} {self.coarse_bits}+{self.fine_bits} b, {r}"
+        c = f", coarse q{self.q_bits_coarse or self.q_bits} p{self.p_bits_coarse or self.p_bits}"
+        return f"G={self.group} {self.coarse_bits}+{self.fine_bits} b, {r}{c}, tile {self.tile}"
 
 
 def _bf16(x, toward):
@@ -75,6 +79,29 @@ def encode(x: torch.Tensor, cfg: FBLAConfig) -> dict:
     return dict(base=base, step=step, code=code.reshape(*lead, N, D))
 
 
+def _quantize_q(z, bits, sl):
+    """z = q * step_K (FP32; exact for BF16 q and steps) -> (q-hat, sq), the kernels' definition (mlops_fbla.h):
+    r = fl(qm / max|z|) (FP32 division), q-hat = rint(z * r) of the exact product (one rounding, ties to even:
+    the product in float64 is exact), sq = max|z| * sl / qm with sl = scale * log2 e: score = sq q-hat . code + sl q . base."""
+    qm = 2 ** (bits - 1) - 1
+    amax = z.abs().amax(-1, keepdim=True)
+    # (tensor / tensor: one IEEE division; a scalar numerator goes through the reciprocal, rounding twice)
+    r = torch.where(amax > 0, torch.full_like(amax, float(qm)) / amax.clamp_min(1e-38), torch.zeros_like(amax))
+    qh = torch.round(z.double() * r.double()).float().clamp(-qm, qm)
+    return qh, amax * (sl / qm)
+
+
+def _tile_any(ref, t):
+    """ref [..., M, 1] -> every row the OR over its tile of t consecutive rows."""
+    if t <= 1:
+        return ref
+    M = ref.shape[-2]
+    pad = -M % t
+    r = torch.nn.functional.pad(ref, (0, 0, 0, pad)) if pad else ref
+    r = r.reshape(*r.shape[:-2], -1, t, 1).any(-2, keepdim=True).expand(*r.shape[:-2], -1, t, 1)
+    return r.reshape(*ref.shape[:-2], M + pad, 1)[..., :M, :]
+
+
 def coarse2(code, fb):
     """Twice the coarse code: 2 * ((code >> fb) << fb) + 2^fb - 1 (an integer: the middle of the coarse cell)."""
     return 2 * torch.floor(code / 2 ** fb) * 2 ** fb + (2 ** fb - 1)
@@ -93,8 +120,9 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cfg: FBLAConfig
     K, V = encode(k, cfg), encode(v, cfg)
     kc2, vc2 = coarse2(K["code"], fb), coarse2(V["code"], fb)
     qs = q.float() * (scale * LOG2E)
-    qm = 2 ** (cfg.q_bits - 1) - 1
+    qbc = cfg.q_bits_coarse or cfg.q_bits
     pq = float(2 ** cfg.p_bits - 1)
+    pqc = float(2 ** (cfg.p_bits_coarse or cfg.p_bits) - 1)
     dev = q.device
     qpos = torch.arange(N - M, N, device=dev)[:, None]                   # [M, 1]
     qgrp = qpos // G
@@ -110,15 +138,13 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cfg: FBLAConfig
         global_lse = torch.full((*lead, M, 1), -math.inf, device=dev)
         for g in range(N // G):
             sK = K["step"][..., g, :, :]
-            qp = qs * sK
-            sq = qp.abs().amax(-1, keepdim=True) / qm
-            qh = torch.where(sq > 0, torch.round(qp / sq.clamp_min(1e-30)), torch.zeros_like(qp)).clamp(-qm, qm)
+            qhc, sqc = _quantize_q(q.float() * sK, qbc, scale * LOG2E)
             qb = qs @ K["base"][..., g, :, :].transpose(-1, -2)
             exact_g = (g < cfg.sink_groups) | (cfg.open_group & (qgrp == g))
             for j in range(g * G, (g + 1) * G, S):
                 sl = slice(j, j + S)
                 masked = torch.arange(j, j + S, device=dev)[None, :] > qpos
-                s_c = qb + sq * 0.5 * (qh @ kc2[..., sl, :].transpose(-1, -2))
+                s_c = qb + sqc * 0.5 * (qhc @ kc2[..., sl, :].transpose(-1, -2))
                 s_e = qs @ kf[..., sl, :].transpose(-1, -2)
                 sc = torch.where(exact_g, s_e, s_c).masked_fill(masked, -math.inf)
                 block_lse = torch.logsumexp(sc * log2, -1, keepdim=True)
@@ -126,16 +152,15 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cfg: FBLAConfig
     for g in range(N // G):
         bK, sK = K["base"][..., g, :, :], K["step"][..., g, :, :]       # [.., 1, D]
         bV, sV = V["base"][..., g, :, :], V["step"][..., g, :, :]
-        qp = qs * sK                                                     # q' = q step_K as int8, q . base_K
-        sq = qp.abs().amax(-1, keepdim=True) / qm
-        qh = torch.where(sq > 0, torch.round(qp / sq.clamp_min(1e-30)), torch.zeros_like(qp)).clamp(-qm, qm)
+        qh, sq = _quantize_q(q.float() * sK, cfg.q_bits, scale * LOG2E)  # z = q step_K as int8, sl q . base_K
+        qhc, sqc = _quantize_q(q.float() * sK, qbc, scale * LOG2E) if qbc != cfg.q_bits else (qh, sq)
         qb = qs @ bK.transpose(-1, -2)
         exact_g = (g < cfg.sink_groups) | (cfg.open_group & (qgrp == g))  # [M, 1]
         for j in range(g * G, (g + 1) * G, S):
             sl = slice(j, j + S)
             masked = torch.arange(j, j + S, device=dev)[None, :] > qpos  # [M, S]
             s_f = qb + sq * (qh @ K["code"][..., sl, :].transpose(-1, -2))
-            s_c = qb + sq * 0.5 * (qh @ kc2[..., sl, :].transpose(-1, -2))
+            s_c = qb + sqc * 0.5 * (qhc @ kc2[..., sl, :].transpose(-1, -2))
             s_e = qs @ kf[..., sl, :].transpose(-1, -2)
             s_f, s_c, s_e = (x.masked_fill(masked, -math.inf) for x in (s_f, s_c, s_e))
             # refinement decision on the coarse scores, against the running maximum
@@ -148,6 +173,7 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cfg: FBLAConfig
                 ref = {"all": torch.ones_like(pre, dtype=torch.bool), "none": torch.zeros_like(pre, dtype=torch.bool)}.get(
                     cfg.refine, pre > cfg.tau)
             quant = torch.isfinite(mbc) & ~exact_g
+            ref = _tile_any(ref & quant, cfg.tile)
             n_q += int(quant.sum()); n_ref += int((quant & ref).sum())
             sc = torch.where(exact_g, s_e, torch.where(ref, s_f, s_c))
             mb = sc.amax(-1, keepdim=True)
@@ -156,8 +182,9 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cfg: FBLAConfig
             alpha = torch.where(torch.isfinite(m), torch.exp2(m - mn), torch.zeros_like(m))
             pblk = torch.where(live, torch.exp2(mb - mn), torch.zeros_like(mb))
             e = torch.where(live, torch.exp2(sc - torch.where(live, mb, 0.0)), torch.zeros_like(sc))
-            ph = torch.round(pq * e)
-            w = pblk / pq
+            pqr = torch.where(exact_g | ref, pq, pqc)                         # [M, 1]: P bits of the row's block
+            ph = torch.round(pqr * e)
+            w = pblk / pqr
             sp = ph.sum(-1, keepdim=True)
             pv_f = sp * bV + sV * (ph @ V["code"][..., sl, :])
             pv_c = sp * bV + sV * 0.5 * (ph @ vc2[..., sl, :])
@@ -170,6 +197,66 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cfg: FBLAConfig
         stats["refined"] = stats.get("refined", 0) + n_ref
         stats["quantized"] = stats.get("quantized", 0) + n_q
     return o * (1.0 / l)
+
+
+@torch.no_grad()
+def prefill_p128(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float = None, exact_block: int = 64) -> torch.Tensor:
+    """float64 model of the tensor-core prefill (mlops_fbla_prefill on sm_75 .. sm_89), causal, q [..., M, D] at
+    positions N - M .. N - 1, k / v [..., N, D] BF16 values (one KV head a q head: repeat_interleave for GQA).
+
+    Closed groups (0 < g < the row's group): every block refined, i.e. the full 6-bit codes, the group's q-hat,
+        s = sl q . base_K + sq q-hat . code,  P = rint(255 2^(s - m)) over ONE block of 128 tokens, V = base + step code.
+    Sink (g = 0) and the row's own group: BF16 q . k, blocks of `exact_block` tokens, P = bf16(255 2^(s - m)).
+    The softmax weight of a block is 2^(m - M); o = sum w P v / sum w sum P."""
+    D, M, N, G = q.shape[-1], q.shape[-2], k.shape[-2], FBLAConfig().group
+    scale = 1.0 / math.sqrt(D) if scale is None else scale
+    dev, f32, f64 = q.device, torch.float32, torch.float64
+    sl = torch.tensor(scale * LOG2E, dtype=f32, device=dev)
+    inv127 = torch.tensor(1.0 / 127.0, dtype=f32, device=dev)
+    pad = -N % G
+    kp, vp = (torch.nn.functional.pad(x.float(), (0, 0, 0, pad)) for x in (k, v))
+    cfg = FBLAConfig()
+    K, V = encode(kp, cfg), encode(vp, cfg)
+    qf, qs = q.float(), (q.float() * sl).double()                  # q sl is FP32, the sums are exact
+    pos = torch.arange(N - M, N, device=dev)
+    own = pos // G
+    m = torch.full((*q.shape[:-2], M), -math.inf, dtype=f64, device=dev)
+    num = torch.zeros(*q.shape[:-2], M, D, dtype=f64, device=dev)
+    den = torch.zeros_like(m)
+
+    def add(s, vals, block, bf16_p):                                # s [.., M, G] (-inf: masked), vals [.., G, D]
+        nonlocal m, num, den
+        for b0 in range(0, G, block):
+            sb = s[..., b0:b0 + block]
+            mb = sb.amax(-1)
+            live = torch.isfinite(mb)
+            x = torch.where(live[..., None], 255.0 * torch.exp2(sb - torch.where(live, mb, 0.0)[..., None]), 0.0)
+            p = x.float().to(torch.bfloat16).double() if bf16_p else torch.round(x)
+            mn = torch.maximum(m, torch.where(live, mb, -math.inf))
+            a = torch.where(torch.isfinite(m), torch.exp2(m - mn), 0.0)
+            w = torch.where(live, torch.exp2(mb - torch.where(torch.isfinite(mn), mn, 0.0)), 0.0)
+            num = num * a[..., None] + w[..., None] * (p @ vals[..., b0:b0 + block, :])
+            den = den * a + w * p.sum(-1)
+            m = torch.where(torch.isfinite(mn), mn, m)
+
+    for g in range(kp.shape[-2] // G):
+        closed, exact = (g >= 1) & (g < own), (g == 0) | (g == own)    # [M]
+        t = slice(g * G, (g + 1) * G)
+        if exact.any():
+            visible = (g * G + torch.arange(G, device=dev))[None, :] <= pos[:, None]
+            s = torch.where((exact[:, None] & visible), qs @ kp[..., t, :].double().transpose(-1, -2), -math.inf)
+            add(s, vp[..., t, :].double(), exact_block, True)
+        if closed.any():
+            z = qf * K["step"][..., g, :, :]                       # exact in FP32; q-hat = rint(z fl(127 / max|z|))
+            am = z.abs().amax(-1, keepdim=True)
+            r = torch.where(am > 0, torch.full_like(am, 127.0) / am.clamp_min(1e-38), torch.zeros_like(am))
+            qh = torch.round(z.double() * r.double())
+            sq = am * (sl * inv127)
+            qb = (qf.double() * K["base"][..., g, :, :].double()).sum(-1, keepdim=True) * sl.double()
+            s = qb + sq.double() * (qh @ K["code"][..., t, :].double().transpose(-1, -2))
+            vals = V["base"][..., g, :, :].double() + V["step"][..., g, :, :].double() * V["code"][..., t, :].double()
+            add(torch.where(closed[:, None], s, -math.inf), vals, G, False)
+    return num / den[..., None]
 
 
 def exact_attention(q, k, v, scale=None):

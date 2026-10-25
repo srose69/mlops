@@ -66,9 +66,18 @@ class Bench {
         nvmlDeviceGetHandleByPciBusId_v2(bus, &nvml_) == NVML_SUCCESS)
       ok_ = true;
     cudaEventCreate(&a_); cudaEventCreate(&b_);
+    // MLOPS_BENCH_FLUSH=1: every timed call starts with a cold L2 (a buffer of twice its size written before it,
+    // outside the timed interval), as a layer's cache is in a model's decode step
+    if (env("MLOPS_BENCH_FLUSH", 0) == 1) {
+      int l2 = 0;
+      cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev);
+      flush_bytes_ = 2 * (size_t)std::max(l2, 1 << 20);
+      if (cudaMalloc(&flush_, flush_bytes_) != cudaSuccess) flush_ = nullptr;
+    }
     warmup();
   }
-  ~Bench() { if (ok_) nvmlShutdown(); }
+  ~Bench() { if (ok_) nvmlShutdown(); if (flush_) cudaFree(flush_); }
+  bool flushing() const { return flush_ != nullptr; }
 
   // MLOPS_BENCH_WARMUP products of 2048 x 2048, 0.5 s apart (the GPU raises its clocks under load)
   static void warmup() {
@@ -100,6 +109,7 @@ class Bench {
     });
     std::vector<float> t(reps);
     for (int r = 0; r < reps; ++r) {
+      if (flush_) cudaMemsetAsync(flush_, r & 0xff, flush_bytes_);
       cudaEventRecord(a_); f(); cudaEventRecord(b_); cudaEventSynchronize(b_);
       cudaEventElapsedTime(&t[r], a_, b_);
     }
@@ -115,4 +125,6 @@ class Bench {
   nvmlDevice_t nvml_{};
   bool ok_ = false;
   cudaEvent_t a_, b_;
+  void *flush_ = nullptr;
+  size_t flush_bytes_ = 0;
 };

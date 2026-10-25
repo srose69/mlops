@@ -13,10 +13,14 @@ the bits per element actually read: coarse + 32 / G + fine * share.
 With --decode T the window is a long context whose first win - T positions are computed exactly (prefill writes
 the cache) and whose last T positions decode against the quantized cache; the loss is that of the last T tokens.
 
-    python bench/fbla_lm.py MODEL_DIR TEXT_FILE [TEXT_FILE ...] [--win 2048] [--windows 13]
-    python bench/fbla_lm.py MODEL_DIR TEXT_FILE [TEXT_FILE ...] --win 16384 --decode 1024 --windows 2
+    python bench/fbla_lm.py MODEL_DIR [TEXT_FILE ...] [--win 2048] [--windows 13]
+    python bench/fbla_lm.py MODEL_DIR [TEXT_FILE ...] --win 16384 --decode 1024 --windows 11
 
-The "FBLA kernel" rows run the CUDA kernel (needs --decode; the installed mlops.attention package).
+Without text files the text is the WikiText-2 (raw) test split (about 299K Qwen3 tokens).
+
+The "FBLA kernel" rows run the CUDA kernels (the installed mlops.attention package): decode needs --decode; the
+prefill row runs the last T queries (or, without --decode, the whole window) through mlops_fbla_prefill, on tensor
+cores where the device has them (MLOPS_FBLA_DP4A=1: the DP4A path).
 """
 import argparse
 import os
@@ -27,7 +31,8 @@ import torch.nn.functional as F
 from transformers import AttentionInterface, AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mlops.attention import decode as fbla_decode, encode as fbla_encode  # noqa: E402  (installed package)
+from mlops.attention import append as fbla_append, decode as fbla_decode, empty as fbla_empty  # noqa: E402  (installed package)
+from mlops.attention import encode as fbla_encode, prefill as fbla_prefill  # noqa: E402
 from mlops.attention import fbla_reference as fb  # noqa: E402
 from mlops.attention.fbla import FBLACache  # noqa: E402
 import kv_native as kn  # noqa: E402
@@ -78,6 +83,29 @@ def kernel_decode(query, key, value, T, fmt, tau, scale, G=128):
     return torch.stack(out, 2)
 
 
+def corpus(files):
+    """The text of the evaluation: `files` joined, or without any the WikiText-2 (raw) test split (Salesforce/wikitext
+    from the Hugging Face hub, cached by huggingface_hub; needs pyarrow), a fixed text every run and every GPU."""
+    if files:
+        return "\n\n".join(open(f).read() for f in files)
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+    path = hf_hub_download("Salesforce/wikitext", "wikitext-2-raw-v1/test-00000-of-00001.parquet", repo_type="dataset")
+    return "".join(pq.read_table(path).column("text").to_pylist())
+
+
+def kernel_prefill(query, key, value, T, fmt, chunk, scale):
+    """The last T queries through mlops_fbla_prefill (tensor cores where the device has them, MLOPS_FBLA_DP4A=1:
+    DP4A) in chunks, the first N - T tokens appended to the cache without attention (T = N: the whole window from
+    an empty cache).  query [1, Hq, N, D], key / value [1, Hkv, N, D] -> [1, Hq, T, D] BF16."""
+    N = query.shape[2]
+    c = fbla_empty(1, key.shape[1], N, fmt)
+    if N > T:
+        fbla_append(c, key[:, :, :N - T], value[:, :, :N - T])
+    return torch.cat([fbla_prefill(query[:, :, i:i + chunk].contiguous(), key[:, :, i:i + chunk], value[:, :, i:i + chunk], c, scale=scale)
+                      for i in range(N - T, N, chunk)], 2)
+
+
 def attn(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kw):
     g = query.shape[1] // key.shape[1]
     k, v = key.repeat_interleave(g, 1), value.repeat_interleave(g, 1)
@@ -91,6 +119,8 @@ def attn(module, query, key, value, attention_mask, scaling=None, dropout=0.0, *
             o[:, :, N - T:] = fb.attention(query[0, :, N - T:], k[0], v[0], mode, scaling, CUR["stats"])[None]
         elif mode[0] == "kernel":
             o[:, :, N - T:] = kernel_decode(query, key, value, T, mode[1], mode[2], scaling).float()
+        elif mode[0] == "prefill":
+            o[:, :, N - T:] = kernel_prefill(query, key, value, T, mode[1], mode[2], scaling).float()
         else:
             fk, fv = mode
             kq, vq = fk(k), fv(v)
@@ -107,6 +137,8 @@ def attn(module, query, key, value, attention_mask, scaling=None, dropout=0.0, *
         o = chunked_sdpa(query, k, v, scaling)
     elif isinstance(mode, fb.FBLAConfig):
         o = fb.attention(query[0], k[0], v[0], mode, scaling, CUR["stats"])[None]
+    elif mode[0] == "prefill":
+        o = kernel_prefill(query, key, value, query.shape[2], mode[1], mode[2], scaling).float()
     else:
         fk, fv = mode
         o = decode_semantics(query, k, v, fk, fv, scaling)
@@ -115,7 +147,7 @@ def attn(module, query, key, value, attention_mask, scaling=None, dropout=0.0, *
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("model"); ap.add_argument("text", nargs="+")
+    ap.add_argument("model"); ap.add_argument("text", nargs="*", help="text files; none: the WikiText-2 test split")
     ap.add_argument("--win", type=int, default=2048); ap.add_argument("--windows", type=int, default=13)
     ap.add_argument("--decode", type=int, default=0)
     ap.add_argument("--only", help="comma-separated substrings: run only the schemes whose name contains one (and SDPA)")
@@ -126,7 +158,7 @@ def main():
     AttentionInterface.register("fbla_eval", attn)
     tok = AutoTokenizer.from_pretrained(a.model)
     model = AutoModelForCausalLM.from_pretrained(a.model, dtype=torch.bfloat16, attn_implementation="fbla_eval").cuda()
-    ids = tok("\n\n".join(open(f).read() for f in a.text), return_tensors="pt").input_ids
+    ids = tok(corpus(a.text), return_tensors="pt").input_ids
     if a.decode:   # windows spread over the text (they may overlap)
         n = ids.shape[1] - a.win
         wins = [ids[:, s:s + a.win].cuda() for s in torch.linspace(0, n, a.windows).long().tolist()]
@@ -155,8 +187,23 @@ def main():
                                                             refine="norm", tau=1e-3), None),
              ("FBLA 3+3 refine W_j > 0.0003", fb.FBLAConfig(coarse_bits=3, fine_bits=3,
                                                              refine="norm", tau=3e-4), None),
+             # prefill (exact: every block through its full codes), P per 16-token block or per 128-token group
+             ("FBLA prefill exact 4+2, P block 16", fb.FBLAConfig(refine="all"), None),
+             ("FBLA prefill exact 4+2, P block 128", fb.FBLAConfig(refine="all", sub=128), None),
+             # prefill chunk (--decode T): one refinement decision per 16 consecutive queries, coarse q / P bits
+             ("FBLA prefill 4+2 W_j > 0.001, tile 16, coarse q8 p8", fb.FBLAConfig(refine="norm", tau=1e-3, tile=16), None),
+             ("FBLA prefill 4+2 W_j > 0.001, tile 16, coarse q4 p8",
+              fb.FBLAConfig(refine="norm", tau=1e-3, tile=16, q_bits_coarse=4), None),
+             ("FBLA prefill 4+2 W_j > 0.001, tile 16, coarse q8 p4",
+              fb.FBLAConfig(refine="norm", tau=1e-3, tile=16, p_bits_coarse=4), None),
+             ("FBLA prefill 4+2 W_j > 0.001, tile 16, coarse q4 p4",
+              fb.FBLAConfig(refine="norm", tau=1e-3, tile=16, q_bits_coarse=4, p_bits_coarse=4), None),
+             ("FBLA prefill 3+3 W_j > 0.0003, tile 16, coarse q4 p4",
+              fb.FBLAConfig(coarse_bits=3, fine_bits=3, refine="norm", tau=3e-4, tile=16, q_bits_coarse=4,
+                            p_bits_coarse=4), None),
              ("FBLA kernel 3+3, W_j > 0.0003 (mlops_fbla_decode)", ("kernel", "3+3", 3e-4), "kernel"),
              ("FBLA kernel 4+2, W_j > 0.001 (mlops_fbla_decode)", ("kernel", "4+2", 1e-3), "kernel"),
+             ("FBLA kernel prefill 4+2, chunks of 1024 (mlops_fbla_prefill)", ("prefill", "4+2", 1024), "kernel"),
              ("KIVI 2-bit", (kn.kivi_k(2), kn.kivi_v(2)), "3.0"),
              ("llama.cpp q4_0", (kn.q4_0, kn.q4_0), "4.5")]
     what = f"last {a.decode} tokens decoding against the cache of the first {a.win - a.decode}" if a.decode else "all tokens"

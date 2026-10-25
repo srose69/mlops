@@ -9,7 +9,7 @@ Where FBLA goes: the model's attention function.  transformers calls it per laye
 projections, the q / k norm and RoPE; it is replaced through AttentionInterface:
 
   prefill (many queries)  prefill(q, k, v, cache): the prompt's K / V go into that layer's FBLA cache and its
-                          queries attend through it (full 6-bit codes, streamed DP4A tiles: no BF16 score matrix)
+                          queries attend through it (full 6-bit codes, streamed tiles: no BF16 score matrix)
   decode  (one query)     the new token's K / V are appended to the cache, the query decodes against it
 
 transformers still keeps its own dense KV cache here (it is how the new token's K / V reach this function);

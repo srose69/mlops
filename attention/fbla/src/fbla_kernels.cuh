@@ -284,9 +284,9 @@ __device__ __forceinline__ void online(float mb, float &m, float &alpha, float &
 }
 
 // ---- per-group query quantization -------------------------------------------------------------
-// The lane's channels 4 l .. + 3: z = q * scale * log2 e * step_K, q-hat = rint(z * 127 / max|z|) with
-// sq = max|z| / 127 (both IEEE divisions, once per group).  The coarse code c of a slot decodes to
-// base + step (2^FB c + hoff): s = c0 + sq 2^FB (q-hat . c), c0 = q . base + sq hoff sum q-hat.
+// The lane's channels 4 l .. + 3 (mlops_fbla.h): z = q step_K (exact), q-hat = rint(z fl(127 / max|z|)) (one rounding
+// of the exact product), sq = max|z| sl / 127 with sl = fl(scale log2 e).  The coarse code c of a slot decodes to
+// base + step (2^FB c + hoff): s = c0 + sq 2^FB (q-hat . c), c0 = sl q . base + sq hoff sum q-hat.
 // The group's state lives in the warp's shared slots, not in registers: q-hat words (stage), per query
 // (c0, sq 2^FB), per lane the V affine (vb, vs) with 2^FB and the channel's 2^-n folded in.
 template <int QG> struct WarpSlots {
@@ -300,11 +300,11 @@ template <int QG> struct GroupState {
   float sq[QG], qb[QG];   // full score = qb + sq * (q-hat . code) (refinement pass)
 };
 
-// km, vm: the group's K and V metadata of the lane; qs: q * scale * log2 e.  r = 127 / max|z| correctly rounded
-// from MUFU.RCP (no IEEE-division slow path); rint(z r) is the low byte of the bits of z r + 1.5 * 2^23 (no F2I).  The coarse
-// and the refinement pass both run this on the same inputs, so their q-hat agree bit for bit.
+// km, vm: the group's K and V metadata of the lane; qs: q (unscaled), sl: fl(scale log2 e).  r = 127 / max|z| correctly
+// rounded from MUFU.RCP (no IEEE-division slow path); rint(z r) is the low byte of the bits of fma(z, r, 1.5 * 2^23) (no
+// F2I).  The coarse and the refinement pass both run this on the same inputs, so their q-hat agree bit for bit.
 template <int CB, int FB, int QG>
-__device__ __forceinline__ void setup_group(int lane, uint4 km, uint4 vm, const float (*qs)[D], uint32_t (*stage)[32],
+__device__ __forceinline__ void setup_group(int lane, uint4 km, uint4 vm, const float (*qs)[D], float sl, uint32_t (*stage)[32],
                                             GroupState<QG> &gs, float4 *vbs = nullptr, float4 *vss = nullptr) {
   constexpr float HOFF = .5f * ((1 << FB) - 1);
   float kb[4], ks[4];
@@ -324,18 +324,18 @@ __device__ __forceinline__ void setup_group(int lane, uint4 km, uint4 vm, const 
     asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(rc) : "f"(amax));
     rc = fmaf(fmaf(-amax, rc, 1.f), rc, rc);
     const float q0 = 127.f * rc;
-    const float sq = amax * (1.f / 127.f), r = amax > 0.f ? fmaf(fmaf(-amax, q0, 127.f), rc, q0) : 0.f;
+    const float sq = amax * (sl * (1.f / 127.f)), r = amax > 0.f ? fmaf(fmaf(-amax, q0, 127.f), rc, q0) : 0.f;
     uint32_t bq[4];
     float qsum = 0.f;
 #pragma unroll
     for (int x = 0; x < 4; ++x) {
-      const float t = __fadd_rn(__fmul_rn(z[x], r), MAGICF);  // rint(fl(z r)): no FMA contraction; low byte = code
+      const float t = fmaf(z[x], r, MAGICF);  // rint(z r), one rounding; low byte = code
       bq[x] = __float_as_uint(t);
       qsum += t - MAGICF;
     }
     const uint32_t wq = prmt(prmt(bq[0], bq[1], 0x0040u), prmt(bq[2], bq[3], 0x0040u), 0x5410u);
     stage[qi][lane] = wq;
-    qb = warp_sum(qb);
+    qb = warp_sum(qb) * sl;
     gs.c0[qi] = fmaf(sq * HOFF, warp_sum(qsum), qb); gs.sqc[qi] = sq * (1 << FB);
     gs.sq[qi] = sq; gs.qb[qi] = qb;
   }
@@ -350,8 +350,9 @@ __device__ __forceinline__ void setup_group(int lane, uint4 km, uint4 vm, const 
 }
 
 // ---- BF16 groups (sink, open) -----------------------------------------------------------------
+// s = sl (q . k) of the lane's token (qs: q unscaled, as the quantization takes it)
 template <int QG>
-__device__ __forceinline__ void exact_scores(const uint16_t *k, int t0, int count, const float (*qs)[D], int lane,
+__device__ __forceinline__ void exact_scores(const uint16_t *k, int t0, int count, const float (*qs)[D], float sl, int lane,
                                              float s[QG]) {
   const int t = lane & 15, h = lane >> 4, tok = t0 + t;
   const uint4 *kp = reinterpret_cast<const uint4 *>(k + (size_t)tok * D + 64 * h);
@@ -371,16 +372,16 @@ __device__ __forceinline__ void exact_scores(const uint16_t *k, int t0, int coun
 #pragma unroll
   for (int qi = 0; qi < QG; ++qi) {
     x[qi] += __shfl_xor_sync(FULL, x[qi], 16);
-    s[qi] = tok < count ? x[qi] : -INFINITY;
+    s[qi] = tok < count ? x[qi] * sl : -INFINITY;
   }
 }
 
 template <int QG>
 __device__ __forceinline__ void exact_block(const uint16_t *ek, const uint16_t *ev, int j, int count,
-                                            const float (*qs)[D], uint32_t (*pb)[8], int lane, float m[QG],
+                                            const float (*qs)[D], float sl, uint32_t (*pb)[8], int lane, float m[QG],
                                             float l[QG], float o[QG][4]) {
   float s[QG], al[QG], w[QG];
-  exact_scores<QG>(ek, j * S, count, qs, lane, s);
+  exact_scores<QG>(ek, j * S, count, qs, sl, lane, s);
 #pragma unroll
   for (int qi = 0; qi < QG; ++qi) {
     const float mb = max16(s[qi]);
@@ -425,7 +426,7 @@ __device__ __forceinline__ int units_of(const Args &a) {  // BF16 sub-blocks + c
 template <int QG> struct SmemCoarse {
   WarpSlots<QG> ws[W];
   union {
-    alignas(16) float qs[W][QG][D];  // q * scale * log2 e, per warp
+    alignas(16) float qs[W][QG][D];  // q (unscaled), per warp
     struct { alignas(16) float o[W][QG][D]; float m[W][QG], l[W][QG]; } merge;  // same index: no overlap
   } u;
 };
@@ -513,12 +514,12 @@ __global__ void __launch_bounds__(32 * W, 2) coarse_kernel(const Args a) {
   const float (*qs)[D] = sm.u.qs[warp];
 
 #pragma unroll
-  for (int qi = 0; qi < QG; ++qi) {  // this warp's q, scaled, in shared memory
+  for (int qi = 0; qi < QG; ++qi) {  // this warp's q in shared memory
     const uint2 qw = __ldg(reinterpret_cast<const uint2 *>(a.q + (size_t)(row0 + qi) * D) + lane);
     float qf[4];
     bf16x4(qw.x, qw.y, qf);
     reinterpret_cast<float4 *>(sm.u.qs[warp][qi])[lane] =
-        make_float4(qf[0] * a.scale_log2, qf[1] * a.scale_log2, qf[2] * a.scale_log2, qf[3] * a.scale_log2);
+        make_float4(qf[0], qf[1], qf[2], qf[3]);
   }
   __syncwarp();
 
@@ -534,7 +535,7 @@ __global__ void __launch_bounds__(32 * W, 2) coarse_kernel(const Args a) {
     const bool sink = u < na;
     const size_t eo = (size_t)bh * G * D;
     exact_block<QG>((sink ? a.c.exact_sink_k : a.c.exact_open_k) + eo, (sink ? a.c.exact_sink_v : a.c.exact_open_v) + eo,
-                    sink ? u : u - na, sink ? (groups == 1 ? a.tokens : G) : cnt_open, qs, ws.pb, lane, r.m, r.l, r.o);
+                    sink ? u : u - na, sink ? (groups == 1 ? a.tokens : G) : cnt_open, qs, a.scale_log2, ws.pb, lane, r.m, r.l, r.o);
   }
 
   if (u < units) {
@@ -557,7 +558,7 @@ __global__ void __launch_bounds__(32 * W, 2) coarse_kernel(const Args a) {
     uint4 km = ld128(meta_at(g)), vm = ld128(meta_at(g) + 512);
     GroupState<QG> gs;
     for (;;) {
-      setup_group<CB, FB, QG>(lane, km, vm, qs, ws.stage, gs, ws.vb, ws.vs);
+      setup_group<CB, FB, QG>(lane, km, vm, qs, a.scale_log2, ws.stage, gs, ws.vb, ws.vs);
       u += nw;
       const bool more = u < units_of(a);
       // from the group's last pair: the warp's next group, or (after its last group) the following records,
@@ -631,7 +632,7 @@ struct WarpSlots4 {
 };
 struct SmemCoarse4 {
   WarpSlots4 ws[W];
-  alignas(16) float qs[4][D];  // q * scale * log2 e (the CTA's KV head: the same for every warp)
+  alignas(16) float qs[4][D];  // q (the CTA's KV head: the same for every warp)
 };
 
 template <int CB>
@@ -701,12 +702,12 @@ __global__ void __launch_bounds__(32 * W, 2) coarse_kernel4(const Args a) {
   const int cnt_open = groups >= 2 ? a.tokens - G * (groups - 1) : 0;
   const int ne = na + (cnt_open + S - 1) / S, units = units_of(a);
   WarpSlots4 &ws = sm.ws[warp];
-  if (warp < QG) {  // the CTA's q, scaled
+  if (warp < QG) {  // the CTA's q
     const uint2 qw = __ldg(reinterpret_cast<const uint2 *>(a.q + (size_t)(row0 + warp) * D) + lane);
     float qf[4];
     bf16x4(qw.x, qw.y, qf);
     reinterpret_cast<float4 *>(sm.qs[warp])[lane] =
-        make_float4(qf[0] * a.scale_log2, qf[1] * a.scale_log2, qf[2] * a.scale_log2, qf[3] * a.scale_log2);
+        make_float4(qf[0], qf[1], qf[2], qf[3]);
   }
   __syncthreads();
 
@@ -722,7 +723,7 @@ __global__ void __launch_bounds__(32 * W, 2) coarse_kernel4(const Args a) {
       const bool sink = u < na;
       const size_t eo = (size_t)bh * G * D;
       exact_block<QG>((sink ? a.c.exact_sink_k : a.c.exact_open_k) + eo, (sink ? a.c.exact_sink_v : a.c.exact_open_v) + eo,
-                      sink ? u : u - na, sink ? (groups == 1 ? a.tokens : G) : cnt_open, sm.qs, ws.pb, lane, r.m, r.l, r.o);
+                      sink ? u : u - na, sink ? (groups == 1 ? a.tokens : G) : cnt_open, sm.qs, a.scale_log2, ws.pb, lane, r.m, r.l, r.o);
     }
 #pragma unroll
     for (int qi = 0; qi < QG; ++qi) {
@@ -750,7 +751,7 @@ __global__ void __launch_bounds__(32 * W, 2) coarse_kernel4(const Args a) {
     for (;;) {
       {
         GroupState<QG> gs;
-        setup_group<CB, FB, QG>(lane, km, vm, sm.qs, ws.stage, gs, ws.vb, ws.vs);
+        setup_group<CB, FB, QG>(lane, km, vm, sm.qs, a.scale_log2, ws.stage, gs, ws.vb, ws.vs);
         if (!lane)
 #pragma unroll
           for (int qi = 0; qi < QG; ++qi) ws.cs[qi] = make_float2(gs.c0[qi], gs.sqc[qi]);
@@ -869,13 +870,12 @@ __global__ void __launch_bounds__(32 * W) select_kernel(const Args a) {
 // group's metadata, from which the q-hat of the coarse pass is recomputed (same code, same inputs: the same
 // codes); corrections accumulate in registers, one partial per CTA.
 template <int QG> struct SmemRefine {
-  alignas(16) float qs[QG][D];  // q * scale * log2 e
+  alignas(16) float qs[QG][D];  // q
   alignas(16) uint32_t stage[W][QG][32];
   alignas(16) uint32_t pb[W][2][QG][4];
   int pre[MAX_SLICES + 1];
   alignas(16) float o[W][QG][D];
   float l[W][QG];
-  int last;
 };
 
 template <int CB, int FB, int QG>
@@ -898,7 +898,7 @@ __global__ void __launch_bounds__(32 * W, 2) refine_kernel(const Args a) {
       float qf[4];
       bf16x4(qw.x, qw.y, qf);
       reinterpret_cast<float4 *>(sm.qs[qi])[lane] =
-          make_float4(qf[0] * a.scale_log2, qf[1] * a.scale_log2, qf[2] * a.scale_log2, qf[3] * a.scale_log2);
+          make_float4(qf[0], qf[1], qf[2], qf[3]);
     }
   if (!warp) {  // prefix sums of the slice counts
     int run = 0;
@@ -952,7 +952,7 @@ __global__ void __launch_bounds__(32 * W, 2) refine_kernel(const Args a) {
     const Codes<FB> &kf = cur.kf, &vf = cur.vf;
     const uint4 vm = cur.vm;
     GroupState<QG> gs;
-    setup_group<CB, FB, QG>(lane, cur.km, vm, sm.qs, sm.stage[warp], gs);
+    setup_group<CB, FB, QG>(lane, cur.km, vm, sm.qs, a.scale_log2, sm.stage[warp], gs);
     float xh[QG], xl[QG];
     qk<CB, QG>(sm.stage[warp], half, kc, xh);
     qk<FB, QG>(sm.stage[warp], half, kf, xl);
@@ -1009,68 +1009,6 @@ __global__ void __launch_bounds__(32 * W, 2) refine_kernel(const Args a) {
     dp[1 + ch] = os;
     if (!ch) dp[0] = ls;
   }
-  __threadfence();
-  __syncthreads();
-  if (!threadIdx.x) sm.last = atomicAdd(a.counter + bh, 1) == P - 1;
-  __syncthreads();
-  if (!sm.last) return;
-  __threadfence();
-  // final combine: warp w sums the CTAs w, w + W, ... of both passes; lane l owns channels 4 l .. + 3
-#pragma unroll
-  for (int qi = 0; qi < QG; ++qi) {
-    const float Rq = __ldg(a.row_lse + row0 + qi);
-    const float *part = a.part + (size_t)(row0 + qi) * a.ctas * (D + 2);
-    const float *dp = a.dpart + (size_t)(row0 + qi) * P * (D + 1);
-    float O[4] = {0.f, 0.f, 0.f, 0.f}, L = 0.f;
-    // four partials per round, all loads in flight together (the combine is a latency chain otherwise)
-    for (int c0 = warp; c0 < a.ctas; c0 += 4 * W) {
-      float mc[4], lc[4];
-      float2 o0[4], o1[4];
-#pragma unroll
-      for (int u = 0; u < 4; ++u) {
-        const int c = c0 + u * W;
-        const float *pc = part + (size_t)min(c, a.ctas - 1) * (D + 2);
-        mc[u] = c < a.ctas ? __ldcg(pc) : -INFINITY; lc[u] = __ldcg(pc + 1);
-        o0[u] = __ldcg(reinterpret_cast<const float2 *>(pc + 2 + 4 * lane));  // 8-byte aligned
-        o1[u] = __ldcg(reinterpret_cast<const float2 *>(pc + 4 + 4 * lane));
-      }
-#pragma unroll
-      for (int u = 0; u < 4; ++u) {
-        const float e = mc[u] == -INFINITY ? 0.f : ex2(mc[u] - Rq);
-        L = fmaf(e, lc[u], L);
-        O[0] = fmaf(e, o0[u].x, O[0]); O[1] = fmaf(e, o0[u].y, O[1]); O[2] = fmaf(e, o1[u].x, O[2]); O[3] = fmaf(e, o1[u].y, O[3]);
-      }
-    }
-    for (int c0 = warp; c0 < P; c0 += 4 * W) {
-      float lc[4], oc[4][4];
-#pragma unroll
-      for (int u = 0; u < 4; ++u) {
-        const int c = c0 + u * W;
-        const float *dc = dp + (size_t)min(c, P - 1) * (D + 1);
-        const float f = c < P ? 1.f : 0.f;
-        lc[u] = f * __ldcg(dc);
-#pragma unroll
-        for (int x2 = 0; x2 < 4; ++x2) oc[u][x2] = f * __ldcg(dc + 1 + 4 * lane + x2);
-      }
-#pragma unroll
-      for (int u = 0; u < 4; ++u) {
-        L += lc[u];
-#pragma unroll
-        for (int x2 = 0; x2 < 4; ++x2) O[x2] += oc[u][x2];
-      }
-    }
-    if (!lane) sm.l[warp][qi] = L;
-    *reinterpret_cast<float4 *>(&sm.o[warp][qi][4 * lane]) = make_float4(O[0], O[1], O[2], O[3]);
-  }
-  __syncthreads();
-  for (int i = threadIdx.x; i < QG * D; i += blockDim.x) {
-    const int qi = i / D, ch = i - qi * D;
-    float O = 0.f, L = 0.f;
-#pragma unroll
-    for (int w = 0; w < W; ++w) { O += sm.o[w][qi][ch]; L += sm.l[w][qi]; }
-    a.out[(size_t)(row0 + qi) * D + ch] = to_bf16(O / L);
-  }
-  if (!threadIdx.x) a.counter[bh] = 0;  // the next call counts from zero again
 }
 
 // ---- refinement pass, four queries per KV head ---------------------------------------------------
@@ -1087,7 +1025,6 @@ struct SmemRefine4 {
   alignas(16) float qs[4][D];
   RefineSlots4 ws[W];
   int pre[MAX_SLICES + 1];
-  int last;
 };
 
 template <int CB, int FB>
@@ -1105,7 +1042,7 @@ __global__ void __launch_bounds__(32 * W, 2) refine_kernel4(const Args a) {
     float qf[4];
     bf16x4(qw.x, qw.y, qf);
     reinterpret_cast<float4 *>(sm.qs[warp])[lane] =
-        make_float4(qf[0] * a.scale_log2, qf[1] * a.scale_log2, qf[2] * a.scale_log2, qf[3] * a.scale_log2);
+        make_float4(qf[0], qf[1], qf[2], qf[3]);
   }
   if (warp == QG) {  // prefix sums of the slice counts
     int run = 0;
@@ -1150,7 +1087,7 @@ __global__ void __launch_bounds__(32 * W, 2) refine_kernel4(const Args a) {
     if (k + P * W < total) fetch(nx, item_at(k + P * W));
     {
       GroupState<QG> gs;
-      setup_group<CB, FB, QG>(lane, cur.km, cur.vm, sm.qs, ws.stage, gs);
+      setup_group<CB, FB, QG>(lane, cur.km, cur.vm, sm.qs, a.scale_log2, ws.stage, gs);
       if (!lane)
 #pragma unroll
         for (int qi = 0; qi < QG; ++qi) ws.gq[qi] = make_float4(gs.sq[qi], gs.qb[qi], gs.c0[qi], gs.sqc[qi]);
@@ -1218,72 +1155,55 @@ __global__ void __launch_bounds__(32 * W, 2) refine_kernel4(const Args a) {
     dp[1 + ch] = os;
     if (!ch) dp[0] = ls;
   }
-  __threadfence();
-  __syncthreads();
-  if (!threadIdx.x) sm.last = atomicAdd(a.counter + bh, 1) == P - 1;
-  __syncthreads();
-  if (!sm.last) return;
-  __threadfence();
-#pragma unroll 1
-  for (int qi = 0; qi < QG; ++qi) {
-    const float Rq = __ldg(a.row_lse + row0 + qi);
-    const float *part = a.part + (size_t)(row0 + qi) * a.ctas * (D + 2);
-    const float *dp = a.dpart + (size_t)(row0 + qi) * P * (D + 1);
-    float O[4] = {0.f, 0.f, 0.f, 0.f}, L = 0.f;
-    for (int c0 = warp; c0 < a.ctas; c0 += 4 * W) {
-      float mc[4], lc[4];
-      float2 o0[4], o1[4];
+}
+
+// ---- final combine ----------------------------------------------------------------------------------
+// One CTA per (batch, KV head, query, slice of MC channels): the partials are many and the traffic of one SM is
+// bound by its outstanding misses, so the row is split over SMs by channel.  Thread (g, ch) sums the coarse
+// partials and the corrections of the CTAs g, g + MG, ...; the loads of a round (MU partials of both arrays) are in
+// flight together.  The grid does not depend on the context.
+constexpr int MC = 16, MG = 16, MU = 9, MSLICES = D / MC;
+template <int QG>
+__global__ void __launch_bounds__(MC * MG) merge_kernel(const Args a) {
+  __shared__ float o[MG][MC], l[MG];
+  const int ch = threadIdx.x % MC, g = threadIdx.x / MC;
+  const int bh = blockIdx.y, b = bh / a.kv_heads, kh = bh - b * a.kv_heads;
+  const int row = b * a.q_heads + kh * QG + blockIdx.x / MSLICES, col = (blockIdx.x % MSLICES) * MC + ch, P = a.rctas;
+  const float Rq = __ldg(a.row_lse + row);
+  const float *part = a.part + (size_t)row * a.ctas * (D + 2);
+  const float *dp = a.dpart + (size_t)row * P * (D + 1);
+  float O = 0.f, L = 0.f;
+  for (int r = g; r < max(a.ctas, P); r += MU * MG) {
+    float mc[MU], lc[MU], oc[MU], ld[MU], od[MU];
 #pragma unroll
-      for (int u = 0; u < 4; ++u) {
-        const int c = c0 + u * W;
-        const float *pc = part + (size_t)min(c, a.ctas - 1) * (D + 2);
-        mc[u] = c < a.ctas ? __ldcg(pc) : -INFINITY; lc[u] = __ldcg(pc + 1);
-        o0[u] = __ldcg(reinterpret_cast<const float2 *>(pc + 2 + 4 * lane));
-        o1[u] = __ldcg(reinterpret_cast<const float2 *>(pc + 4 + 4 * lane));
-      }
-#pragma unroll
-      for (int u = 0; u < 4; ++u) {
-        const float e = mc[u] == -INFINITY ? 0.f : ex2(mc[u] - Rq);
-        L = fmaf(e, lc[u], L);
-        O[0] = fmaf(e, o0[u].x, O[0]); O[1] = fmaf(e, o0[u].y, O[1]); O[2] = fmaf(e, o1[u].x, O[2]); O[3] = fmaf(e, o1[u].y, O[3]);
-      }
+    for (int u = 0; u < MU; ++u) {
+      const int c = r + u * MG;
+      const float *pc = part + (size_t)min(c, a.ctas - 1) * (D + 2), *dc = dp + (size_t)min(c, P - 1) * (D + 1);
+      const float f = c < P ? 1.f : 0.f;
+      mc[u] = c < a.ctas ? __ldcg(pc) : -INFINITY; lc[u] = __ldcg(pc + 1); oc[u] = __ldcg(pc + 2 + col);
+      ld[u] = f * __ldcg(dc); od[u] = f * __ldcg(dc + 1 + col);
     }
-    for (int c0 = warp; c0 < P; c0 += 4 * W) {
-      float lc[4], oc[4][4];
 #pragma unroll
-      for (int u = 0; u < 4; ++u) {
-        const int c = c0 + u * W;
-        const float *dc = dp + (size_t)min(c, P - 1) * (D + 1);
-        const float f = c < P ? 1.f : 0.f;
-        lc[u] = f * __ldcg(dc);
-#pragma unroll
-        for (int x2 = 0; x2 < 4; ++x2) oc[u][x2] = f * __ldcg(dc + 1 + 4 * lane + x2);
-      }
-#pragma unroll
-      for (int u = 0; u < 4; ++u) {
-        L += lc[u];
-#pragma unroll
-        for (int x2 = 0; x2 < 4; ++x2) O[x2] += oc[u][x2];
-      }
+    for (int u = 0; u < MU; ++u) {
+      const float e = mc[u] == -INFINITY ? 0.f : ex2(mc[u] - Rq);
+      L = fmaf(e, lc[u], L) + ld[u];
+      O = fmaf(e, oc[u], O) + od[u];
     }
-    __syncwarp();
-    if (!lane) ws.dl[qi] = L;
-    reinterpret_cast<float4 *>(ws.o[qi])[lane] = make_float4(O[0], O[1], O[2], O[3]);
   }
+  o[g][ch] = O;
+  if (!ch) l[g] = L;
   __syncthreads();
-  for (int i = threadIdx.x; i < QG * D; i += blockDim.x) {
-    const int qi = i / D, ch = i - qi * D;
-    float O = 0.f, L = 0.f;
+  if (g == 0) {
+    float s = 0.f, n = 0.f;
 #pragma unroll
-    for (int w = 0; w < W; ++w) { O += sm.ws[w].o[qi][ch]; L += sm.ws[w].dl[qi]; }
-    a.out[(size_t)(row0 + qi) * D + ch] = to_bf16(O / L);
+    for (int w = 0; w < MG; ++w) { s += o[w][ch]; n += l[w]; }
+    a.out[(size_t)row * D + col] = to_bf16(s / n);
   }
-  if (!threadIdx.x) a.counter[bh] = 0;  // the next call counts from zero again
 }
 
 // ---- launch ---------------------------------------------------------------------------------------
 // CTAs per (batch, KV head): the device's resident CTAs split over the heads (persistent, one wave), at
-// most bound (the scratch's partials), and no more than gives every warp 16 sub-blocks of work.
+// most bound (the scratch's partials).  The grid is a function of the device only, not of the context.
 inline int blocks_per_sm(const void *kernel) {
   static struct { const void *k; int dev, occ; } cache[64];
   static int n = 0;
@@ -1295,31 +1215,36 @@ inline int blocks_per_sm(const void *kernel) {
   if (n < 64) cache[n++] = {kernel, dev, std::max(occ, 1)};
   return std::max(occ, 1);
 }
-inline int per_head(const void *kernel, int bound, const Args &a, long long work) {
+inline int per_head(const void *kernel, int bound, const Args &a) {
   int dev = 0, sms = 1;
   cudaGetDevice(&dev);
   cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
   const int heads = a.batch * a.kv_heads, slots = blocks_per_sm(kernel) * sms;
-  const long long by_work = std::max<long long>(1, work / (16LL * W));
-  return (int)std::max<long long>(1, std::min<long long>({(long long)std::max(1, slots / heads), (long long)bound, by_work}));
+  return std::max(1, std::min(std::max(1, slots / heads), bound));
 }
 
-// The select pass does not depend on the format: one copy of its kernels (the object built with
-// MLOPS_FBLA_DEFINE_SHARED, fbla_inst.cu), launched from both format objects through this host function.  From
+// The select and merge passes do not depend on the format: one copy of their kernels (the object built with
+// MLOPS_FBLA_DEFINE_SHARED, fbla_inst.cu), launched from both format objects through these host functions.  From
 // CUDA 12.8 on a kernel template's launch stub is local to its object (-static-global-template-stub), so the
-// kernel itself cannot be shared.
+// kernel itself cannot be shared (and a copy in each object is a duplicate entry kernel).
 void launch_select(const Args &a, int qg, dim3 grid, cudaStream_t stream);
+void launch_merge(const Args &a, int qg, int heads, cudaStream_t stream);
 #ifdef MLOPS_FBLA_DEFINE_SHARED
 void launch_select(const Args &a, int qg, dim3 grid, cudaStream_t stream) {
   if (qg == 1) select_kernel<1><<<grid, 32 * W, 0, stream>>>(a);
   else if (qg == 2) select_kernel<2><<<grid, 32 * W, 0, stream>>>(a);
   else select_kernel<4><<<grid, 32 * W, 0, stream>>>(a);
 }
+void launch_merge(const Args &a, int qg, int heads, cudaStream_t stream) {
+  const dim3 grid(qg * MSLICES, heads);
+  if (qg == 1) merge_kernel<1><<<grid, MC * MG, 0, stream>>>(a);
+  else if (qg == 2) merge_kernel<2><<<grid, MC * MG, 0, stream>>>(a);
+  else merge_kernel<4><<<grid, MC * MG, 0, stream>>>(a);
+}
 #endif
 
 template <int CB, int FB, int QG> cudaError_t launch_qg(Args a, int bound, cudaStream_t stream) {
   const int heads = a.batch * a.kv_heads;
-  const long long work = (long long)a.groups * SBG;
   const void *ck, *rk;
   if constexpr (QG == 4) {
     ck = reinterpret_cast<const void *>(coarse_kernel4<CB, FB>);
@@ -1328,14 +1253,14 @@ template <int CB, int FB, int QG> cudaError_t launch_qg(Args a, int bound, cudaS
     ck = reinterpret_cast<const void *>(coarse_kernel<CB, FB, QG>);
     rk = reinterpret_cast<const void *>(refine_kernel<CB, FB, QG>);
   }
-  const int p1 = per_head(ck, bound, a, work);
-  const int p2 = per_head(rk, bound, a, work / 4);
-  a.ctas = p1;
+  const int p1 = per_head(ck, bound, a), p2 = per_head(rk, bound, a);  // the device's resident CTAs, not the context
+  a.ctas = p1; a.rctas = p2;
   if constexpr (QG == 4) coarse_kernel4<CB, FB><<<dim3(p1, heads), 32 * W, 0, stream>>>(a);
   else coarse_kernel<CB, FB, QG><<<dim3(p1, heads), 32 * W, 0, stream>>>(a);
   launch_select(a, QG, dim3(a.nslices, heads), stream);
   if constexpr (QG == 4) refine_kernel4<CB, FB><<<dim3(p2, heads), 32 * W, 0, stream>>>(a);
   else refine_kernel<CB, FB, QG><<<dim3(p2, heads), 32 * W, 0, stream>>>(a);
+  launch_merge(a, QG, heads, stream);
   return cudaGetLastError();
 }
 

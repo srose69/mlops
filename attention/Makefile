@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 # mlops-attention: FBLA compressed-KV FlashAttention prefill and decode (fbla/).
-#   make lib        libmlops_attention.a for $(ARCHS) (default: every DP4A architecture sm_61..sm_90)
+#   make lib        libmlops_attention.a for $(ARCHS) (default: every architecture sm_61..sm_90)
 #   make test       both formats against a float64 model; GQA 1/2/4, capacity, 384 .. 256K tokens (GPU $(GPU))
 #   make bench      local run: 3+3 / 4+2 at 16K .. 1M; KV heads 1/8, GQA 2/4, traffic and NVML clocks
 #                   (bench/run_bench.sh: controlled board run -> benches/<gpu>.md and benches/table.md)
@@ -23,7 +23,8 @@ endif
 VERSION := $(shell sed -n 's/^#define MLOPS_ATTENTION_VERSION "\(.*\)"/\1/p' include/mlops_attention.h)
 FLAGS   = $(if $(CCBIN),-ccbin $(CCBIN)) -O3 -std=c++17 -Xcompiler -ffp-contract=off,-fPIC -Iinclude -Ifbla/src
 HDRS    = include/mlops_attention.h include/mlops_fbla.h fbla/src/common.cuh fbla/src/fbla_kernels.cuh \
-          fbla/src/fbla_prefill.cuh
+          fbla/src/fbla_prefill.cuh fbla/src/tensors/mma.cuh fbla/src/tensors/transcode.cuh fbla/src/tensors/fn.cuh \
+          fbla/src/tensors/prefill_tc.cuh
 OBJS    = fbla fbla_inst_3p3 fbla_inst_4p2
 NVCC_THREADS := $(shell t=$$(( $(JOBS) / $(words $(OBJS)) )); [ $$t -lt 1 ] && t=1; a=$(words $(ARCHS)); [ $$t -gt $$a ] && t=$$a; echo $$t)
 

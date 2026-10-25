@@ -208,22 +208,28 @@ def test_append_matches_encode(mode):
 
 
 @pytest.mark.parametrize("mode", ["3+3", "4+2"])
-def test_prefill_matches_decode(mode):
-    """Chunked prefill from an empty cache: every position's output against append + decode of that position
-    with every block refined (the same attention; the two kernels round differently, so within BF16 output
-    rounding), and the cache it leaves against encode's."""
+def test_prefill_matches_model(mode):
+    """Chunked prefill from an empty cache: every position's output against the model of the path that ran.
+    Tensor cores (the cache carries images): fbla_reference.prefill_p128 (P blocks of 128 tokens in the closed
+    groups, BF16 P in the BF16 ones).  DP4A: append + decode of that position with every block refined.  Within
+    BF16 output rounding; and the cache the prefill leaves against encode's."""
     from mlops.attention import append, decode, empty, encode, prefill
+    from mlops.attention.fbla_reference import prefill_p128
     _, k, v = _case(900, seed=11)
     q = (1.5 * torch.randn(1, 4, 900, 128, device="cuda", generator=torch.Generator(device="cuda").manual_seed(12))).bfloat16()
     c = empty(1, 2, 1024, mode)
     outs = [prefill(q[:, :, a:b], k[:, :, a:b], v[:, :, a:b], c) for a, b in ((0, 300), (300, 384), (384, 900))]
     out = torch.cat(outs, 2)
-    d = empty(1, 2, 1024, mode)
-    for t in range(900):
-        append(d, k[:, :, t:t + 1], v[:, :, t:t + 1])
-        if t % 61 == 0 or t in (127, 128, 383, 384, 899):
-            ref = decode(q[:, :, t], d, tau=1e-30)
-            assert _rel(out[:, :, t], ref) < 4e-3, t
+    if c.images is not None:
+        ref = prefill_p128(q, k.repeat_interleave(2, 1), v.repeat_interleave(2, 1))
+        for t in range(900):
+            assert _rel(out[:, :, t], ref[:, :, t]) < 4e-3, t
+    else:
+        d = empty(1, 2, 1024, mode)
+        for t in range(900):
+            append(d, k[:, :, t:t + 1], v[:, :, t:t + 1])
+            if t % 61 == 0 or t in (127, 128, 383, 384, 899):
+                assert _rel(out[:, :, t], decode(q[:, :, t], d, tau=1e-30)) < 4e-3, t
     e = encode(k, v, mode, capacity=1024)
     assert c.tokens == e.tokens == 900
     for x, y in ((c.coarse, e.coarse), (c.fine, e.fine), (c.meta, e.meta), (c.open_k, e.open_k), (c.sink_v, e.sink_v)):

@@ -16,13 +16,12 @@ struct Args {
   float *lse;      // [rows, nblocks]: log2 mass of every closed sub-block (coarse scores)
   float *part;     // [rows, ctas, 2 + 128]: coarse (m, l, o) of every coarse CTA
   float *dpart;    // [rows, ctas, 1 + 128]: corrections (dl, do) of every refine CTA
-  int *counter;    // [batch * kv_heads]: refine CTAs finished
   float *row_lse;  // [rows]: log2 sum of the row's coarse mass, written by the select pass
   int *items;      // [batch * kv_heads, nslices * SLICE]: refined sub-blocks (sub-block << 4 | query mask)
   int *counts;     // [batch * kv_heads, nslices]: items of every slice
   int batch, q_heads, kv_heads, tokens, groups, nblocks, nslices;
   int cgroups;     // groups of the cache's capacity: the per-head stride of the planes and the metadata
-  int ctas;        // coarse CTAs per (batch, KV head)
+  int ctas, rctas; // coarse and refine CTAs per (batch, KV head)
   float scale_log2, log2_tau;
 };
 
@@ -39,6 +38,13 @@ struct PrefillArgs {
 // instantiated per format in fbla_inst.cu (one object each); fbla.cu sees only these declarations
 template <int CB, int FB> cudaError_t launch(const Args &, int bound, cudaStream_t);
 template <int CB, int FB> cudaError_t launch_prefill(const PrefillArgs &, cudaStream_t);
+bool prefill_tc_device();
+// mlops_fbla_cache.tc_images: [batch kv_heads][capacity groups] images of IMAGE_BYTES (tensors/transcode.cuh TGB),
+// then [batch kv_heads][capacity groups] uint32 flags (nonzero: the image is the group's records')
+constexpr size_t IMAGE_BYTES = 34048;
+__host__ __device__ inline uint32_t *image_flags(const mlops_fbla_cache &c, int heads, int cgroups) {
+  return reinterpret_cast<uint32_t *>(c.tc_images + (size_t)heads * cgroups * IMAGE_BYTES);
+}  // the prefill's attention runs on tensor cores here (any head ratio), else on DP4A (1, 2, 4)
 
 __device__ __forceinline__ float bf16(uint16_t x) { return __uint_as_float((uint32_t)x << 16); }
 __device__ __forceinline__ uint16_t to_bf16(float x) {

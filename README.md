@@ -13,8 +13,8 @@ installs all of them.
 |---|---|---|---|
 | [mlops-optimizers](optimizers) | `mlops.optim` | 0.2.0 | AdamW, and AdamWQAT: AdamW that trains NVFP4 weights in place, on GPUs from Maxwell to Hopper. Transformer Engine trains NVFP4 only on Blackwell (sm_100+), through an FP32 or FP16 master copy re-quantized every step. AdamWQAT keeps no such copy: each weight's position lives on the NVFP4 lattice as a 16-bit coordinate, the moments in FP8, and block scales move only on significant evidence and, UE5M3 by default, can grow 256x without an amax recompute (`to_e4m3` exports Transformer Engine's E4M3 scales bit-exact when they fit, else keeps UE5M3 and warns). 6 B per weight for weight + optimizer state, against 12.6 B for an FP32 master with FP32 moments. |
 | [mlops-positional](positional) | `mlops.positional` | 0.1.0 | RoPE of q and k in one pass, 4–8× transformers' eager path, with YaRN / Llama 3 / LongRoPE scaling built in. Its error does not grow with the position: at the floor of the dtype up to 10M tokens. transformers and torchtune take the angle as one FP32 product: in FP32 their error is 1.1e-3 already at 128K, 44 000× the float32 floor, and 9 % RMS at 10M, where they place every token up to ±1.4 positions off. A bit-exact drop-in for transformers' `apply_rotary_pos_emb`. |
-| [mlops-attention](attention) | `mlops.attention` | 0.2.1 | FBLA (Flash Block Attention): compressed-KV FlashAttention prefill and decode for DP4A GPUs (sm_61+), 3+3 and 4+2 modes, 6.25 bits per KV element. On GTX 1080: decode 35–42× faster than PyTorch BF16 SDPA at 16K (at 256K SDPA runs out of memory, FBLA takes 1 ms), prefill 2× faster than PyTorch FP32 SDPA. As accurate as llama.cpp's `q8_0` cache (both within the noise of BF16 on Qwen3-0.6B) at 74 % of its size; `q4_0` costs 20 % of the loss. Details: [attention/docs/overview.md](attention/docs/overview.md). |
-| `mlops` | | 0.5.0 | meta package: every package above |
+| [mlops-attention](attention) | `mlops.attention` | 0.3.0 | FBLA (Flash Block Attention): compressed-KV FlashAttention prefill and decode for GPUs sm_61+ (DP4A decode; the prefill is tuned for tensor cores on Turing, Ampere and Ada, sm_75 .. sm_89, DP4A elsewhere), 3+3 and 4+2 modes, 6.25 bits per KV element. On GTX 1080: decode 35–42× faster than PyTorch BF16 SDPA at 16K (at 256K SDPA runs out of memory, FBLA takes 1 ms), prefill 2× faster than PyTorch FP32 SDPA. On L40S against flash-attn 2: decode 2 .. 4.5×, prefill 1.3 .. 1.9× faster. As accurate as llama.cpp's `q8_0` cache (both within the noise of BF16 on Qwen3-0.6B) at 74 % of its size; `q4_0` raises the loss by 7 % (WikiText-2). Details: [attention/docs/overview.md](attention/docs/overview.md). |
+| `mlops` | | 0.6.0 | meta package: every package above |
 
 **Why UE5M3 block scales by default.** NVFP4 as Transformer Engine stores it has E4M3 block scales
 (`2^-9 .. 448`). NVIDIA's NVFP4 pretraining ([arXiv:2509.25149](https://arxiv.org/abs/2509.25149)) diverges
@@ -49,28 +49,31 @@ group has one BF16 base/step per channel and a 6-bit code; only its high 3 or 4 
 materialized blockwise attention, the coarse kernel already computes FA2 `(m,l,o)`; refinement adds a sparse
 `full - coarse` correction, so decode reads about 4.3 bits per element and runs near DRAM bandwidth (16K
 context: 0.1 .. 0.2 ms on a GTX 1080, 35–42× PyTorch BF16 SDPA; 1M: 5.2 ms at 88 % of a device copy). Prefill is
-compute-bound and reads the full codes through DP4A GEMM tiles at 8 equivalent FP32 TFLOPS. On Qwen3-0.6B,
-16K contexts, 11,264 scored tokens (11 windows), BF16 loss 2.323:
+compute-bound and reads the full codes through GEMM tiles: DP4A at 8 equivalent FP32 TFLOPS on a GTX 1080, tensor
+cores on sm_75 .. sm_89 (1.3 .. 1.9× flash-attn 2 BF16 on an L40S). On Qwen3-0.6B,
+16K contexts of WikiText-2, 11,264 scored tokens (11 windows), BF16 loss 2.784:
 
 | KV cache | bits per element | delta loss vs BF16 SDPA |
 |---|---:|---:|
 | BF16 SDPA | 16 | +0.0000 |
-| llama.cpp `q8_0` | 8.5 | -0.0001 |
-| FBLA 3+3, CUDA kernel | 6.25 | -0.0008 |
-| FBLA 4+2, CUDA kernel | 6.25 | +0.0005 |
-| KIVI 4-bit | 5.0 | +0.0038 |
-| llama.cpp `q4_0` | 4.5 | +0.4755 |
+| llama.cpp `q8_0` | 8.5 | +0.0011 |
+| FBLA 3+3, decode kernel | 6.25 | +0.0013 |
+| FBLA 4+2, decode kernel | 6.25 | +0.0014 |
+| FBLA 4+2, tensor-core prefill | 6.25 | -0.0013 |
+| KIVI 4-bit | 5.0 | +0.0010 |
+| llama.cpp `q4_0` | 4.5 | +0.2048 |
 
-The windows differ by up to ±0.006: FBLA and `q8_0` are within the noise of BF16.
+The windows differ by up to ±0.005: FBLA, `q8_0` and KIVI-4 are within the noise of BF16.
 
-On one 16K window / 2,048 tokens, FBLA 4+2's CUDA kernel has 96.04% top-1 agreement and mean
-`KL(BF16 || FBLA) = 0.00228`, against 95.56% and 0.00464 for KIVI-4. Full tails, loss ranges, format traffic
-and the 16K .. 1M native benchmark: [attention/docs/overview.md](attention/docs/overview.md).
+On one 16K window / 2,048 tokens, FBLA 4+2's decode kernel has 96.39% top-1 agreement and mean
+`KL(BF16 || FBLA) = 0.00223` (the tensor-core prefill: 96.48%, 0.00205), against 95.46% and 0.00467 for KIVI-4
+and 96.58% and 0.00162 for `q8_0` at 8.5 bits. Full tails, loss ranges, format traffic and the 16K .. 1M native
+benchmark: [attention/docs/overview.md](attention/docs/overview.md).
 
-**Against llama.cpp.** Qwen3-8B on one GTX 1080, the same NVFP4 weights (`nvidia/Qwen3-8B-NVFP4`; llama.cpp
+**Against llama.cpp.** Qwen3-8B on one GTX 1080 (sm_61), the same NVFP4 weights (`nvidia/Qwen3-8B-NVFP4`; llama.cpp
 runs its own GGUF conversion of them), `llama-bench`'s tests: the mlops stack (NVFP4EffMA linear layers,
-mlops.positional, FBLA) prefills 1.9× and decodes 1.5× faster at a 16K context against its `q8_0` cache, and
-prefills 2.1× faster at 32K, where llama.cpp fits only a `q4_0` cache. The FBLA
+mlops.positional, FBLA) is, on sm_61, 1.9× faster at prefill and 1.5× faster at decode than llama.cpp at a 16K
+context against its `q8_0` cache, and 2.1× faster at prefill at 32K, where llama.cpp fits only a `q4_0` cache. The FBLA
 cache is as accurate as `q8_0` at 74 % of its size (6.25 bits per element against 8.5), and far more accurate
 than `q4_0`. Full table: [attention/docs/llamacpp-compare.md](attention/docs/llamacpp-compare.md).
 

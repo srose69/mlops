@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Token-distribution comparison of one FBLA configuration against bf16 attention.
+"""Token-distribution comparison of one FBLA configuration (or KIVI / llama.cpp KV quantization) against bf16
+attention, on one window of the WikiText-2 test split unless text files are given.
 
 The two model forwards retain only the evaluated hidden states on CPU.  The LM head is then applied in small
 chunks, so a [tokens, vocabulary] logits tensor is never kept in GPU memory.
@@ -17,7 +18,7 @@ from transformers import AttentionInterface, AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mlops.attention import fbla_reference as fb  # noqa: E402
-from fbla_lm import CUR, attn  # noqa: E402
+from fbla_lm import CUR, attn, corpus  # noqa: E402
 
 torch.backends.cuda.matmul.allow_tf32 = False
 
@@ -29,8 +30,10 @@ def quantiles(x, ps):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
-    ap.add_argument("text", nargs="+")
+    ap.add_argument("text", nargs="*", help="text files; none: the WikiText-2 test split")
+    ap.add_argument("--ids-from", help="take the window's token ids from a --bf16-hidden-cache file instead of tokenizing text")
     ap.add_argument("--win", type=int, default=16384)
+    ap.add_argument("--start", type=int, default=0, help="first token of the window in the text")
     ap.add_argument("--tokens", type=int, default=2048)
     ap.add_argument("--logit-chunk", type=int, default=16)
     ap.add_argument("--tau", type=float, default=3e-4)
@@ -38,7 +41,10 @@ def main():
     ap.add_argument("--fine-bits", type=int, default=3)
     ap.add_argument("--bf16-hidden-cache", help="reuse/save bf16 hidden states for this exact tokenized window")
     ap.add_argument("--kernel", action="store_true", help="decode through the CUDA kernel instead of the model")
+    ap.add_argument("--prefill-kernel", action="store_true", help="the evaluated tokens through mlops_fbla_prefill in chunks")
+    ap.add_argument("--chunk", type=int, default=1024, help="prefill chunk of --prefill-kernel")
     ap.add_argument("--kivi", type=int, default=0, help="KIVI with this many bits instead of FBLA")
+    ap.add_argument("--llama", choices=["q8_0", "q4_0"], help="llama.cpp's KV cache quantization instead of FBLA")
     a = ap.parse_args()
 
     AttentionInterface.register("fbla_token_metrics", attn)
@@ -46,7 +52,8 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         a.model, dtype=torch.bfloat16, attn_implementation="fbla_token_metrics"
     ).cuda().eval()
-    ids = tok("\n\n".join(open(f).read() for f in a.text), return_tensors="pt").input_ids[:, :a.win].cuda()
+    ids = (torch.load(a.ids_from)["input_ids"] if a.ids_from else
+           tok(corpus(a.text), return_tensors="pt").input_ids)[:, a.start:a.start + a.win].cuda()
     if ids.shape[1] != a.win:
         raise ValueError(f"text has only {ids.shape[1]} tokens, need {a.win}")
     CUR["decode"] = a.tokens
@@ -75,7 +82,9 @@ def main():
     stats = {}
     import kv_native as kn
     mode = ((kn.kivi_k(a.kivi), kn.kivi_v(a.kivi)) if a.kivi else
-            ("kernel", f"{a.coarse_bits}+{a.fine_bits}", a.tau) if a.kernel else cfg)
+            (getattr(kn, a.llama),) * 2 if a.llama else
+            ("kernel", f"{a.coarse_bits}+{a.fine_bits}", a.tau) if a.kernel else
+            ("prefill", f"{a.coarse_bits}+{a.fine_bits}", a.chunk) if a.prefill_kernel else cfg)
     h_fbla = hidden(mode, stats)
     targets = ids[:, -a.tokens:].cpu().flatten()
 
@@ -102,9 +111,11 @@ def main():
     true_delta, true_abs_delta = torch.cat(true_delta), torch.cat(true_abs_delta)
     flips = top1_b != top1_q
 
-    name = f"KIVI {a.kivi}-bit" if a.kivi else f"FBLA {a.coarse_bits}+{a.fine_bits}, W_j > {a.tau:g}" + (" (CUDA kernel)" if a.kernel else "")
+    name = (f"KIVI {a.kivi}-bit" if a.kivi else f"llama.cpp {a.llama}" if a.llama else
+            f"FBLA {a.coarse_bits}+{a.fine_bits}, prefill chunks of {a.chunk} (CUDA kernel)" if a.prefill_kernel else
+            f"FBLA {a.coarse_bits}+{a.fine_bits}, W_j > {a.tau:g}" + (" (CUDA kernel)" if a.kernel else ""))
     print(f"{name}; context {a.win}, evaluated tokens {a.tokens}")
-    if not (a.kernel or a.kivi):
+    if not (a.kernel or a.kivi or a.llama or a.prefill_kernel):
         share = stats["refined"] / max(stats["quantized"], 1)
         bits = cfg.coarse_bits + 32 / cfg.group + cfg.fine_bits * share
         print(f"refined {share:.3%}; quantized traffic {bits:.4f} bits/element")

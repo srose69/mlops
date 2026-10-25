@@ -29,6 +29,12 @@ int64_t scratch_bytes(int64_t batch, int64_t q_heads, int64_t kv_heads, int64_t 
   return (int64_t)n;
 }
 
+// bytes of the tensor-core prefill's persistent images (mlops_fbla_cache.tc_images; 0: not used on this device)
+int64_t images_bytes(int64_t batch, int64_t kv_heads, int64_t capacity) {
+  const mlops_fbla_config cfg = config(batch, kv_heads, kv_heads, 0, MLOPS_FBLA_3P3, capacity, 0.0, 0.0);
+  return (int64_t)mlops_fbla_images_bytes(&cfg);
+}
+
 Tensor decode(Tensor q, Tensor coarse, Tensor fine, Tensor meta, Tensor sk, Tensor sv, Tensor ok, Tensor ov,
               Tensor scratch, int64_t tokens, int64_t capacity, int64_t kv_heads, int64_t format, double scale,
               double tau) {
@@ -55,7 +61,7 @@ Tensor decode(Tensor q, Tensor coarse, Tensor fine, Tensor meta, Tensor sk, Tens
 // every new position (None: append only).
 c10::optional<Tensor> prefill(c10::optional<Tensor> q, Tensor k, Tensor v, Tensor coarse, Tensor fine, Tensor meta,
                               Tensor sk, Tensor sv, Tensor ok, Tensor ov, int64_t tokens, int64_t capacity,
-                              int64_t q_heads, int64_t format, double scale) {
+                              int64_t q_heads, int64_t format, double scale, c10::optional<Tensor> images) {
   TORCH_CHECK_VALUE(k.dim() == 4 && k.size(3) == MLOPS_FBLA_HEAD_DIM && v.sizes() == k.sizes(),
                     "k and v must be [batch, kv_heads, n, 128], got ", k.sizes(), " and ", v.sizes());
   const at::Device dev = k.device();
@@ -71,7 +77,12 @@ c10::optional<Tensor> prefill(c10::optional<Tensor> q, Tensor k, Tensor v, Tenso
   const mlops_fbla_config cfg = config(B, q_heads, Hkv, tokens, format, capacity, scale, 0.0);
   mlops_fbla_cache cache{coarse.data_ptr<uint8_t>(), fine.data_ptr<uint8_t>(), (uint16_t *)meta.data_ptr(),
                          (uint16_t *)sk.data_ptr(), (uint16_t *)sv.data_ptr(), (uint16_t *)ok.data_ptr(),
-                         (uint16_t *)ov.data_ptr()};
+                         (uint16_t *)ov.data_ptr(), nullptr};
+  if (images) {
+    tensor(*images, dev, at::kByte, "images");
+    TORCH_CHECK_VALUE((size_t)images->numel() >= mlops_fbla_images_bytes(&cfg), "images: too small for the cache's capacity");
+    cache.tc_images = images->data_ptr<uint8_t>();
+  }
   const c10::cuda::CUDAGuard guard(dev);
   c10::optional<Tensor> out;
   if (q) out = at::empty_like(*q);
@@ -92,7 +103,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("tokens"), py::arg("format"), py::arg("capacity"));
   m.def("prefill", &prefill, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("coarse"), py::arg("fine"),
         py::arg("meta"), py::arg("sink_k"), py::arg("sink_v"), py::arg("open_k"), py::arg("open_v"), py::arg("tokens"),
-        py::arg("capacity"), py::arg("q_heads"), py::arg("format"), py::arg("scale") = 0.0);
+        py::arg("capacity"), py::arg("q_heads"), py::arg("format"), py::arg("scale") = 0.0, py::arg("images") = py::none());
+  m.def("images_bytes", &images_bytes, py::arg("batch"), py::arg("kv_heads"), py::arg("capacity"));
   m.def("decode", &decode, py::arg("q"), py::arg("coarse"), py::arg("fine"), py::arg("meta"), py::arg("sink_k"),
         py::arg("sink_v"), py::arg("open_k"), py::arg("open_v"), py::arg("scratch"), py::arg("tokens"),
         py::arg("capacity"), py::arg("kv_heads"), py::arg("format"), py::arg("scale") = 0.0, py::arg("tau") = 0.0);

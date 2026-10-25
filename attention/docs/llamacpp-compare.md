@@ -55,10 +55,11 @@ streamed from host memory.
 | NVFP4, LM head also NVFP4 (round to nearest) | FBLA 4+2 | 2.7773 | +0.0722 |
 
 On Qwen3-8B the FBLA cache is within the noise of one window (±0.002) of exact attention with either weights;
-the loss of the NVFP4 model is its weight quantization. On Qwen3-0.6B (11 windows of 16K, 11,264 scored tokens,
-[overview.md](overview.md#quality)) FBLA 3+3 (-0.0008), FBLA 4+2 (+0.0005) and q8_0 (-0.0001) are all within
-the noise of BF16 (loss 2.323), while q4_0 costs +0.48 (20 %). FBLA stores 6.25 bits per element against q8_0's
-8.5; q4_0 is smaller (4.5 bits) and loses a fifth of the model.
+the loss of the NVFP4 model is its weight quantization (this 8B table was measured on this repository's
+documentation and has not been re-run on WikiText). On Qwen3-0.6B (WikiText-2, 11 windows of 16K, 11,264 scored
+tokens, [overview.md](overview.md#quality)) FBLA 3+3 (+0.0013), FBLA 4+2 (+0.0014) and q8_0 (+0.0011) are all
+within the noise of BF16 (loss 2.784), while q4_0 costs +0.20 (7 %). FBLA stores 6.25 bits per element against
+q8_0's 8.5; q4_0 is smaller (4.5 bits) and raises the loss by 7 % on that text.
 
 ## Reproduce
 

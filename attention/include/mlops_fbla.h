@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
  * Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
  *
- * FBLA attention over a compressed KV cache, sm_61+ (DP4A): decode, and prefill (mlops_fbla_prefill).  Head
+ * FBLA attention over a compressed KV cache, sm_61+ (DP4A; prefill on tensor cores on sm_75 .. sm_89): decode,
+ * and prefill (mlops_fbla_prefill).  Head
  * dim 128; tokens form groups of 128 (per group and channel a BF16 base and step) and sub-blocks of 16 (the unit
  * of selective refinement).
  *
@@ -11,8 +12,9 @@
  * bits an element decodes to the middle of its coarse cell.  The first group (attention sink) and the last
  * group (still being filled) are BF16.  Decode reads every coarse plane once and the fine planes only of the
  * sub-blocks that hold a share W_j > tau of a query's softmax mass (W_j from the coarse scores).  The query is
- * scaled in FP32 by fl(scale * log2 e) and quantized per group to int8: q-hat = rint(z * fl(127 / max|z|)),
- * z = q * step_K, with sq = max|z| * fl(1 / 127).
+ * quantized per group to int8: z = q * step_K (BF16 x BF16, exact in FP32), q-hat = rint(z * fl(127 / max|z|))
+ * (one rounding of the exact product, ties to even); the scale sl = fl(scale * log2 e) cancels there and enters
+ * sq = max|z| * sl / 127 and the base term sl * (q . base_K) only: score = sq * (q-hat . code) + sl * (q . base_K).
  *
  * Planes.  coarse: [batch, kv_heads, capacity_groups * 8, 2 * CB * 256] bytes, fine: the same with FB: one
  * record per 16-token sub-block holding K and V.  A lane l (0..31) of the decoding warp owns 64 codes of K
@@ -65,6 +67,11 @@ typedef struct {  /* decode only reads the cache; prefill writes it (records, me
   uint8_t *coarse, *fine;
   uint16_t *meta;
   uint16_t *exact_sink_k, *exact_sink_v, *exact_open_k, *exact_open_v;
+  /* Optional (null: none): the tensor-core prefill's closed-group images, kept between calls
+   * (mlops_fbla_images_bytes, zero-filled before first use).  With it a prefill call rebuilds only the groups closed
+   * since, without it all of them.  Kept consistent with the records the library writes (records written otherwise:
+   * zero-fill it again); used only with a nonzero cfg->capacity; not by decode. */
+  uint8_t *tc_images;
 } mlops_fbla_cache;
 
 typedef struct {
@@ -75,9 +82,9 @@ typedef struct {
   int capacity; /* tokens the cache's planes and metadata are laid out for; 0 means tokens */
 } mlops_fbla_config;
 
-/* Scratch for one decode of this configuration (it depends on the current device's SM count).  It must be
- * zero-filled once before its first use; every call leaves it reusable for the next, also for another context
- * length or configuration of the same batch * kv_heads that fits. */
+/* Scratch for one decode of this configuration (it depends on the current device's SM count).  Its initial
+ * contents do not matter; it can be reused for the next call, also for another context length or configuration of
+ * the same batch * kv_heads that fits. */
 size_t mlops_fbla_decode_scratch_bytes(const mlops_fbla_config *cfg);
 
 /* One decode query per q head: q / output [batch, q_heads, 128] BF16, q_heads / kv_heads = 1, 2 or 4 (the
@@ -86,14 +93,20 @@ mlops_fbla_status mlops_fbla_decode(const mlops_fbla_config *cfg, const uint16_t
                                     const mlops_fbla_cache *cache, uint16_t *output,
                                     void *scratch, size_t scratch_bytes, cudaStream_t stream);
 
+/* Bytes of mlops_fbla_cache.tc_images on the current device: 34052 per group of capacity and KV head; 0 where the
+ * prefill does not run on tensor cores. */
+size_t mlops_fbla_images_bytes(const mlops_fbla_config *cfg);
+
 /* Prefill (and append): `count` new tokens.  k / v [batch, kv_heads, count, 128] BF16 are appended to the
  * cache, which holds cfg->tokens (>= 0) tokens before the call and must have cfg->capacity >= tokens + count
  * (capacity 0 means tokens + count): the groups they close are quantized into the records and metadata, the
  * sink and open groups take their BF16 tokens.  With q non-null, q / output [batch, q_heads, count, 128] BF16:
  * the query of position tokens + i attends to the tokens 0 .. tokens + i, the closed groups through their full
- * 6-bit codes (every block refined: mlops_fbla_decode with tau -> 0 after appending them; cfg->tau is not
- * used), the sink and its own group BF16.  q null: append only (output unused).  A zero-filled cache (tokens 0)
- * of the capacity's size is an empty cache.  Up to three kernel launches on `stream`, no scratch. */
+ * 6-bit codes (every block refined; cfg->tau is not used), the sink and its own group BF16.  P blocks (one maximum
+ * and weight): DP4A 16 tokens, as decode; tensor cores 128 tokens a closed group (integer P) and 64 in the BF16
+ * groups (P rounded to BF16).  q_heads / kv_heads: any integer ratio on tensor cores, 1, 2 or 4 on DP4A.  q null:
+ * append only (output unused).  A zero-filled cache (tokens 0) of the capacity's size is an empty cache.  No
+ * scratch. */
 mlops_fbla_status mlops_fbla_prefill(const mlops_fbla_config *cfg, int count, const uint16_t *q,
                                      const uint16_t *k, const uint16_t *v, const mlops_fbla_cache *cache,
                                      uint16_t *output, cudaStream_t stream);
