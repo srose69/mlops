@@ -63,6 +63,7 @@ class Linear:
     on the GPU or (streamed layers) in pinned host memory."""
     def __init__(self, t, nvfp4, bias=None):
         self.t, self.nvfp4, self.bias = t, nvfp4, bias
+        self.tc, self.act = None, "auto"  # tensor-core image of a resident NVFP4 weight (Decoder.place with tc)
 
     @classmethod
     def load(cls, w, names, quantize):
@@ -84,6 +85,9 @@ class Linear:
         return cls([q.data, q.scales, q.global_scale], True, bias)
 
     def __call__(self, x, t=None):
+        if t is None and self.tc is not None:
+            y = nvfp4effma.linear(x, self.tc, act=self.act)
+            return y if self.bias is None else y + self.bias
         t = self.t if t is None else t
         y = nvfp4effma.linear(x, nvfp4effma.NVFP4Tensor(*t)) if self.nvfp4 else F.linear(x, t[0])
         return y if self.bias is None else y + self.bias
@@ -135,15 +139,18 @@ class Decoder:
         del w
         self.streamed, self.queue, self.next = [], collections.deque(), 0  # layers in pinned host memory
         self.copy = torch.cuda.Stream()
+        self.graphs = None  # the decode step's CUDA graphs (step())
 
-    def place(self, capacity, chunk, gpu_layers=None):
+    def place(self, capacity, chunk, gpu_layers=None, tc=None):
         """The KV cache first, then as many layers' weights on the GPU as fit beside it and the activations of a
         prefill chunk; the rest in pinned host memory, streamed in per forward pass (NBUF - 1 layers ahead).  Can be
-        called again (another capacity): the cache is replaced and the layers re-placed."""
-        self.cache, self.streamed = None, []
+        called again (another capacity): the cache is replaced and the layers re-placed.  tc ("exact" / "int8"):
+        the resident NVFP4 layers also get tensor-core images (nvfp4effma.TCWeight, as large as the weights; not in the
+        budget) and run on the tensor-core GEMV / GEMM, W4A16 or W4A8."""
+        self.cache, self.streamed, self.graphs, self.gout = None, [], None, None  # (graphs: the weights' old places)
         for L in self.layers:
             for n in self.LINEARS:
-                L[n].t = [x.cpu() for x in L[n].t]
+                L[n].t, L[n].tc = [x.cpu() for x in L[n].t], None
         torch.cuda.empty_cache()
         self.cache = self.new_cache(capacity)
         I = self.layers[0]["down"].t[0].shape[1] * (2 if self.layers[0]["down"].nvfp4 else 1)  # intermediate size
@@ -166,6 +173,8 @@ class Decoder:
         for i, L in enumerate(self.layers):
             for m in self.LINEARS:
                 L[m].t = [x.cpu().pin_memory() if i in streamed else x.cuda() for x in L[m].t]
+                if tc and L[m].nvfp4 and i not in streamed:
+                    L[m].tc, L[m].act = nvfp4effma.TCWeight(nvfp4effma.NVFP4Tensor(*L[m].t), tc), tc
         self.streamed, self.queue, self.next = sorted(streamed), collections.deque(), 0
         return n - len(self.streamed)
 
@@ -227,11 +236,32 @@ class Decoder:
             ev.record()
         return t, ev
 
+    def qkv(self, L, x, wt, pos, positions=None):
+        """A layer's attention inputs from x [S, H]: q [1, Hq, S, D], k / v [1, Hkv, S, D] (RoPE at pos .. pos + S - 1,
+        or at the device tensor `positions` [S])."""
+        S, D = x.shape[0], self.D
+        q, k, v = L["qkv"](rms_norm(x, L["ln1"], self.eps), wt).split([self.Hq * D, self.Hkv * D, self.Hkv * D], -1)
+        q, k, v = q.view(1, S, self.Hq, D), k.view(1, S, self.Hkv, D), v.view(1, S, self.Hkv, D)
+        if L["q_norm"] is not None:  # Qwen3: RMSNorm of every head's q and k
+            q, k = rms_norm(q, L["q_norm"], self.eps), rms_norm(k, L["k_norm"], self.eps)
+        else:
+            q, k = q.contiguous(), k.contiguous()
+        self.rope(q, k, positions, layout="bshd", offset=pos, inplace=True)
+        return q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(), v.transpose(1, 2).contiguous()
+
+    def mlp(self, L, x, o, wt):
+        """x + the attention's projection o [S, Hq D], then + the MLP."""
+        x = x + L["o"](o, wt["o"])
+        g, u = L["gate_up"](rms_norm(x, L["ln2"], self.eps), wt["gate_up"]).chunk(2, -1)
+        return x + L["down"](F.silu(g) * u, wt["down"])
+
     @torch.no_grad()
     def forward(self, ids, pos, last=True):
         """ids [S] (host) at positions pos .. pos + S - 1 -> the logits of the last one [vocab] (FP32); last=False:
-        the final hidden states of all S (normalized, before the LM head)."""
+        the final hidden states of all S (normalized, before the LM head).  One token on a resident model: step()."""
         S, D = ids.shape[0], self.D
+        if S == 1 and last and self.graphable():
+            return self.step(ids, pos)
         x = self.embed[ids].to("cuda", non_blocking=True)
         self.prefetch()
         for i, (L, c) in enumerate(zip(self.layers, self.cache)):
@@ -243,22 +273,75 @@ class Decoder:
                     for t in ts:
                         t.record_stream(torch.cuda.current_stream())
                 self.prefetch()
-            qkv = L["qkv"](rms_norm(x, L["ln1"], self.eps), wt["qkv"])
-            q, k, v = qkv.split([self.Hq * D, self.Hkv * D, self.Hkv * D], -1)
-            q, k, v = q.view(1, S, self.Hq, D), k.view(1, S, self.Hkv, D), v.view(1, S, self.Hkv, D)
-            if L["q_norm"] is not None:  # Qwen3: RMSNorm of every head's q and k
-                q, k = rms_norm(q, L["q_norm"], self.eps), rms_norm(k, L["k_norm"], self.eps)
-            else:
-                q, k = q.contiguous(), k.contiguous()
-            self.rope(q, k, layout="bshd", offset=pos, inplace=True)
-            o = self.attention(q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(),
-                               v.transpose(1, 2).contiguous(), c, pos)
-            x = x + L["o"](o[0].transpose(0, 1).reshape(S, self.Hq * D), wt["o"])
-            g, u = L["gate_up"](rms_norm(x, L["ln2"], self.eps), wt["gate_up"]).chunk(2, -1)
-            x = x + L["down"](F.silu(g) * u, wt["down"])
+            q, k, v = self.qkv(L, x, wt["qkv"], pos)
+            o = self.attention(q, k, v, c, pos)
+            x = self.mlp(L, x, o[0].transpose(0, 1).reshape(S, self.Hq * D), wt)
         if not last:
             return rms_norm(x, self.norm, self.eps)
         return self.lm_head(rms_norm(x[-1:], self.norm, self.eps))[0].float()
+
+    # ---- decode step on CUDA graphs --------------------------------------------------------------------------
+    # A token's pass is some 46 kernels a layer; launched one by one from Python they take longer than they run.
+    # Everything but the attention is position-free given the position as a device tensor (RoPE reads it), so a
+    # step replays one graph per span between attentions -- layer 0's attention inputs, then the rest of layer i - 1
+    # with layer i's attention inputs, then the last layer's rest and the LM head -- and runs FBLA's append / decode
+    # (their launches depend on the cache's length) between them.  Captured on the first step after place(); the
+    # inputs live in static buffers (the token's embedding staged through pinned memory, no synchronization).
+
+    def graphable(self):
+        return self.attn == "fbla" and not self.streamed and self.rope.kind not in ("dynamic", "longrope")
+
+    def capture(self):
+        n, dev = len(self.layers), "cuda"
+        self.gx = torch.zeros(1, self.H, device=dev, dtype=torch.bfloat16)        # the residual stream
+        self.go = torch.zeros(1, self.Hq * self.D, device=dev, dtype=torch.bfloat16)  # an attention's output
+        self.gpos = torch.zeros(1, device=dev, dtype=torch.int32)
+        self.stage = [(torch.empty(1, self.H, dtype=torch.bfloat16).pin_memory(), torch.cuda.Event()) for _ in range(4)]
+        self.slot = 0
+        none = dict.fromkeys(self.LINEARS)
+
+        def span(i):  # graph i: layer i - 1's rest (i > 0), then layer i's q, k, v (i < n) or the logits
+            x = self.gx
+            if i > 0:
+                x = self.mlp(self.layers[i - 1], x, self.go, none)
+                self.gx.copy_(x)
+            if i < n:
+                return self.qkv(self.layers[i], x, None, 0, self.gpos)
+            return self.lm_head(rms_norm(x, self.norm, self.eps))[0].float()
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):  # warm-up: tables, workspaces, cuBLAS handles made outside the capture
+            for i in range(n + 1):
+                span(i)
+        torch.cuda.current_stream().wait_stream(s)
+        pool = torch.cuda.graph_pool_handle()
+        self.graphs, self.gout = [], []
+        for i in range(n + 1):  # captured in replay order: they share one memory pool
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=pool):
+                out = span(i)
+            self.graphs.append(g)
+            self.gout.append(out)
+
+    def step(self, ids, pos):
+        """forward() of one token on the graphs: the logits [vocab] (FP32, a static buffer: the next step overwrites)."""
+        if self.graphs is None:
+            self.capture()
+        buf, ev = self.stage[self.slot]
+        self.slot = (self.slot + 1) % len(self.stage)
+        ev.synchronize()  # (the copy from this buffer 4 steps ago is done)
+        torch.index_select(self.embed, 0, ids, out=buf)
+        self.gx.copy_(buf, non_blocking=True)
+        ev.record()
+        self.gpos.fill_(pos)
+        for i, c in enumerate(self.cache):
+            self.graphs[i].replay()
+            q, k, v = self.gout[i]
+            append(c, k, v)
+            self.go.copy_(decode(q[:, :, 0], c).view(1, -1))
+        self.graphs[-1].replay()
+        return self.gout[-1]
 
 
 def sample(logits, temperature, top_p, gen):

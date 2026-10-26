@@ -39,6 +39,7 @@ def main():
     ap.add_argument("--nvfp4", default="mlp", choices=["mlp", "all", "none"], help="see samples/04_generate.py")
     ap.add_argument("-ngl", "--gpu-layers", type=int, default=None, help="at most this many layers on the GPU")
     ap.add_argument("--nbuf", type=int, default=None, help="streamed layers on the GPU at a time (default: the decoder's)")
+    ap.add_argument("--tc", choices=["exact", "int8"], help="NVFP4EffMA tensor cores (TCWeight: GEMV / GEMM), W4A16 / W4A8")
     ap.add_argument("--fill-chunk", type=int, default=512, help="prefill chunk of the (untimed) context (llama.cpp's ubatch)")
     a = ap.parse_args()
     ints = lambda s: [int(x) for x in s.split(",") if x]
@@ -51,7 +52,7 @@ def main():
     size = sum(x.numel() * x.element_size() for L in model.layers for n in model.LINEARS for x in L[n].t)
     size += sum(x.numel() * x.element_size() for x in model.lm_head.t)
     name = os.path.basename(os.path.normpath(a.model))
-    print(f"{name}: {len(model.layers)} layers, FBLA {a.mode}, NVFP4EffMA linear layers "
+    print(f"{name}: {len(model.layers)} layers, FBLA {a.mode}, NVFP4EffMA linear layers{' (tensor cores, ' + a.tc + ')' if a.tc else ''} "
           f"({'checkpoint' if model.prequantized else a.nvfp4}), weights {size / 2**30:.2f} GiB (embedding table in host "
           f"memory); {torch.cuda.get_device_name()}\n")
     table = Table([("model", 24, "<"), ("GPU layers", 10, ">"), ("test", 16, ">"), ("t/s", 18, ">")])
@@ -85,7 +86,7 @@ def main():
     plans = []
     for d in Dp:
         capacity = d + max(P + N)
-        resident = model.place(capacity, max(P + [a.fill_chunk]), a.gpu_layers)
+        resident = model.place(capacity, max(P + [a.fill_chunk]), a.gpu_layers, a.tc)
         if model.streamed:
             pl = model.plan
             plans.append(f"  d{d}: layers {model.streamed} streamed from host memory ({pl['layer_mb']:.0f} MiB each at "
