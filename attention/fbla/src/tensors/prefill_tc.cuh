@@ -46,10 +46,10 @@ __device__ __forceinline__ void copy_group(uint32_t slot, const uint8_t *img, co
 }
 #endif
 
-// tiles: group g of KV head bh at tiles + (bh tstride + g - toff) TGB
+// tiles: group g of KV head bh at tiles + bh hstep + (g - toff) gstep (bytes)
 template <int GQA>
-__global__ void __launch_bounds__(THREADS, 1) prefill_tc_kernel(const PrefillArgs a, const uint8_t *tiles, int tstride, int toff, float2 *part_ml,
-                                                                float *part_o) {
+__global__ void __launch_bounds__(THREADS, 1) prefill_tc_kernel(const PrefillArgs a, const uint8_t *tiles, size_t hstep, size_t gstep, int toff,
+                                                                float2 *part_ml, float *part_o) {
 #ifdef MLOPS_FBLA_TC75
   extern __shared__ __align__(128) uint8_t smem[];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, t = lane & 3;
@@ -132,18 +132,18 @@ __global__ void __launch_bounds__(THREADS, 1) prefill_tc_kernel(const PrefillArg
   // ---- closed groups 1 .. gb - 1, ascending; piece z: groups 1 + i0 .. i0 + ng ---------------------------------------
   const int nall = max(0, gb - 1), i0 = (int)((long long)nall * z / nsplit), ng = (int)((long long)nall * (z + 1) / nsplit) - i0;
   if (ng) {
-    const uint8_t *img0 = tiles + ((size_t)bh * tstride + (1 + i0) - toff) * TGB;
+    const uint8_t *img0 = tiles + bh * hstep + (1 + i0 - toff) * gstep;
     const uint32_t ko = k_lane_off(lane), vo = v_lane_off(lane);
     const bool on[2] = {valid[0], valid[1]};
 #ifdef MLOPS_FBLA_TC80
-    if (warp < min(ng, 2)) copy_group(s0 + SLOT * warp, img0 + (size_t)warp * TGB, warp + 1 < ng ? img0 + (size_t)(warp + 1) * TGB : nullptr, lane);
+    if (warp < min(ng, 2)) copy_group(s0 + SLOT * warp, img0 + warp * gstep, warp + 1 < ng ? img0 + (warp + 1) * gstep : nullptr, lane);
 #else
     for (int i = tid; i < min(ng, 2) * SLOT / 16; i += THREADS)
-      reinterpret_cast<uint4 *>(smem)[i] = __ldg(reinterpret_cast<const uint4 *>(img0 + (size_t)(i / (SLOT / 16)) * TGB) + i % (SLOT / 16));
+      reinterpret_cast<uint4 *>(smem)[i] = __ldg(reinterpret_cast<const uint4 *>(img0 + (i / (SLOT / 16)) * gstep) + i % (SLOT / 16));
     __syncthreads();
     auto meta_pf = [&](int jk, int jv) {  // KM of group jk, VM of jv into L1 (6 + 4 lines)
-      if (lane < 6 && jk < ng) prefetch_l1(img0 + (size_t)jk * TGB + O_KM + 128 * lane);
-      else if (lane >= 6 && lane < 10 && jv < ng) prefetch_l1(img0 + (size_t)jv * TGB + O_VM + 128 * (lane - 6));
+      if (lane < 6 && jk < ng) prefetch_l1(img0 + jk * gstep + O_KM + 128 * lane);
+      else if (lane >= 6 && lane < 10 && jv < ng) prefetch_l1(img0 + jv * gstep + O_VM + 128 * (lane - 6));
     };
     meta_pf(1, 0);
 #endif
@@ -151,7 +151,7 @@ __global__ void __launch_bounds__(THREADS, 1) prefill_tc_kernel(const PrefillArg
     float sq[2], qb[2];
     quantize(q, img0 + O_KM + 48 * t, sl, qa, sq, qb);
     for (int j = 0; j < ng; ++j) {
-      const uint8_t *im = img0 + (size_t)j * TGB;
+      const uint8_t *im = img0 + j * gstep;
       const uint32_t kt = s0 + SLOT * (j & 1);
 #ifdef MLOPS_FBLA_TC80
       const uint8_t *kmn = smem + SLOT * (j & 1) + O_KM, *vmj = smem + SLOT * (j & 1) + O_VM;  // (KM: stale at the last)
@@ -163,7 +163,7 @@ __global__ void __launch_bounds__(THREADS, 1) prefill_tc_kernel(const PrefillArg
         bar_sync<64>(ready_id(warp, j));
       }
 #else
-      const uint8_t *kmn = j + 1 < ng ? im + TGB + O_KM : im + O_KM, *vmj = im + O_VM;
+      const uint8_t *kmn = j + 1 < ng ? im + gstep + O_KM : im + O_KM, *vmj = im + O_VM;
       meta_pf(j + 2, j + 1);
 #endif
       closed_group(o, m, l, q, sl, kmn + 48 * t, vmj + 16 * t, kt, kt + O_V, ko, vo, on, qa, sq, qb);
@@ -172,7 +172,7 @@ __global__ void __launch_bounds__(THREADS, 1) prefill_tc_kernel(const PrefillArg
         const uint32_t e = BAR_EMPTY + (j & 1);
         if (warp == ((j + 2) & 7)) {
           bar_sync<THREADS>(e);
-          copy_group(kt, im + 2 * (size_t)TGB, j + 3 < ng ? im + 3 * (size_t)TGB : nullptr, lane);
+          copy_group(kt, im + 2 * gstep, j + 3 < ng ? im + 3 * gstep : nullptr, lane);
         } else if (warp == (j & 7)) {
           bar_sync<THREADS>(e);
         } else {
@@ -183,7 +183,7 @@ __global__ void __launch_bounds__(THREADS, 1) prefill_tc_kernel(const PrefillArg
       if (j + 1 < ng) __syncthreads();  // group j + 1 published, slot j & 1 free
       if (j + 2 < ng) {
         uint4 x[SLOT / 16 / THREADS];
-        unroll<SLOT / 16 / THREADS>([&](auto k) { x[k] = __ldg(reinterpret_cast<const uint4 *>(im + 2 * (size_t)TGB) + tid + THREADS * k); });
+        unroll<SLOT / 16 / THREADS>([&](auto k) { x[k] = __ldg(reinterpret_cast<const uint4 *>(im + 2 * gstep) + tid + THREADS * k); });
         unroll<SLOT / 16 / THREADS>([&](auto k) { reinterpret_cast<uint4 *>(smem + SLOT * (j & 1))[tid + THREADS * k] = x[k]; });
       }
 #endif

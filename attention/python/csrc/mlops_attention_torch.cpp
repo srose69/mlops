@@ -18,7 +18,7 @@ mlops_fbla_config config(int64_t batch, int64_t q_heads, int64_t kv_heads, int64
                          int64_t capacity, double scale, double tau) {
   TORCH_CHECK_VALUE(format == MLOPS_FBLA_3P3 || format == MLOPS_FBLA_4P2, "format must be 0 (3+3) or 1 (4+2)");
   return mlops_fbla_config{(int)batch, (int)q_heads, (int)kv_heads, (int)tokens, (float)scale, (float)tau,
-                           (mlops_fbla_format)format, (int)capacity};
+                           (mlops_fbla_format)format, (int)capacity, 0, 0};
 }
 
 int64_t scratch_bytes(int64_t batch, int64_t q_heads, int64_t kv_heads, int64_t tokens, int64_t format, int64_t capacity) {

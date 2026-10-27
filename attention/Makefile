@@ -21,10 +21,11 @@ ifeq ($(filter $(TEST_ARCH),61 62 70 72 75 80 86 87 89 90),)
 endif
 
 VERSION := $(shell sed -n 's/^#define MLOPS_ATTENTION_VERSION "\(.*\)"/\1/p' include/mlops_attention.h)
-FLAGS   = $(if $(CCBIN),-ccbin $(CCBIN)) -O3 -std=c++17 -Xcompiler -ffp-contract=off,-fPIC -Iinclude -Ifbla/src
+FLAGS   = $(if $(CCBIN),-ccbin $(CCBIN)) -O3 -std=c++17 -Xcompiler -ffp-contract=off,-fPIC -Iinclude -Ifbla/src \
+          -I../positional/include -I../positional/rope/src
 HDRS    = include/mlops_attention.h include/mlops_fbla.h fbla/src/common.cuh fbla/src/fbla_kernels.cuh \
           fbla/src/fbla_prefill.cuh fbla/src/tensors/mma.cuh fbla/src/tensors/transcode.cuh fbla/src/tensors/fn.cuh \
-          fbla/src/tensors/prefill_tc.cuh
+          fbla/src/tensors/prefill_tc.cuh fbla/src/fbla_qkv.cuh ../positional/include/mlops_rope.h ../positional/rope/src/rope.cuh
 OBJS    = fbla fbla_inst_3p3 fbla_inst_4p2
 NVCC_THREADS := $(shell t=$$(( $(JOBS) / $(words $(OBJS)) )); [ $$t -lt 1 ] && t=1; a=$(words $(ARCHS)); [ $$t -gt $$a ] && t=$$a; echo $$t)
 

@@ -6,9 +6,13 @@
 #if MLOPS_FBLA_CB == 3
 #define MLOPS_FBLA_DEFINE_SHARED
 #endif
-#include "fbla_prefill.cuh"
+#include "fbla_qkv.cuh"
 
 template cudaError_t mlops_fbla_detail::launch<MLOPS_FBLA_CB, MLOPS_FBLA_FB>(
     const mlops_fbla_detail::Args &, int, cudaStream_t);
 template cudaError_t mlops_fbla_detail::launch_prefill<MLOPS_FBLA_CB, MLOPS_FBLA_FB>(
     const mlops_fbla_detail::PrefillArgs &, cudaStream_t);
+template cudaError_t mlops_fbla_detail::launch_append<MLOPS_FBLA_CB, MLOPS_FBLA_FB>(
+    const mlops_fbla_detail::PrefillArgs &, cudaStream_t);
+template cudaError_t mlops_fbla_detail::launch_qkv<MLOPS_FBLA_CB, MLOPS_FBLA_FB>(
+    const mlops_fbla_detail::QkvArgs &, cudaStream_t);

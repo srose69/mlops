@@ -5,7 +5,7 @@
     cache = empty(batch, kv_heads, capacity, "4+2")   # or encode(k, v, "4+2", capacity) from dense K / V
     out = prefill(q, k, v, cache)          # a chunk: q [B, Hq, n, 128], k / v [B, Hkv, n, 128] BF16; appends
     append(cache, k_new, v_new)            # [B, Hkv, n, 128] without attention
-    out = decode(q, cache)                 # one query per head: q [B, Hq, 128], q_heads / kv_heads = 1, 2 or 4
+    out = decode(q, cache)                 # one query per head: q [B, Hq, 128], Hq a multiple of the KV heads
 
 ``capacity`` lays the cache out for more tokens than it holds (one allocation for a growing context; the
 decode reads the first ``tokens``).  Every write of the cache (encode, append, prefill) runs on the GPU
@@ -40,9 +40,10 @@ def _quantize(x, groups):
     hi = torch.where(valid, xb, -torch.inf).amax(-2)
     lo, hi = torch.where(torch.isfinite(lo), lo, 0), torch.where(torch.isfinite(hi), hi, 0)
     base = _bf16(lo, -1)
-    step = _bf16((hi - base.float()) / torch.full_like(hi, 63.0), +1)  # tensor / tensor: IEEE division (/ scalar is * 1/63)
+    step = _bf16((hi - base.float()) * torch.tensor(1 / 63, dtype=torch.float32, device=x.device), +1)  # * fl(1/63)
     s = step.float()[..., None, :]
-    code = torch.where(s > 0, torch.round((xb - base.float()[..., None, :]) / s.clamp_min(1e-30)), torch.zeros_like(xb))
+    inv = torch.where(s > 0, torch.reciprocal(s.clamp_min(1e-30)), torch.zeros_like(s))  # fl(1/step), one per channel
+    code = torch.round((xb - base.float()[..., None, :]) * inv)
     code = code.clamp_(0, 63).to(torch.uint8).reshape(B, H, groups * 128, D)
     return base.contiguous(), step.contiguous(), code
 

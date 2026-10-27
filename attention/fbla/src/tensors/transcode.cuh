@@ -45,15 +45,15 @@ template <int BITS> __host__ __device__ constexpr int v_slot_of(int c, int u) {
 __device__ __forceinline__ uint2 ld64(const uint8_t *p) { return __ldg(reinterpret_cast<const uint2 *>(p)); }
 // a record lane's words: p = record + 16 l; p3 (3-bit low words) = record + 16 (l % 16) + 8 (l / 16) (K), + 8 l (V)
 template <int BITS> __device__ __forceinline__ void rec_k(Codes<BITS> &c, const uint8_t *p, const uint8_t *p3) {
-  const uint4 a = ld128(p);
+  const uint4 a = ld128<Grid>(p);
   c.w[0] = a.x; c.w[1] = a.y; c.w[2] = a.z; c.w[3] = a.w;
-  if constexpr (BITS == 4) { const uint4 b = ld128(p + 512); c.w[4] = b.x; c.w[5] = b.y; c.w[6] = b.z; c.w[7] = b.w; }
+  if constexpr (BITS == 4) { const uint4 b = ld128<Grid>(p + 512); c.w[4] = b.x; c.w[5] = b.y; c.w[6] = b.z; c.w[7] = b.w; }
   if constexpr (BITS == 3) { const uint2 b = ld64(p3 + 1024); c.w[4] = b.x; c.w[5] = b.y; }
 }
 template <int BITS> __device__ __forceinline__ void rec_v(Codes<BITS> &c, const uint8_t *p, const uint8_t *p3) {
-  const uint4 a = ld128(p + (BITS == 4 ? 1024 : 512));
+  const uint4 a = ld128<Grid>(p + (BITS == 4 ? 1024 : 512));
   c.w[0] = a.x; c.w[1] = a.y; c.w[2] = a.z; c.w[3] = a.w;
-  if constexpr (BITS == 4) { const uint4 b = ld128(p + 1536); c.w[4] = b.x; c.w[5] = b.y; c.w[6] = b.z; c.w[7] = b.w; }
+  if constexpr (BITS == 4) { const uint4 b = ld128<Grid>(p + 1536); c.w[4] = b.x; c.w[5] = b.y; c.w[6] = b.z; c.w[7] = b.w; }
   if constexpr (BITS == 3) { const uint2 b = ld64(p3 + 1280); c.w[4] = b.x; c.w[5] = b.y; }
 }
 
@@ -105,23 +105,25 @@ __device__ __forceinline__ uint4 meta_chunk(const uint32_t *mw, int i) {
   return make_uint4(__ldg(p), __ldg(p + 2), __ldg(p + 8), __ldg(p + 10));
 }
 
-// Group g = 1 + blockIdx.x of KV head blockIdx.y to tiles + (bh tstride + g - toff) TGB.  flags (persistent images,
-// one word per head and group; close_kernel clears it): a group whose flag is set is skipped, a transcoded one sets it.
+// Group g = 1 + blockIdx.x of KV head blockIdx.y to tiles + bh hstep + (g - toff) gstep.  flagged (persistent images:
+// the slot's word after the image; close_kernel clears it): a group whose flag is set is skipped, a transcoded one sets it.
 template <int CB, int FB>
-__global__ void __launch_bounds__(XT) transcode_kernel(const PrefillArgs a, uint8_t *tiles, int tstride, int toff, uint32_t *flags) {
+__global__ void __launch_bounds__(XT) transcode_kernel(const PrefillArgs a, uint8_t *tiles, size_t hstep, size_t gstep, int toff, bool flagged) {
   constexpr int RC = record_bytes<CB>(), RF = record_bytes<FB>();
   __shared__ __align__(128) uint8_t img[KT + VT];
   const int tid = threadIdx.x, lane = tid & 31, j = tid >> 5, bh = blockIdx.y, g = 1 + blockIdx.x;
-  const size_t hg = (size_t)bh * a.cgroups + g;
-  if (flags && flags[hg]) return;  // (CTA-uniform)
-  uint4 *dst = reinterpret_cast<uint4 *>(tiles + ((size_t)bh * tstride + g - toff) * TGB);
+  const size_t hg = (size_t)bh * a.hs + (size_t)g * a.gs;
+  uint8_t *slot = tiles + bh * hstep + (g - toff) * gstep;
+  uint32_t *flag = reinterpret_cast<uint32_t *>(slot + TGB);
+  if (flagged && *flag) return;  // (CTA-uniform)
+  uint4 *dst = reinterpret_cast<uint4 *>(slot);
   if (tid < (KMB + VMB) / 16)
     dst[O_KM / 16 + (tid < KMB / 16 ? 3 * (tid & 15) + (tid >> 4) : tid)] =
         meta_chunk(reinterpret_cast<const uint32_t *>(a.c.meta + hg * 512), tid);
   decode_sub_block<CB, FB>(img, a.c.coarse + (hg * SBG + j) * RC, a.c.fine + (hg * SBG + j) * RF, j, lane);
   __syncthreads();
   unroll<(KT + VT) / (16 * XT)>([&](auto k) { dst[tid + XT * k] = *reinterpret_cast<const uint4 *>(img + 16 * (tid + XT * k)); });
-  if (flags && tid == 0) flags[hg] = 1u;  // (read by later launches only)
+  if (flagged && tid == 0) *flag = 1u;  // (read by later launches only)
 }
 
 }  // namespace tc

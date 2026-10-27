@@ -117,7 +117,11 @@ token's K / V with `append(cache, k, v)` and calls `decode(q, cache)`. Every cac
 layout and API. `mlops_fbla_decode` takes raw device pointers, explicit scratch and a `cudaStream_t`, and
 returns a status; `mlops_fbla_last_error()` describes failures. Scratch needs no initialization and is reusable
 across calls and context lengths that fit it. `mlops_fbla_prefill` appends a chunk (and with q attends its
-queries) on the same cache and needs no scratch.
+queries) on the same cache and needs no scratch. `mlops_fbla_decode_at` and `mlops_fbla_append_at` read the cache's
+length from device memory: their launches do not depend on it, so a CUDA graph or a program queued ahead of the host
+replays them as the cache grows. `head_stride` / `group_stride` place each (KV head, group) unit of the cache anywhere
+in its arrays -- e.g. every layer's groups side by side, so a cache mapped group by group as it grows (virtual memory)
+grows at one end.
 
 ## Build and test
 

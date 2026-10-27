@@ -61,33 +61,33 @@ template <int BITS, class F> __device__ __forceinline__ uint32_t record_byte(int
   }
 }
 
-// Group g = g0 + blockIdx.x of head blockIdx.y: per channel (thread) the BF16 base (minimum rounded down) and
-// step (range / 63 rounded up) of K and V, every code rint((x - base) / step), then the coarse and fine records.
-template <int CB, int FB>
-__global__ void __launch_bounds__(128) close_kernel(const PrefillArgs a, int g0) {
-  __shared__ uint8_t code[2][G][D];  // [K, V][token][channel]
+// Group g of head bh, the chunk starting at n0: per channel (thread c < 128 of T) the BF16 base (minimum rounded down)
+// and step (range / 63 rounded up) of K and V, every code rint((x - base) / step), then the coarse and fine records.
+template <int CB, int FB, int T, class Pos = Grid>
+__device__ __forceinline__ void close_group(const PrefillArgs &a, int n0, int g, int bh, uint8_t (&code)[2][G][D]) {
   constexpr int RC = record_bytes<CB>(), RF = record_bytes<FB>();
-  const int g = g0 + blockIdx.x, bh = blockIdx.y, c = threadIdx.x;
+  const int c = Pos::tid();
   const size_t eh = (size_t)bh * G * D, ih = (size_t)bh * a.count * D;
-  uint16_t *meta = const_cast<uint16_t *>(a.c.meta) + ((size_t)bh * a.cgroups + g) * 512;
-  if (a.c.tc_images && c == 0) image_flags(a.c, gridDim.y, a.cgroups)[(size_t)bh * a.cgroups + g] = 0u;  // its image is stale
+  const size_t unit = (size_t)bh * a.hs + (size_t)g * a.gs;
+  uint16_t *meta = const_cast<uint16_t *>(a.c.meta) + unit * 512;
+  if (a.c.tc_images && c == 0) *image_flag(a.c, unit) = 0u;  // its image is stale
 #pragma unroll
-  for (int x = 0; x < 2; ++x) {
+  for (int x = 0; x < (T == D || c < D ? 2 : 0); ++x) {
     const uint16_t *sink = (x ? a.c.exact_sink_v : a.c.exact_sink_k) + eh;
     const uint16_t *open = (x ? a.c.exact_open_v : a.c.exact_open_k) + eh;
     const uint16_t *in = (x ? a.v : a.k) + ih;
     float lo = INFINITY, hi = -INFINITY;
     for (int t = 0; t < G; ++t) {
-      const float e = bf16(token_row(sink, open, in, a.n0, g * G + t)[c]);
+      const float e = bf16(token_row(sink, open, in, n0, g * G + t)[c]);
       lo = fminf(lo, e); hi = fmaxf(hi, e);
     }
     const uint16_t ub = bf16_dir(lo, false);
     const float base = bf16(ub);
-    const uint16_t us = bf16_dir(__fdiv_rn(__fsub_rn(hi, base), 63.f), true);
-    const float step = bf16(us);
+    const uint16_t us = bf16_dir(__fmul_rn(__fsub_rn(hi, base), 1.f / 63.f), true);
+    const float step = bf16(us), inv = step > 0.f ? __frcp_rn(step) : 0.f;
     for (int t = 0; t < G; ++t) {
-      const float e = bf16(token_row(sink, open, in, a.n0, g * G + t)[c]);
-      const float r = step > 0.f ? rintf(__fdiv_rn(__fsub_rn(e, base), step)) : 0.f;
+      const float e = bf16(token_row(sink, open, in, n0, g * G + t)[c]);
+      const float r = rintf(__fmul_rn(__fsub_rn(e, base), inv));
       code[x][t][c] = (uint8_t)fminf(fmaxf(r, 0.f), 63.f);
     }
     meta[256 * x + 8 * (c >> 2) + (c & 3)] = ub;      // lane c / 4: four bases, four steps
@@ -96,8 +96,8 @@ __global__ void __launch_bounds__(128) close_kernel(const PrefillArgs a, int g0)
   __syncthreads();
   // records: K code (lane l, slot s, byte b) = channel 64 (l / 16) + 4 s + b of token l % 16; V code = channel
   // 4 l + v_channel(s) of token 4 v_quad(s) + b (the plane's own slot order)
-  const size_t sb0 = ((size_t)bh * a.cgroups + g) * SBG;
-  for (int wi = threadIdx.x; wi < SBG * (RC + RF) / 4; wi += blockDim.x) {
+  const size_t sb0 = unit * SBG;
+  for (int wi = Pos::tid(); wi < SBG * (RC + RF) / 4; wi += blockDim.x) {
     const bool fine = wi >= SBG * RC / 4;
     const int ow = fine ? 4 * wi - SBG * RC : 4 * wi, jj = ow / (fine ? RF : RC), o = ow - jj * (fine ? RF : RC);
     const uint8_t (*ck)[D] = code[0] + 16 * jj, (*cv)[D] = code[1] + 16 * jj;
@@ -125,6 +125,15 @@ __global__ void __launch_bounds__(128) close_kernel(const PrefillArgs a, int g0)
   }
 }
 
+// The blockIdx.x-th group the chunk closes, of head blockIdx.y (a CTA past them returns)
+template <int CB, int FB>
+__global__ void __launch_bounds__(128) close_kernel(const PrefillArgs a) {
+  __shared__ uint8_t code[2][G][D];  // [K, V][token][channel]
+  const int n0 = n0_of<Grid>(a), g = (n0 == 0 ? 0 : (n0 - 1) / G) + blockIdx.x;
+  if (g >= (n0 + a.count - 1) / G) return;  // (CTA-uniform)
+  close_group<CB, FB, D>(a, n0, g, blockIdx.y, code);
+}
+
 // The sink (positions < 128) and the open group (the chunk's last group) take the chunk's tokens; a newly
 // opened group's unused rows are cleared.
 // Format-independent: compiled into one object only (fbla_inst.cu, MLOPS_FBLA_DEFINE_SHARED) and launched from
@@ -132,8 +141,8 @@ __global__ void __launch_bounds__(128) close_kernel(const PrefillArgs a, int g0)
 void launch_finish(const PrefillArgs &a, int heads, cudaStream_t stream);
 #ifdef MLOPS_FBLA_DEFINE_SHARED
 __global__ void __launch_bounds__(128) finish_kernel(const PrefillArgs a) {
-  const int bh = blockIdx.x, n1 = a.n0 + a.count, gl = (n1 - 1) / G;
-  const bool fresh = a.n0 == 0 || (a.n0 - 1) / G != gl;  // the open group is a new one
+  const int bh = blockIdx.x, n0 = n0_of<Grid>(a), n1 = n0 + a.count, gl = (n1 - 1) / G;
+  const bool fresh = n0 == 0 || (n0 - 1) / G != gl;  // the open group is a new one
   const size_t eh = (size_t)bh * G * D, ih = (size_t)bh * a.count * D;
 #pragma unroll
   for (int x = 0; x < 2; ++x) {
@@ -142,9 +151,9 @@ __global__ void __launch_bounds__(128) finish_kernel(const PrefillArgs a) {
     uint4 *sink = reinterpret_cast<uint4 *>(const_cast<uint16_t *>(x ? a.c.exact_sink_v : a.c.exact_sink_k) + eh);
     for (int e = threadIdx.x; e < G * 16; e += blockDim.x) {  // 16 uint4 per token row
       const int t = e >> 4, pos = gl * G + t;
-      if (pos >= a.n0 && pos < n1) open[e] = in[(size_t)(pos - a.n0) * 16 + (e & 15)];
+      if (pos >= n0 && pos < n1) open[e] = in[(size_t)(pos - n0) * 16 + (e & 15)];
       else if (fresh && pos >= n1) open[e] = make_uint4(0u, 0u, 0u, 0u);
-      if (t >= a.n0 && t < n1) sink[e] = in[(size_t)(t - a.n0) * 16 + (e & 15)];
+      if (t >= n0 && t < n1) sink[e] = in[(size_t)(t - n0) * 16 + (e & 15)];
     }
   }
 }
@@ -218,23 +227,24 @@ template <int BITS> __device__ __forceinline__ uint32_t v_value(const Codes<BITS
   return v_slot<BITS>(c, s) >> n;
 }
 
-// Producer: record lanes of a half group.  Lane-record index lr: 0 .. 127 the K lanes (sub-block lr / 32, lane
-// lr % 32), 128 .. 255 the V lanes; producer lane pt owns lr = pt + 32 k (the K, then the V lanes it serves).
+// Producer: record lanes of a half group (of unit u: the group's place in the head's planes and metadata).  Lane-record
+// index lr: 0 .. 127 the K lanes (sub-block lr / 32, lane lr % 32), 128 .. 255 the V lanes; producer lane pt owns
+// lr = pt + 32 k (the K, then the V lanes it serves).
 template <int CB, int FB> struct HalfRaw { Codes<CB> w[Warps<CB>::NLR]; Codes<FB> f[Warps<CB>::NLR]; uint4 meta[2]; };
 template <int CB, int FB>
 __device__ __forceinline__ void half_load(HalfRaw<CB, FB> &h, const uint8_t *coarse_h, const uint8_t *fine_h,
-                                          const uint16_t *meta_h, int g, int half, int pt) {
+                                          const uint16_t *meta_h, size_t u, int half, int pt) {
 #pragma unroll
   for (int k = 0; k < Warps<CB>::NLR; ++k) {
     const int lr = pt + 32 * Warps<CB>::NPW * k, j4 = (lr & 127) >> 5, l = lr & 31;
-    const size_t sb = (size_t)g * SBG + 4 * half + j4;
+    const size_t sb = u * SBG + 4 * half + j4;
     const uint8_t *rc = coarse_h + sb * record_bytes<CB>(), *rf = fine_h + sb * record_bytes<FB>();
     if (lr < 128) { load_k<CB>(h.w[k], rc + 16 * l, l); load_k<FB>(h.f[k], rf + 16 * l, l); }
     else { load_v<CB>(h.w[k], rec_at(rc, l)); load_v<FB>(h.f[k], rec_at(rf, l)); }
   }
 #pragma unroll
   for (int k = 0; k < 2 / Warps<CB>::NPW; ++k)  // 64 words
-    h.meta[k] = __ldg(reinterpret_cast<const uint4 *>(meta_h + (size_t)g * 512) + pt + 32 * Warps<CB>::NPW * k);
+    h.meta[k] = __ldg(reinterpret_cast<const uint4 *>(meta_h + u * 512) + pt + 32 * Warps<CB>::NPW * k);
 }
 // the fine plane's V slot holding the same (channel, token quad) as coarse slot s
 template <int CB, int FB> __host__ __device__ constexpr int fine_v_slot(int s) {
@@ -380,7 +390,7 @@ __global__ void __launch_bounds__(PTH) stream_kernel(const PrefillArgs a) {
   const int bh = blockIdx.y, rows = a.count * a.qg, r0 = blockIdx.x * PROWS, n1 = a.n0 + a.count;
   const int p_first = a.n0 + r0 / a.qg, p_last = a.n0 + (min(r0 + PROWS, rows) - 1) / a.qg;
   const int g_lo = p_first / G, g_hi = p_last / G, nhalf = 2 * max(0, g_hi - 1);
-  const size_t head = (size_t)bh * a.cgroups;
+  const size_t head = (size_t)bh * a.hs;
   const uint8_t *coarse_h = a.c.coarse + head * SBG * RC, *fine_h = a.c.fine + head * SBG * record_bytes<FB>();
   const uint16_t *meta_h = a.c.meta + head * 512;
   auto group_of = [&](int it) { return g_hi - 1 - (it >> 1); };  // newest closed group first
@@ -388,12 +398,12 @@ __global__ void __launch_bounds__(PTH) stream_kernel(const PrefillArgs a) {
   if (warp >= NCW) {  // ---- producer: the closed groups' half groups into the ring -------------------------
     const int pt = t - CTH;
     HalfRaw<CB, FB> raw;
-    if (nhalf) half_load(raw, coarse_h, fine_h, meta_h, group_of(0), 0, pt);
+    if (nhalf) half_load(raw, coarse_h, fine_h, meta_h, (size_t)group_of(0) * a.gs, 0, pt);
     for (int it = 0; it < nhalf; ++it) {
       if (it == 1 || it >= NST) bar_sync(BAR_EMPTY + it % NST, PTH);  // stage 1 first holds the BF16 groups
       half_store(sm.u.st[it % NST], raw, pt);
       bar_arrive(BAR_FULL + it % NST, PTH);
-      if (it + 1 < nhalf) half_load(raw, coarse_h, fine_h, meta_h, group_of(it + 1), (it + 1) & 1, pt);
+      if (it + 1 < nhalf) half_load(raw, coarse_h, fine_h, meta_h, (size_t)group_of(it + 1) * a.gs, (it + 1) & 1, pt);
     }
     return;
   }
@@ -697,7 +707,9 @@ namespace mlops_fbla_detail {
 // The tensor-core attention, format-independent (compiled into one object, MLOPS_FBLA_DEFINE_SHARED): GQA template
 // 1, 2, 4, 8 (else the ratio at run time), split-K below a wave, the merge.  (Not stream-K: cutting CTAs at arbitrary
 // points spreads an image's reads over the whole call and leans on the L2.)
-cudaError_t launch_tc_attention(const PrefillArgs &a, const uint8_t *tiles, int tstride, int toff, int groups, cudaStream_t stream);
+// tiles: group g of KV head bh at tiles + bh hstep + (g - toff) gstep (bytes)
+cudaError_t launch_tc_attention(const PrefillArgs &a, const uint8_t *tiles, size_t hstep, size_t gstep, int toff, int groups,
+                                cudaStream_t stream);
 #ifdef MLOPS_FBLA_DEFINE_SHARED
 // The device's dynamic shared memory for the TC kernel (0: DP4A).  The specialization is the compiled code's PTX version
 // (a compute_75 build JIT-compiled on a newer card runs the sm_75 path); sm_75 .. sm_89 with tc::smem_bytes available.
@@ -722,8 +734,8 @@ static int prefill_tc_smem() {
 }
 bool prefill_tc_device() { return prefill_tc_smem() > 0; }
 
-template <int GQA> static cudaError_t tc_attention(const PrefillArgs &a, const uint8_t *tiles, int tstride, int toff, int groups, int dev, int sms,
-                                                   cudaStream_t stream) {
+template <int GQA> static cudaError_t tc_attention(const PrefillArgs &a, const uint8_t *tiles, size_t hstep, size_t gstep, int toff, int groups,
+                                                   int dev, int sms, cudaStream_t stream) {
   static bool ready[16];  // (above 48 KiB of dynamic shared memory: once per device)
   const int smem = prefill_tc_smem();
   if (!ready[dev]) {
@@ -741,7 +753,7 @@ template <int GQA> static cudaError_t tc_attention(const PrefillArgs &a, const u
     if (e == cudaSuccess) e = cudaMallocAsync(reinterpret_cast<void **>(&part_o), prow * D * sizeof(float), stream);
     if (e != cudaSuccess) return e;
   }
-  tc::prefill_tc_kernel<GQA><<<dim3(nblk, heads, nsplit), tc::THREADS, smem, stream>>>(a, tiles, tstride, toff, part_ml, part_o);
+  tc::prefill_tc_kernel<GQA><<<dim3(nblk, heads, nsplit), tc::THREADS, smem, stream>>>(a, tiles, hstep, gstep, toff, part_ml, part_o);
   if (nsplit > 1) {
     tc::merge_kernel<><<<dim3((a.count + 15) / 16, heads), 256, 0, stream>>>(a, part_ml, part_o, nsplit);
     cudaError_t e = cudaFreeAsync(part_ml, stream);
@@ -750,17 +762,18 @@ template <int GQA> static cudaError_t tc_attention(const PrefillArgs &a, const u
   }
   return cudaSuccess;
 }
-cudaError_t launch_tc_attention(const PrefillArgs &a, const uint8_t *tiles, int tstride, int toff, int groups, cudaStream_t stream) {
+cudaError_t launch_tc_attention(const PrefillArgs &a, const uint8_t *tiles, size_t hstep, size_t gstep, int toff, int groups,
+                                cudaStream_t stream) {
   static int sms[16];
   int dev = 0;
   cudaGetDevice(&dev);  // (prefill_tc_device: dev < 16)
   if (!sms[dev]) cudaDeviceGetAttribute(&sms[dev], cudaDevAttrMultiProcessorCount, dev);
   switch (a.qg) {
-    case 1: return tc_attention<1>(a, tiles, tstride, toff, groups, dev, sms[dev], stream);
-    case 2: return tc_attention<2>(a, tiles, tstride, toff, groups, dev, sms[dev], stream);
-    case 4: return tc_attention<4>(a, tiles, tstride, toff, groups, dev, sms[dev], stream);
-    case 8: return tc_attention<8>(a, tiles, tstride, toff, groups, dev, sms[dev], stream);
-    default: return tc_attention<0>(a, tiles, tstride, toff, groups, dev, sms[dev], stream);
+    case 1: return tc_attention<1>(a, tiles, hstep, gstep, toff, groups, dev, sms[dev], stream);
+    case 2: return tc_attention<2>(a, tiles, hstep, gstep, toff, groups, dev, sms[dev], stream);
+    case 4: return tc_attention<4>(a, tiles, hstep, gstep, toff, groups, dev, sms[dev], stream);
+    case 8: return tc_attention<8>(a, tiles, hstep, gstep, toff, groups, dev, sms[dev], stream);
+    default: return tc_attention<0>(a, tiles, hstep, gstep, toff, groups, dev, sms[dev], stream);
   }
 }
 #endif
@@ -770,10 +783,9 @@ cudaError_t launch_tc_attention(const PrefillArgs &a, const uint8_t *tiles, int 
 template <int CB, int FB> cudaError_t launch_prefill_tc(const PrefillArgs &a, cudaStream_t stream) {
   const int heads = a.batch * a.kv_heads, groups = max(0, (a.n0 + a.count - 1) / G - 1);
   if (a.c.tc_images) {
-    if (groups)
-      tc::transcode_kernel<CB, FB><<<dim3(groups, heads), tc::XT, 0, stream>>>(a, a.c.tc_images, a.cgroups, 0,
-                                                                              image_flags(a.c, heads, a.cgroups));
-    return launch_tc_attention(a, a.c.tc_images, a.cgroups, 0, groups, stream);
+    const size_t hstep = (size_t)a.hs * IMAGE_SLOT, gstep = (size_t)a.gs * IMAGE_SLOT;
+    if (groups) tc::transcode_kernel<CB, FB><<<dim3(groups, heads), tc::XT, 0, stream>>>(a, a.c.tc_images, hstep, gstep, 0, true);
+    return launch_tc_attention(a, a.c.tc_images, hstep, gstep, 0, groups, stream);
   }
   static bool ready[16];
   int dev = 0;
@@ -790,9 +802,9 @@ template <int CB, int FB> cudaError_t launch_prefill_tc(const PrefillArgs &a, cu
   if (groups) {
     const cudaError_t e = cudaMallocAsync(reinterpret_cast<void **>(&tiles), (size_t)heads * groups * tc::TGB, stream);
     if (e != cudaSuccess) return e;
-    tc::transcode_kernel<CB, FB><<<dim3(groups, heads), tc::XT, 0, stream>>>(a, tiles, groups, 1, nullptr);
+    tc::transcode_kernel<CB, FB><<<dim3(groups, heads), tc::XT, 0, stream>>>(a, tiles, (size_t)groups * tc::TGB, tc::TGB, 1, false);
   }
-  const cudaError_t e = launch_tc_attention(a, tiles, groups, 1, groups, stream);
+  const cudaError_t e = launch_tc_attention(a, tiles, (size_t)groups * tc::TGB, tc::TGB, 1, groups, stream);
   if (e != cudaSuccess) return e;
   return groups ? cudaFreeAsync(tiles, stream) : cudaSuccess;
 }
@@ -802,7 +814,7 @@ template <int CB, int FB> cudaError_t launch_prefill_tc(const PrefillArgs &a, cu
 template <int CB, int FB> cudaError_t launch_prefill(const PrefillArgs &a, cudaStream_t stream) {
   const int heads = a.batch * a.kv_heads, n1 = a.n0 + a.count;
   const int g_first = a.n0 == 0 ? 0 : (a.n0 - 1) / G, g_end = (n1 - 1) / G;
-  if (g_end > g_first) close_kernel<CB, FB><<<dim3(g_end - g_first, heads), 128, 0, stream>>>(a, g_first);
+  if (g_end > g_first) close_kernel<CB, FB><<<dim3(g_end - g_first, heads), 128, 0, stream>>>(a);
   if (a.q) {
     if (prefill_tc_device()) {
       const cudaError_t e = launch_prefill_tc<CB, FB>(a, stream);
@@ -813,6 +825,15 @@ template <int CB, int FB> cudaError_t launch_prefill(const PrefillArgs &a, cudaS
       stream_kernel<CB, FB><<<grid, PTH, 0, stream>>>(a);
     }
   }
+  launch_finish(a, heads, stream);
+  return cudaGetLastError();
+}
+
+// One token per KV head at the device length: the group it closes, if any (one CTA per head, which returns when
+// none), then the BF16 windows.
+template <int CB, int FB> cudaError_t launch_append(const PrefillArgs &a, cudaStream_t stream) {
+  const int heads = a.batch * a.kv_heads;
+  close_kernel<CB, FB><<<dim3(1, heads), 128, 0, stream>>>(a);
   launch_finish(a, heads, stream);
   return cudaGetLastError();
 }

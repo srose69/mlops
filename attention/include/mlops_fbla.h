@@ -7,8 +7,9 @@
  * of selective refinement).
  *
  * Format.  Every element of a closed group has a 6-bit code c, x = base + c * step (base = the group's
- * channel minimum rounded down, step = range / 63 rounded up, both BF16).  The code is stored as two planes,
- * the coarse plane (the top CB bits) and the fine plane (the low FB bits): 3+3 or 4+2.  Without its fine
+ * channel minimum rounded down, step = range fl(1/63) rounded up, both BF16; c = rint((x - base) fl(1/step))).
+ * The code is stored as two planes, the coarse plane (the top CB bits) and the fine plane (the low FB bits): 3+3
+ * or 4+2.  Without its fine
  * bits an element decodes to the middle of its coarse cell.  The first group (attention sink) and the last
  * group (still being filled) are BF16.  Decode reads every coarse plane once and the fine planes only of the
  * sub-blocks that hold a share W_j > tau of a query's softmax mass (W_j from the coarse scores).  The query is
@@ -39,6 +40,12 @@
  * channels 4 l .. + 3 at byte 16 l (base first), V's at byte 512 + 16 l.  Exact groups: exact_sink_* and
  * exact_open_*: [batch, kv_heads, 128, 128] BF16, the open group's tokens at 0 .. n-1.  capacity (0 = tokens)
  * only sets the strides, so one allocation serves a growing context.
+ * Strides.  The planes, the metadata and tc_images hold one unit per (KV head h = b * kv_heads + kh, group g): the
+ * 8 records of the group (planes), its 1 KiB (metadata), its image slot (tc_images).  By default unit (h, g) is the
+ * (h * capacity_groups + g)-th of its array, as above; cfg->head_stride and group_stride place it at
+ * h * head_stride + g * group_stride instead -- e.g. head_stride 1, group_stride L * kv_heads with a pointer per
+ * layer l at unit l * kv_heads puts the groups of L layers side by side, so a cache allocated as it grows (virtual
+ * memory mapped group by group) grows at one end.  Units must not overlap; not checked.
  */
 #ifndef MLOPS_FBLA_H
 #define MLOPS_FBLA_H
@@ -70,7 +77,7 @@ typedef struct {  /* decode only reads the cache; prefill writes it (records, me
   /* Optional (null: none): the tensor-core prefill's closed-group images, kept between calls
    * (mlops_fbla_images_bytes, zero-filled before first use).  With it a prefill call rebuilds only the groups closed
    * since, without it all of them.  Kept consistent with the records the library writes (records written otherwise:
-   * zero-fill it again); used only with a nonzero cfg->capacity; not by decode. */
+   * zero-fill it again); used only with a nonzero cfg->capacity or explicit strides; not by decode. */
   uint8_t *tc_images;
 } mlops_fbla_cache;
 
@@ -80,6 +87,7 @@ typedef struct {
   float tau;    /* refinement threshold on W_j; 0 selects the format default */
   mlops_fbla_format format;
   int capacity; /* tokens the cache's planes and metadata are laid out for; 0 means tokens */
+  int head_stride, group_stride; /* units between consecutive KV heads and groups (see Strides); 0, 0: the capacity's */
 } mlops_fbla_config;
 
 /* Scratch for one decode of this configuration (it depends on the current device's SM count).  Its initial
@@ -87,14 +95,16 @@ typedef struct {
  * the same batch * kv_heads that fits. */
 size_t mlops_fbla_decode_scratch_bytes(const mlops_fbla_config *cfg);
 
-/* One decode query per q head: q / output [batch, q_heads, 128] BF16, q_heads / kv_heads = 1, 2 or 4 (the
- * GQA queries of a KV head share every load).  Three kernel launches on `stream`; tokens <= 2^26. */
+/* One decode query per q head: q / output [batch, q_heads, 128] BF16, q_heads any multiple of kv_heads (the GQA
+ * queries of a KV head share every load, up to 4: a larger ratio r runs r / 4, r / 2 or r groups of 4, 2 or 1 queries --
+ * the largest that divides r -- each reading the KV head's records, mostly from L2).  Four kernel launches on `stream`;
+ * tokens <= 2^26. */
 mlops_fbla_status mlops_fbla_decode(const mlops_fbla_config *cfg, const uint16_t *q,
                                     const mlops_fbla_cache *cache, uint16_t *output,
                                     void *scratch, size_t scratch_bytes, cudaStream_t stream);
 
-/* Bytes of mlops_fbla_cache.tc_images on the current device: 34052 per group of capacity and KV head; 0 where the
- * prefill does not run on tensor cores. */
+/* Bytes of mlops_fbla_cache.tc_images on the current device: an image slot of 34176 bytes per group of capacity and KV
+ * head; 0 where the prefill does not run on tensor cores. */
 size_t mlops_fbla_images_bytes(const mlops_fbla_config *cfg);
 
 /* Prefill (and append): `count` new tokens.  k / v [batch, kv_heads, count, 128] BF16 are appended to the
@@ -104,12 +114,46 @@ size_t mlops_fbla_images_bytes(const mlops_fbla_config *cfg);
  * the query of position tokens + i attends to the tokens 0 .. tokens + i, the closed groups through their full
  * 6-bit codes (every block refined; cfg->tau is not used), the sink and its own group BF16.  P blocks (one maximum
  * and weight): DP4A 16 tokens, as decode; tensor cores 128 tokens a closed group (integer P) and 64 in the BF16
- * groups (P rounded to BF16).  q_heads / kv_heads: any integer ratio on tensor cores, 1, 2 or 4 on DP4A.  q null:
+ * groups (P rounded to BF16).  q_heads: any multiple of kv_heads.  q null:
  * append only (output unused).  A zero-filled cache (tokens 0) of the capacity's size is an empty cache.  No
  * scratch. */
 mlops_fbla_status mlops_fbla_prefill(const mlops_fbla_config *cfg, int count, const uint16_t *q,
                                      const uint16_t *k, const uint16_t *v, const mlops_fbla_cache *cache,
                                      uint16_t *output, cudaStream_t stream);
+
+/* Decode and the one-token append with the cache's length in device memory, read when the kernels run: launches that
+ * do not depend on it, for CUDA graphs and programs queued ahead of the host.  The length is *length (int, device,
+ * 4-byte aligned) + cfg->tokens (>= 0, e.g. 1 for the token appended just before).  cfg->capacity (> 0) bounds it and
+ * sets the launches and the scratch: mlops_fbla_decode_scratch_bytes of the configuration with tokens = capacity.
+ * The length's bounds (>= 1 for decode, capacity) are the caller's; nothing checks them.
+ * append_at: k / v [batch, kv_heads, 128] BF16, one token per KV head, at position *length + cfg->tokens (the group it
+ * closes quantized, the sink or open group updated): the caller advances *length afterwards. */
+mlops_fbla_status mlops_fbla_decode_at(const mlops_fbla_config *cfg, const int *length, const uint16_t *q,
+                                       const mlops_fbla_cache *cache, uint16_t *output, void *scratch, size_t scratch_bytes,
+                                       cudaStream_t stream);
+mlops_fbla_status mlops_fbla_append_at(const mlops_fbla_config *cfg, const int *length, const uint16_t *k, const uint16_t *v,
+                                       const mlops_fbla_cache *cache, cudaStream_t stream);
+
+/* The new token's attention inputs, for mlops_fbla_qkv_at: q head h of KV head g = h / (q_heads / kv_heads), batch row b,
+ * at q + b * batch_stride + g * q_group_stride + (h % (q_heads / kv_heads)) * 128; k and v of KV head g at k / v +
+ * b * batch_stride + g * kv_group_stride (elements; BF16, 128 per head; 4-byte aligned). */
+typedef struct {
+  const uint16_t *q, *k, *v;
+  int64_t batch_stride, q_group_stride, kv_group_stride;
+  const uint16_t *q_norm, *k_norm; /* a head's RMSNorm weights (128 BF16 each, Qwen3), or both NULL: no norm */
+  float eps;                       /* the RMSNorm's */
+  const float *freq;               /* device, 64 x 4 floats of mlops_rope_freq (mlops_rope.h): RoPE over the whole head,
+                                      pairs (i, i + 64) */
+  float attention_factor;          /* 0 means 1 */
+  uint16_t *q_out;                 /* [batch, q_heads, 128] BF16: the q of mlops_fbla_decode_at */
+} mlops_fbla_token;
+
+/* One decode step's attention inputs at the device length (position *length + cfg->tokens), one launch: per head the
+ * RMSNorm of q and k (FP32 sum of squares, 1 / sqrt(mean + eps) rounded to nearest, x r and then the weight rounded to
+ * BF16, as transformers' Llama / Qwen), RoPE (mlops_rope's exact arithmetic), q to q_out, k and v appended to the
+ * cache as mlops_fbla_append_at does.  Launches independent of the length (cfg->capacity > 0, as decode_at). */
+mlops_fbla_status mlops_fbla_qkv_at(const mlops_fbla_config *cfg, const int *length, const mlops_fbla_token *token,
+                                    const mlops_fbla_cache *cache, cudaStream_t stream);
 
 const char *mlops_fbla_status_string(mlops_fbla_status status);
 const char *mlops_fbla_last_error(void);

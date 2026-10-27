@@ -15,7 +15,8 @@ For one K or V channel in a group, FBLA stores BF16 `base` and `step` and a six-
 x = base + step c,     c in [0, 63]
 ```
 
-`base` is the channel minimum rounded toward `-inf`; `step = (max - base) / 63` is rounded toward `+inf`.
+`base` is the channel minimum rounded toward `-inf`; `step = (max - base) fl(1/63)` is rounded toward `+inf`;
+`c = rint((x - base) fl(1/step))`, clamped to [0, 63] (multiplies by the reciprocals, no division per element).
 The code is split as `c = 2^FB h + f`:
 
 | mode | coarse `h` | fine `f` | coarse reconstruction | default threshold |
@@ -169,7 +170,10 @@ independently from that text before comparing any attention result.
 
 ## GQA and storage
 
-One CTA belongs to a KV head, not a query head. The same record is reused for GQA ratios 1, 2 and 4.
+One CTA belongs to a KV head, not a query head. The same record is reused for GQA ratios 1, 2 and 4. A larger
+ratio r is split into r / g virtual KV heads of g = 4, 2 or 1 queries (the largest that divides r): each runs the
+GQA-g kernels over its KV head's records (the CTAs of a KV head's virtual heads run together, so the records come
+mostly from L2), with its own refinement list.
 
 * GQA 1/2 keeps per-query online state in registers. Shared memory holds Q8 words, V affine values, P8 bytes
   and the final cross-warp merge; the query buffer aliases the merge buffer because their lifetimes do not
