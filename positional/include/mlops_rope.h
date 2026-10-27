@@ -78,6 +78,36 @@ mlops_rope_status mlops_rope(const mlops_rope_config *cfg, const mlops_rope_tens
  * g = frac(2^16 f) = g_hi + g_lo. Copy it to the device for cfg->freq. */
 void mlops_rope_freq(const double *inv_freq, int n, float *out);
 
+/* RoPE frequency scalings, as transformers computes them (modeling_rope_utils), in float64. */
+typedef enum {
+  MLOPS_ROPE_SCALE_DEFAULT = 0, /* base^(-2i / rotary_dim) */
+  MLOPS_ROPE_SCALE_LINEAR = 1,  /* factor: every frequency / factor */
+  MLOPS_ROPE_SCALE_DYNAMIC = 2, /* factor: NTK-aware base growth with seq_len beyond max_position_embeddings */
+  MLOPS_ROPE_SCALE_YARN = 3,    /* factor (0: max_position_embeddings / original), original_max_position_embeddings,
+                                   beta_fast (0: 32), beta_slow (0: 1), attention_factor or mscale / mscale_all_dim,
+                                   no_truncate; attention factor 0.1 ln(factor) + 1 */
+  MLOPS_ROPE_SCALE_LLAMA3 = 4,  /* factor, low_freq_factor, high_freq_factor, original_max_position_embeddings */
+  MLOPS_ROPE_SCALE_LONGROPE = 5 /* short_factor / long_factor (the long ones beyond the original length), original_max_position_
+                                   embeddings, factor (0: max_position_embeddings / original), attention_factor */
+} mlops_rope_scale_type;
+
+typedef struct {
+  mlops_rope_scale_type type;
+  double factor;
+  int original_max_position_embeddings;
+  double low_freq_factor, high_freq_factor;
+  double beta_fast, beta_slow;
+  double attention_factor;   /* 0: from the factor */
+  double mscale, mscale_all_dim;
+  int no_truncate;           /* YaRN: 1 = do not round the correction range to whole dimensions */
+  const double *short_factor, *long_factor;  /* LongRoPE: rotary_dim / 2 each */
+} mlops_rope_scaling;
+
+/* inv_freq[rotary_dim / 2] (radians per position) and the attention factor of RoPE with an optional scaling (NULL: none)
+ * over `base` (rope_theta).  max_position_embeddings (0: unknown) and seq_len (0: none) as transformers uses them. */
+mlops_rope_status mlops_rope_frequencies(int rotary_dim, double base, const mlops_rope_scaling *scaling,
+                                         int max_position_embeddings, int seq_len, double *inv_freq, float *attention_factor);
+
 const char *mlops_rope_status_string(mlops_rope_status status);
 /* Description of the most recent failure of an mlops_rope call on the calling thread; "" after a success. */
 const char *mlops_rope_last_error(void);

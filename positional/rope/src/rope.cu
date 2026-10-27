@@ -3,6 +3,7 @@
 // mlops_rope host side (include/mlops_rope.h): argument checks, the vector width, the frequency table. The
 // kernel instances are in rope_inst.cu (rope_kernels.cuh).
 #include "rope_kernels.cuh"
+#include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -109,6 +110,96 @@ extern "C" void mlops_rope_freq(const double *inv_freq, int n, float *out) {
     out[4 * i] = fh; out[4 * i + 1] = (float)(f - fh);
     out[4 * i + 2] = gh; out[4 * i + 3] = (float)(g - gh);
   }
+}
+
+extern "C" mlops_rope_status mlops_rope_frequencies(int dim, double base, const mlops_rope_scaling *sc, int max_pos, int seq_len,
+                                                    double *inv, float *att_out) {
+  if (dim < 2 || dim % 2 || !inv || !att_out || !(base > 0.0))
+    return fail(MLOPS_ROPE_INVALID_VALUE, "mlops_rope_frequencies: rotary_dim even >= 2, base > 0, outputs required");
+  const mlops_rope_scaling none{};
+  const mlops_rope_scaling &s = sc ? *sc : none;
+  const int n = dim / 2;
+  auto expo = [&](int i) { return (double)(2 * i) / dim; };
+  double att = 1.0;
+  switch (s.type) {
+    case MLOPS_ROPE_SCALE_DEFAULT:
+      for (int i = 0; i < n; ++i) inv[i] = std::pow(base, -expo(i));
+      break;
+    case MLOPS_ROPE_SCALE_LINEAR:
+      if (!(s.factor > 0.0)) return fail(MLOPS_ROPE_INVALID_VALUE, "mlops_rope_frequencies: linear needs factor");
+      for (int i = 0; i < n; ++i) inv[i] = std::pow(base, -expo(i)) / s.factor;
+      break;
+    case MLOPS_ROPE_SCALE_DYNAMIC: {
+      if (!(s.factor > 0.0) || max_pos <= 0)
+        return fail(MLOPS_ROPE_INVALID_VALUE, "mlops_rope_frequencies: dynamic needs factor and max_position_embeddings");
+      const double len = std::max(seq_len ? seq_len : max_pos, max_pos);
+      const double b = base * std::pow(s.factor * len / max_pos - (s.factor - 1.0), (double)dim / (dim - 2));
+      for (int i = 0; i < n; ++i) inv[i] = std::pow(b, -expo(i));
+      break;
+    }
+    case MLOPS_ROPE_SCALE_YARN: {
+      const double orig = s.original_max_position_embeddings;
+      if (orig <= 0) return fail(MLOPS_ROPE_INVALID_VALUE, "mlops_rope_frequencies: YaRN needs original_max_position_embeddings");
+      double factor = s.factor;
+      if (factor == 0.0) {
+        if (max_pos <= 0) return fail(MLOPS_ROPE_INVALID_VALUE, "mlops_rope_frequencies: YaRN without a factor needs max_position_embeddings");
+        factor = max_pos / orig;
+      }
+      auto mscale = [](double f, double m) { return f <= 1.0 ? 1.0 : 0.1 * m * std::log(f) + 1.0; };
+      att = s.attention_factor;
+      if (att == 0.0) att = s.mscale != 0.0 && s.mscale_all_dim != 0.0 ? mscale(factor, s.mscale) / mscale(factor, s.mscale_all_dim)
+                                                                          : mscale(factor, 1.0);
+      const double bf = s.beta_fast != 0.0 ? s.beta_fast : 32.0, bs = s.beta_slow != 0.0 ? s.beta_slow : 1.0;
+      const double pi = 3.14159265358979323846264338327950288;
+      auto corr = [&](double rot) { return dim * std::log(orig / (rot * 2 * pi)) / (2 * std::log(base)); };
+      double low = corr(bf), high = corr(bs);
+      if (!s.no_truncate) { low = std::floor(low); high = std::ceil(high); }
+      low = std::max(low, 0.0);
+      high = std::min(high, (double)(dim - 1));
+      if (low == high) high += 0.001;
+      for (int i = 0; i < n; ++i) {
+        const double ramp = std::min(std::max((i - low) / (high - low), 0.0), 1.0), extra = 1.0 - ramp;
+        const double pf = std::pow(base, expo(i));
+        inv[i] = (1.0 / (factor * pf)) * (1.0 - extra) + (1.0 / pf) * extra;
+      }
+      break;
+    }
+    case MLOPS_ROPE_SCALE_LLAMA3: {
+      const double factor = s.factor, lo = s.low_freq_factor, hi = s.high_freq_factor, old = s.original_max_position_embeddings;
+      if (!(factor > 0.0) || !(lo > 0.0) || !(hi > lo) || old <= 0)
+        return fail(MLOPS_ROPE_INVALID_VALUE, "mlops_rope_frequencies: llama3 needs factor, low_freq_factor < high_freq_factor, "
+                    "original_max_position_embeddings");
+      const double pi = 3.14159265358979323846264338327950288;
+      for (int i = 0; i < n; ++i) {
+        const double f = std::pow(base, -expo(i)), wavelen = 2 * pi / f;
+        const double scaled = wavelen > old / lo ? f / factor : f;
+        const double smooth = (old / wavelen - lo) / (hi - lo);
+        const double smoothed = (1 - smooth) * scaled / factor + smooth * scaled;
+        const bool medium = !(wavelen < old / hi) && !(wavelen > old / lo);
+        inv[i] = medium ? smoothed : scaled;
+      }
+      break;
+    }
+    case MLOPS_ROPE_SCALE_LONGROPE: {
+      const double orig = s.original_max_position_embeddings;
+      if (orig <= 0 || !s.short_factor || !s.long_factor)
+        return fail(MLOPS_ROPE_INVALID_VALUE, "mlops_rope_frequencies: LongRoPE needs original_max_position_embeddings and both factors");
+      double factor = s.factor;
+      if (factor == 0.0) {
+        if (max_pos <= 0) return fail(MLOPS_ROPE_INVALID_VALUE, "mlops_rope_frequencies: LongRoPE without a factor needs max_position_embeddings");
+        factor = max_pos / orig;
+      }
+      att = s.attention_factor;
+      if (att == 0.0) att = factor <= 1.0 ? 1.0 : std::sqrt(1.0 + std::log(factor) / std::log(orig));
+      const double *ext = seq_len && seq_len > orig ? s.long_factor : s.short_factor;
+      for (int i = 0; i < n; ++i) inv[i] = 1.0 / (ext[i] * std::pow(base, expo(i)));
+      break;
+    }
+    default: return fail(MLOPS_ROPE_INVALID_VALUE, "mlops_rope_frequencies: unknown scaling type %d", (int)s.type);
+  }
+  *att_out = (float)att;
+  last_error_buf()[0] = '\0';
+  return MLOPS_ROPE_OK;
 }
 
 extern "C" const char *mlops_rope_status_string(mlops_rope_status status) {
