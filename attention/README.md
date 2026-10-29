@@ -119,15 +119,37 @@ returns a status; `mlops_fbla_last_error()` describes failures. Scratch needs no
 across calls and context lengths that fit it. `mlops_fbla_prefill` appends a chunk (and with q attends its
 queries) on the same cache and needs no scratch. `mlops_fbla_decode_at` and `mlops_fbla_append_at` read the cache's
 length from device memory: their launches do not depend on it, so a CUDA graph or a program queued ahead of the host
-replays them as the cache grows. `head_stride` / `group_stride` place each (KV head, group) unit of the cache anywhere
+replays them as the cache grows. `mlops_fbla_prefill_at` is the prefill the same way: the chunk's start and count in
+device memory, every launch sized by the chunk's ceiling alone (where the prefill runs on tensor cores its q non-null
+needs the cache's `tc_images`, as `empty` above allocates). `head_stride` / `group_stride` place each (KV head, group) unit of the cache anywhere
 in its arrays -- e.g. every layer's groups side by side, so a cache mapped group by group as it grows (virtual memory)
 grows at one end.
+
+[`include/mlops_fbla_items.h`](include/mlops_fbla_items.h) describes the same operations as passes of CTA-sized
+work items. A plan supplies each pass's device entry, argument blob, grid, shared storage and register usage;
+`mlops_fbla_item_access` reports its read/write ranges. Device-dependent positions use conservative envelopes,
+which may overlap between items. An executor establishes release/acquire ordering and supplies a position policy
+whose `ro` reads mutable inputs through coherent L2. Tensor-core split partials belong to the executor; the header
+documents their sizes and entry arguments. `per_head = 0` describes decode with the ordinary API's occupancy;
+a positive value fixes the number of coarse/refine CTAs per virtual KV head.
+
+For NVRTC include `mlops_fbla_items.cuh`, compile for the plan's `compute_<arch>` and use C++17 with
+`--device-as-default-execution-space`. The headers require the CUDA toolkit's `include/` (CUDA 13 also
+`include/cccl`). `make install` includes the complete device-header tree under `include/mlops/` and a top-level
+`mlops_fbla_items.cuh`, so installed consumers do not need a source checkout.
+
+Decode refinement entries include their prefix capacity as the final template argument: `1` when
+`Args.nslices == 1`, otherwise `MAX_SLICES`. Use `SmemRefine<QG, capacity>` or
+`SmemRefine4Storage<capacity>` for their shared storage; `tests/test_items.cu` demonstrates executor generation.
 
 ## Build and test
 
 ```sh
 make lib                # out/libmlops_attention.a: every architecture sm_61..sm_90
-make test               # both modes vs float64; GQA 1/2/4, capacity, all/none refinement, up to 256K
+make test               # float64 API tests and bit-for-bit NVRTC item execution
+./out/test_items --publication  # producer/consumer CTAs, with a deliberately primed readonly cache
+./out/test_items --bench        # short decode passes: full grid, three persistent CTAs, one persistent CTA
+MLOPS_BENCH_SHORT=1 MLOPS_BENCH_REPS=100 ./out/bench_fbla  # complete decode, 16..1024 tokens
 make bench              # uncontrolled local run: 36 rows, traffic and NVML clocks
 bench/run_bench.sh      # controlled board run; writes benches/<gpu>.md and benches/table.md
 make install PREFIX=..  # headers, library, pkg-config file
@@ -137,6 +159,15 @@ pytest python/tests     # record layout, kernel vs model, capacity and exact-att
 Tests and benchmark use GPU `GPU` (default 0) and build for its architecture. Kernel formats are separate
 objects compiled in parallel (`JOBS`); toolchain and architecture selection:
 [`../build/arch.mk`](../build/arch.mk).
+
+The item tests cover both formats, GQA 1/2/4/5/8, batch, strided caches and token inputs, chunk ceilings,
+append-only operation, TC split/merge, multi-slice decode, and query/truncation of plans and access ranges.
+They compare outputs and caches bit for bit, validate every range against its allocation, and check stores
+against the declared ranges, including individual-item runs. Scalar dependencies are checked explicitly as well:
+store coverage cannot detect a missing length/count read. `--bad-count` and `--omit-count-range` are negative
+controls and must fail.
+`--readonly-control` enables publication with deliberately incoherent input loads: a mismatch demonstrates the
+problem, while exit 77 means no stale read was observed on that run and establishes no coherence guarantee.
 
 ## License
 

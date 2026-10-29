@@ -23,7 +23,7 @@ endif
 VERSION := $(shell sed -n 's/^#define MLOPS_ATTENTION_VERSION "\(.*\)"/\1/p' include/mlops_attention.h)
 FLAGS   = $(if $(CCBIN),-ccbin $(CCBIN)) -O3 -std=c++17 -Xcompiler -ffp-contract=off,-fPIC -Iinclude -Ifbla/src \
           -I../positional/include -I../positional/rope/src
-HDRS    = include/mlops_attention.h include/mlops_fbla.h fbla/src/common.cuh fbla/src/fbla_kernels.cuh \
+HDRS    = include/mlops_attention.h include/mlops_fbla.h include/mlops_fbla_items.h include/mlops_fbla_items.cuh fbla/src/common.cuh fbla/src/fbla_kernels.cuh \
           fbla/src/fbla_prefill.cuh fbla/src/tensors/mma.cuh fbla/src/tensors/transcode.cuh fbla/src/tensors/fn.cuh \
           fbla/src/tensors/prefill_tc.cuh fbla/src/fbla_qkv.cuh ../positional/include/mlops_rope.h ../positional/rope/src/rope.cuh
 OBJS    = fbla fbla_inst_3p3 fbla_inst_4p2
@@ -54,20 +54,33 @@ NATIVE_FLAGS = $(FLAGS) -arch=sm_$(TEST_ARCH)
 # ---- tests and benchmark (local architecture) ----------------------------------------------------
 out/test_fbla: fbla/tests/test_fbla.cu out/native/libmlops_attention.a
 	$(NVCC) $(NATIVE_FLAGS) -o $@ $< out/native/libmlops_attention.a
+out/test_items: fbla/tests/test_items.cu $(HDRS) out/native/libmlops_attention.a
+	$(NVCC) $(NATIVE_FLAGS) -DFBLA_ROOT='"$(CURDIR)"' -DFBLA_CUDA_INCLUDE='"$(CUDA_HOME)/include"' -o $@ $< out/native/libmlops_attention.a -lnvrtc -lcuda
 out/bench_fbla: fbla/bench/bench_fbla.cu fbla/bench/bench_util.h out/native/libmlops_attention.a
 	$(NVCC) $(NATIVE_FLAGS) -o $@ $< out/native/libmlops_attention.a -lnvidia-ml
-test-bin: out/test_fbla
+test-bin: out/test_fbla out/test_items
 bench-bin: out/bench_fbla
-test: out/test_fbla
+test: out/test_fbla out/test_items
 	$(RUN) ./out/test_fbla
+	$(RUN) ./out/test_items
 bench: out/bench_fbla
 	$(RUN) ./out/bench_fbla
 
 # ---- install (C / C++ projects: pkg-config --cflags --libs mlops-attention) ----------------------
 PREFIX ?= /usr/local
 install: $(OBJDIR)/libmlops_attention.a
-	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib/pkgconfig
-	install -m 644 include/mlops_attention.h include/mlops_fbla.h $(DESTDIR)$(PREFIX)/include/
+	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib/pkgconfig \
+	  $(DESTDIR)$(PREFIX)/include/mlops/attention/include $(DESTDIR)$(PREFIX)/include/mlops/attention/fbla/src/tensors \
+	  $(DESTDIR)$(PREFIX)/include/mlops/positional/include $(DESTDIR)$(PREFIX)/include/mlops/positional/rope/src
+	install -m 644 include/mlops_attention.h include/mlops_fbla.h include/mlops_fbla_items.h $(DESTDIR)$(PREFIX)/include/
+	install -m 644 include/*.h include/mlops_fbla_items.cuh $(DESTDIR)$(PREFIX)/include/mlops/attention/include/
+	install -m 644 fbla/src/*.cuh $(DESTDIR)$(PREFIX)/include/mlops/attention/fbla/src/
+	install -m 644 fbla/src/tensors/*.cuh $(DESTDIR)$(PREFIX)/include/mlops/attention/fbla/src/tensors/
+	install -m 644 ../positional/include/mlops_rope.h $(DESTDIR)$(PREFIX)/include/mlops/positional/include/
+	install -m 644 ../positional/rope/src/rope.cuh $(DESTDIR)$(PREFIX)/include/mlops/positional/rope/src/
+	{ sed -n '1,2p' include/mlops_fbla_items.cuh; printf '#include "mlops/attention/include/mlops_fbla_items.cuh"\n'; } \
+	  > $(DESTDIR)$(PREFIX)/include/mlops_fbla_items.cuh
+	chmod 644 $(DESTDIR)$(PREFIX)/include/mlops_fbla_items.cuh
 	install -m 644 $(OBJDIR)/libmlops_attention.a $(DESTDIR)$(PREFIX)/lib/
 	printf 'prefix=%s\nincludedir=$${prefix}/include\nlibdir=$${prefix}/lib\n\nName: mlops-attention\nDescription: FBLA compressed-KV FlashAttention prefill and decode\nVersion: $(VERSION)\nCflags: -I$${includedir} -I$(CUDA_HOME)/include\nLibs: -L$${libdir} -lmlops_attention -L$(CUDA_HOME)/lib64 -lcudart -lstdc++ -lm\n' '$(PREFIX)' > $(DESTDIR)$(PREFIX)/lib/pkgconfig/mlops-attention.pc
 

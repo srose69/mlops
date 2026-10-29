@@ -1,29 +1,29 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// FBLA flash decoding, sm_61+: three launches.
+// FBLA flash decoding, sm_61+: coarse, select, refine and merge launches.
 //
-//   coarse_kernel  one flash-decoding pass over the coarse records (K and V of a sub-block, read once).
-//                  Warp w of a (batch, KV head) owns a contiguous, balanced run of sub-blocks; per group it
-//                  quantizes q' = q * step_K to int8, per sub-block QK^T is a DP4A chain over the 64 channels
-//                  of the lane's (token, half) and one xor-16 shuffle, P is quantized to u8 against the
-//                  sub-block maximum and broadcast through shared memory, P V is a DP4A chain over the lane's
-//                  four channels x 16 tokens.  It writes every closed sub-block's log2-mass and one (m, l, o)
-//                  per CTA.  No barrier, atomic or address multiply in the loop: one pointer per lane.
-//   select_kernel  R = log2 of the row's coarse mass from the partials, and the list of the sub-blocks with
-//                  W_j = 2^(lse_j - R) > tau for some query of the KV head, in sub-block order per slice.
-//   refine_kernel  the list's items, strided over all warps of the (batch, KV head): the correction
-//                  exact - coarse of K and V, weighted 2^(m_block - R); the last CTA writes the BF16 output.
+//   coarse_kernel  flash-decoding pass over the coarse records: per sub-block a DP4A QK^T chain, P quantized
+//                  to u8 against the sub-block maximum, a DP4A P V chain; writes the closed sub-blocks'
+//                  log2-mass and one (m, l, o) per CTA.  No barrier or atomic in the loop.
+//   select_kernel  R = log2 of the row's coarse mass, and the sub-blocks with W_j = 2^(lse_j - R) > tau
+//                  for some query of the KV head, in sub-block order per slice.
+//   refine_kernel  the list's items, strided over the warps: the correction exact - coarse of K and V,
+//                  weighted 2^(m_block - R), one correction partial per CTA.
+//   merge_kernel   coarse partials and corrections into the BF16 output.
 //
-// Codes are never shifted into place where a mask suffices: a masked slot is the code times 2^n, and n is
-// fixed per K accumulator or per V channel, so the factor 2^-n is folded into the FP32 epilogue.  Integer
-// sums start at the bits of 1.5 * 2^23 (NVFP4EffMA's DP4A epilogue): every sum stays within +-2^22, so the
-// accumulator read as FP32 minus 1.5 * 2^23 is the exact sum without an I2F.
+// A masked code slot is the code times 2^n with n fixed per accumulator, so 2^-n folds into the FP32
+// epilogue.  Integer sums start at the bits of 1.5 * 2^23: the accumulator read as FP32 minus 1.5 * 2^23
+// is the exact sum (|sum| < 2^22) without an I2F.
 #ifndef MLOPS_FBLA_KERNELS_CUH
 #define MLOPS_FBLA_KERNELS_CUH
 
 #include "common.cuh"
+#ifdef __CUDACC_RTC__
+#include <cuda/std/cmath>
+#else
 #include <algorithm>
 #include <cmath>
+#endif
 
 namespace mlops_fbla_detail {
 
@@ -73,20 +73,29 @@ __device__ __forceinline__ void bf16x4(uint32_t a, uint32_t b, float x[4]) {
 __device__ __forceinline__ int tid_x() { int t; asm volatile("mov.u32 %0, %%tid.x;" : "=r"(t)); return t; }
 __device__ __forceinline__ int ctaid_y() { int t; asm volatile("mov.u32 %0, %%ctaid.y;" : "=r"(t)); return t; }
 __device__ __forceinline__ int ctaid_x() { int t; asm volatile("mov.u32 %0, %%ctaid.x;" : "=r"(t)); return t; }
-// Where a pass's work item runs: its position (x, y) and the x extent (CTAs per head of the coarse and refine passes),
-// tid(), the thread, and ro(p), the load of what earlier passes wrote; kReread: position values read where they are used
-// instead of kept (q, metadata, BF16 windows, scratch).  Grid: a launch's (the
-// kernels; ro = __ldg, the data is constant during a launch); a persistent program passes its own, whose ro goes
-// through L2.  x_v / y_v are re-read where used (not kept live).
+// Where a work item runs: position (x, y), the x extent, tid(), and ro(p), the load of what earlier passes wrote.
+// kReread: position values are re-read where used, not kept live.  Kernels use __ldg for ro; a persistent
+// program supplies its own grid and an L2 ro.
 struct Grid {
   template <class T> __device__ static __forceinline__ T ro(const T *p) { return __ldg(p); }
   __device__ static __forceinline__ unsigned tid() { return threadIdx.x; }  // (a persistent program's re-reads it)
   static constexpr bool kReread = false;  // the item's position kept (a persistent program's: re-read where used)
   __device__ static __forceinline__ unsigned x() { return blockIdx.x; }  // (unsigned, as blockIdx: the same arithmetic)
   __device__ static __forceinline__ unsigned y() { return blockIdx.y; }
+  __device__ static __forceinline__ unsigned z() { return blockIdx.z; }
   __device__ static __forceinline__ unsigned nx() { return gridDim.x; }
+  __device__ static __forceinline__ unsigned ny() { return gridDim.y; }
+  __device__ static __forceinline__ unsigned nz() { return gridDim.z; }
   __device__ static __forceinline__ int x_v() { return ctaid_x(); }
   __device__ static __forceinline__ int y_v() { return ctaid_y(); }
+};
+// Ordinary input loads in launch kernels keep their original code generation. An executor's policy reads
+// inputs produced earlier in the same launch through coherent L2, including loads the compiler could cache.
+template <class Pos> struct InputLoad {
+  template <class T> __device__ static __forceinline__ T get(const T *p) { return Pos::ro(p); }
+};
+template <> struct InputLoad<Grid> {
+  template <class T> __device__ static __forceinline__ T get(const T *p) { return *p; }
 };
 __device__ __forceinline__ uint4 lds128v(const void *p) {  // volatile: ordered with the record loads
   uint4 v;
@@ -110,10 +119,9 @@ __device__ __forceinline__ uint2 ldv64(const uint8_t *p) {
 }
 
 // ---- records (mlops_fbla.h) ---------------------------------------------------------------------
-// A lane's 2 * BITS words of K or of V, every load a fixed offset from a per-lane base and every warp-wide
-// load one contiguous 256 or 512 bytes.  V: p = record + 16 lane (128-bit words) and p8 = record + 8 lane
-// (the 3-bit low words).  K by token (coarse pass): p = record + 16 t serves the high words of both halves
-// (+ 0, + 256) and the 3-bit low words of both (+ 1024, one 128-bit load).
+// A lane's 2 * BITS words of K or V: fixed offsets from one per-lane base, warp-wide loads of 256 or 512 bytes.
+// V: p = record + 16 lane (128-bit words), p8 = record + 8 lane (3-bit low words).
+// K by token: p = record + 16 t serves both halves' high words (+0, +256) and low words (+1024).
 template <int BITS> struct Codes { uint32_t w[2 * BITS]; };
 template <int BITS> __host__ __device__ constexpr int record_bytes() { return 2 * BITS * 256; }
 struct Rec { const uint8_t *p, *p8; };
@@ -299,11 +307,9 @@ __device__ __forceinline__ void online(float mb, float &m, float &alpha, float &
 }
 
 // ---- per-group query quantization -------------------------------------------------------------
-// The lane's channels 4 l .. + 3 (mlops_fbla.h): z = q step_K (exact), q-hat = rint(z fl(127 / max|z|)) (one rounding
-// of the exact product), sq = max|z| sl / 127 with sl = fl(scale log2 e).  The coarse code c of a slot decodes to
-// base + step (2^FB c + hoff): s = c0 + sq 2^FB (q-hat . c), c0 = sl q . base + sq hoff sum q-hat.
-// The group's state lives in the warp's shared slots, not in registers: q-hat words (stage), per query
-// (c0, sq 2^FB), per lane the V affine (vb, vs) with 2^FB and the channel's 2^-n folded in.
+// Lane channels 4 l .. + 3: z = q step_K, q-hat = rint(z fl(127 / max|z|)), sq = max|z| sl / 127, sl = fl(scale log2 e).
+// A coarse code c decodes to base + step (2^FB c + hoff): s = c0 + sq 2^FB (q-hat . c), c0 = sl q . base + sq hoff sum q-hat.
+// The group state lives in the warp's shared slots: q-hat words, per query (c0, sq 2^FB), per lane the V affine (vb, vs).
 template <int QG> struct WarpSlots {
   alignas(16) uint32_t stage[QG][32];  // q-hat words of the group
   alignas(16) float4 vb[32], vs[32];   // the lanes' V affine of the group (coarse code -> value)
@@ -404,33 +410,42 @@ __device__ __forceinline__ void exact_block(const uint16_t *ek, const uint16_t *
     put_p(pb[qi], s[qi], mb, lane);
   }
   __syncwarp();
+  // Query tiles of QT: each V token is loaded and widened once per tile.
+  constexpr int QT = QG > 1 ? 2 : 1;
 #pragma unroll
-  for (int qi = 0; qi < QG; ++qi) {
-    uint32_t P[4];
-    const float sp = get_p(pb[qi], P);
-    float y[4] = {0.f, 0.f, 0.f, 0.f};
+  for (int q0 = 0; q0 < QG; q0 += QT) {
+    uint32_t P[QT][4];
+    float sp[QT], y[QT][4] = {};
+#pragma unroll
+    for (int i = 0; i < QT; ++i) sp[i] = get_p(pb[q0 + i], P[i]);
 #pragma unroll
     for (int t = 0; t < S; ++t) {
       float vv[4];
       const uint2 x = j * S + t < count ? Pos::ro(reinterpret_cast<const uint2 *>(ev + (size_t)(j * S + t) * D) + lane)
                                         : make_uint2(0u, 0u);
       bf16x4(x.x, x.y, vv);
-      const float p = __uint_as_float(MAGIC | ((P[t >> 2] >> (8 * (t & 3))) & 255u)) - MAGICF;
 #pragma unroll
-      for (int c = 0; c < 4; ++c) y[c] = fmaf(p, vv[c], y[c]);
+      for (int i = 0; i < QT; ++i) {
+        const float p = __uint_as_float(MAGIC | ((P[i][t >> 2] >> (8 * (t & 3))) & 255u)) - MAGICF;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) y[i][c] = fmaf(p, vv[c], y[i][c]);
+      }
     }
-    l[qi] = fmaf(al[qi], l[qi], w[qi] * sp);
 #pragma unroll
-    for (int c = 0; c < 4; ++c) o[qi][c] = fmaf(al[qi], o[qi][c], w[qi] * y[c]);
+    for (int i = 0; i < QT; ++i) {
+      const int qi = q0 + i;
+      l[qi] = fmaf(al[qi], l[qi], w[qi] * sp[i]);
+#pragma unroll
+      for (int c = 0; c < 4; ++c) o[qi][c] = fmaf(al[qi], o[qi][c], w[qi] * y[i][c]);
+    }
   }
   __syncwarp();
 }
 
 // ---- coarse pass --------------------------------------------------------------------------------
-// Units of a (batch, KV head): first the BF16 sub-blocks (sink group, then open group), then the closed
-// groups 1 .. groups - 2.  Warp w of the head's P W warps takes the units w, w + P W, ...: at any moment all
-// warps read one window of the cache (DRAM rows and TLB stay hot), and no warp has more than one unit more
-// than another.
+// Units of a (batch, KV head): the BF16 sub-blocks (sink, open), then closed groups 1 .. groups - 2.
+// Warp w of P W takes units w, w + P W, ...: all warps read one cache window and loads differ by at most
+// one unit.
 template <class Pos> __device__ __forceinline__ int units_of(const Args &a) {  // BF16 sub-blocks + closed groups of a head
   const int tokens = tokens_of<Pos>(a), groups = (tokens + G - 1) / G;
   const int na = groups == 1 ? (tokens + S - 1) / S : SBG;
@@ -439,10 +454,14 @@ template <class Pos> __device__ __forceinline__ int units_of(const Args &a) {  /
 }
 
 template <int QG> struct SmemCoarse {
+  struct MergeStorage {
+    alignas(16) float o[W][QG][D];
+    float m[W][QG], l[W][QG];
+  };
   WarpSlots<QG> ws[W];
   union {
     alignas(16) float qs[W][QG][D];  // q (unscaled), per warp
-    struct { alignas(16) float o[W][QG][D]; float m[W][QG], l[W][QG]; } merge;  // same index: no overlap
+    MergeStorage merge;  // q has been consumed before the CTA reduces its output
   } u;
 };
 
@@ -450,11 +469,25 @@ template <int QG> struct Run {  // a warp's running softmax
   float m[QG], l[QG], o[QG][4];
 };
 
-// Pair J of a group: sub-blocks A = 2J and B = 2J + 1.  K: lane l holds token l % 16 of A
-// (l < 16) or of B, all 128 channels (halves kc[0], kc[1]), so a token's score needs no cross-lane sum and the
-// two blocks' maxima come from one 16-lane reduction.  V: lane l holds channels 4 l .. + 3 of A (va) and B (vb).
-// The registers just read are refilled from the next pair (nk, nv) at once.  The pair's (m_block, sum p) of
-// query qi goes to the warp's slots (lane 0), the group's lse = m + log2 sum p is stored once per group.
+// Empty items still publish their partial: later passes and executors may read the full grid.
+template <int QG, class Pos, bool Coarse>
+__device__ __forceinline__ void empty_partial(const Args &a) {
+  constexpr int STRIDE = D + (Coarse ? 2 : 1);
+  float *base = Coarse ? a.part : a.dpart;
+  for (int i = Pos::tid(); i < QG * D; i += 32 * W) {
+    const int qi = i / D, ch = i % D;
+    float *part = base + (((size_t)Pos::y() * QG + qi) * Pos::nx() + Pos::x()) * STRIDE;
+    part[STRIDE - D + ch] = 0.f;
+    if (!ch) {
+      part[0] = Coarse ? -INFINITY : 0.f;
+      if constexpr (Coarse) part[1] = 0.f;
+    }
+  }
+}
+
+// Pair J: sub-blocks A = 2J, B = 2J + 1.  K: lane l holds token l % 16 of A (l < 16) or B, all 128 channels,
+// so a score needs no cross-lane sum.  V: lane l holds channels 4 l .. + 3 of A (va) and B (vb).
+// Registers just consumed are refilled from the next pair (nk, nv); (m_block, sum p) go to the warp's slots.
 
 template <int CB, int QG>
 __device__ __forceinline__ void coarse_pair(Codes<CB> (&kc)[2], Codes<CB> &va, Codes<CB> &vb, const uint8_t *nk, Rec nv,
@@ -528,6 +561,10 @@ __device__ __forceinline__ void coarse_kernel_item(const Args &a, SmemCoarse<QG>
   const int cnt_open = groups >= 2 ? tokens - G * (groups - 1) : 0;  // open group's tokens
   const int ne = na + (cnt_open + S - 1) / S;                          // BF16 units
   const int units = ne + (groups >= 3 ? groups - 2 : 0);
+  if (cta() * W >= units) {
+    empty_partial<QG, Pos, true>(a);
+    return;
+  }
   WarpSlots<QG> &ws = sm.ws[warp];
   const float (*qs)[D] = sm.u.qs[warp];
 
@@ -640,10 +677,8 @@ __global__ void __launch_bounds__(32 * W, 2) coarse_kernel(const Args a) {
 }
 
 // ---- coarse pass, four queries per KV head -------------------------------------------------------
-// One warp serves all four queries of its KV head (every record read once, every code decoded once), in two
-// halves of two queries over the same code registers.  The state indexed by query -- running (m, l), o, the
-// group's (c0, sq 2^FB) -- lives in the warp's shared slots, so the halves are a loop and nothing indexed by
-// query sits in registers: two CTAs per SM without spills.
+// One warp serves the four queries of its KV head: every record is read and decoded once, in two halves of
+// two queries over the same code registers.  The per-query state (m, l, o, c0, sq 2^FB) lives in shared slots.
 struct WarpSlots4 {
   alignas(16) uint32_t stage[4][32];  // q-hat words of the group
   alignas(16) float4 vb[32], vs[32];  // the lanes' V affine of the group
@@ -727,6 +762,10 @@ __device__ __forceinline__ void coarse_kernel4_item(const Args &a, SmemCoarse4 &
   const int na = groups == 1 ? (tokens + S - 1) / S : SBG;
   const int cnt_open = groups >= 2 ? tokens - G * (groups - 1) : 0;
   const int ne = na + (cnt_open + S - 1) / S, units = units_of<Pos>(a);
+  if (cta() * W >= units) {
+    empty_partial<QG, Pos, true>(a);
+    return;
+  }
   WarpSlots4 &ws = sm.ws[warp];
   if (warp < QG) {  // the CTA's q
     const uint2 qw = Pos::ro(reinterpret_cast<const uint2 *>(a.q + (size_t)(row0() + warp) * D) + lane);
@@ -833,10 +872,8 @@ __global__ void __launch_bounds__(32 * W, 2) coarse_kernel4(const Args a) {
 }
 
 // ---- select pass ------------------------------------------------------------------------------------
-// R = log2 sum of the whole row in the units of the partials (sum p, not / 255): the coarse partials of
-// every CTA rescaled to R sum to l = 1, and every correction is weighted 2^(m_block - R) in the same units.
-// CTA (s, head) lists the refined sub-blocks of slice s in sub-block order: the item order, and so the
-// refinement's sums, do not depend on timing.
+// R = log2 sum of the whole row in the partials' units (sum p): coarse partials rescaled to R sum to l = 1.
+// CTA (s, head) lists slice s's refined sub-blocks in sub-block order, so the sums are timing-independent.
 template <int QG, class Pos> __device__ __forceinline__ float row_r(const Args &a, int row, int lane) {
   const float *part = a.part + (size_t)row * a.ctas * (D + 2);
   float mx = -INFINITY;
@@ -900,21 +937,39 @@ __global__ void __launch_bounds__(32 * W) select_kernel(const Args a) {
 }
 
 // ---- refinement pass --------------------------------------------------------------------------------
-// Item k of the head's list (slices concatenated) goes to warp k mod (gridDim.x W): every warp gets the same
-// number of items +-1 wherever the refined sub-blocks cluster.  Per item both records (coarse, fine), the
-// group's metadata, from which the q-hat of the coarse pass is recomputed (same code, same inputs: the same
-// codes); corrections accumulate in registers, one partial per CTA.
-template <int QG> struct SmemRefine {
+// Item k of the head's list goes to warp k mod (gridDim.x W), balanced to +-1 item.  Per item: both records and
+// the group metadata, from which the coarse pass's q-hat is recomputed; corrections accumulate in registers.
+// One warp builds the prefix; a single-slice list is already contiguous.
+template <class Pos, int Entries>
+__device__ __forceinline__ void refine_prefix(const Args &a, int vh, int (&pre)[Entries]) {
+  const int lane = Pos::tid() & 31;
+  if constexpr (Entries == 2) {
+    if (!lane) { pre[0] = 0; pre[1] = Pos::ro(a.counts + vh); }
+  } else {
+    int run = 0;
+    for (int s0 = 0; s0 < a.nslices; s0 += 32) {
+      const int s = s0 + lane, n = s < a.nslices ? Pos::ro(a.counts + (size_t)vh * a.nslices + s) : 0;
+      int x = n;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) { const int y = __shfl_up_sync(FULL, x, o); x += lane >= o ? y : 0; }
+      if (s < a.nslices) pre[s] = run + x - n;
+      run += __shfl_sync(FULL, x, 31);
+    }
+    if (!lane) pre[a.nslices] = run;
+  }
+}
+
+template <int QG, int Slices = MAX_SLICES> struct SmemRefine {
   alignas(16) float qs[QG][D];  // q
   alignas(16) uint32_t stage[W][QG][32];
   alignas(16) uint32_t pb[W][2][QG][4];
-  int pre[MAX_SLICES + 1];
+  int pre[Slices + 1];
   alignas(16) float o[W][QG][D];
   float l[W][QG];
 };
 
-template <int CB, int FB, int QG, class Pos, bool V = false>
-__device__ __forceinline__ void refine_kernel_item(const Args &a, SmemRefine<QG> &sm) {
+template <int CB, int FB, int QG, class Pos, bool V = false, int Slices = MAX_SLICES>
+__device__ __forceinline__ void refine_kernel_item(const Args &a, SmemRefine<QG, Slices> &sm) {
   static_assert(QG <= 2, "four queries per KV head: refine_kernel4");
   constexpr int RC = record_bytes<CB>(), RF = record_bytes<FB>();
   constexpr float HOFF = .5f * ((1 << FB) - 1);
@@ -925,6 +980,12 @@ __device__ __forceinline__ void refine_kernel_item(const Args &a, SmemRefine<QG>
   auto cta = [&] { return Pos::kReread ? (int)Pos::x() : cta_; };
   auto P = [&] { return Pos::kReread ? (int)Pos::nx() : P_; };
   auto ns = [&] { return P() * W; };
+  if constexpr (Slices == 1) {
+    if (cta() * W >= Pos::ro(a.counts + vh)) {
+      empty_partial<QG, Pos, false>(a);
+      return;
+    }
+  }
   float R[QG];
 #pragma unroll
   for (int qi = 0; qi < QG; ++qi) R[qi] = Pos::ro(a.row_lse + row0() + qi);
@@ -938,18 +999,7 @@ __device__ __forceinline__ void refine_kernel_item(const Args &a, SmemRefine<QG>
       reinterpret_cast<float4 *>(sm.qs[qi])[lane] =
           make_float4(qf[0], qf[1], qf[2], qf[3]);
     }
-  if (!warp) {  // prefix sums of the slice counts
-    int run = 0;
-    for (int s0 = 0; s0 < a.nslices; s0 += 32) {
-      const int s = s0 + lane, n = s < a.nslices ? Pos::ro(a.counts + (size_t)vh * a.nslices + s) : 0;
-      int x = n;
-#pragma unroll
-      for (int o = 1; o < 32; o <<= 1) { const int y = __shfl_up_sync(FULL, x, o); x += lane >= o ? y : 0; }
-      if (s < a.nslices) sm.pre[s] = run + x - n;
-      run += __shfl_sync(FULL, x, 31);
-    }
-    if (!lane) sm.pre[a.nslices] = run;
-  }
+  if (!warp) refine_prefix<Pos>(a, vh, sm.pre);
   __syncthreads();
   const int total = sm.pre[a.nslices];
 
@@ -968,8 +1018,11 @@ __device__ __forceinline__ void refine_kernel_item(const Args &a, SmemRefine<QG>
   struct Load { int it; Codes<CB> kc, vc; Codes<FB> kf, vf; uint4 km, vm; };
   int s = 0;
   auto item_at = [&](int k) {
-    while (sm.pre[s + 1] <= k) ++s;
-    return Pos::ro(items + (size_t)s * SLICE + (k - sm.pre[s]));
+    if constexpr (Slices == 1) return Pos::ro(items + k);
+    else {
+      while (sm.pre[s + 1] <= k) ++s;
+      return Pos::ro(items + (size_t)s * SLICE + (k - sm.pre[s]));
+    }
   };
   auto fetch = [&](Load &L, int it) {
     const int sb = it >> 4;
@@ -1032,7 +1085,7 @@ __device__ __forceinline__ void refine_kernel_item(const Args &a, SmemRefine<QG>
     __syncwarp();  // stage and pb are rewritten by the next item
   }
 
-  // the CTA's corrections, then the last CTA of the (batch, KV head) writes the output
+  // The CTA's correction partial; the separate merge pass writes the output.
 #pragma unroll
   for (int qi = 0; qi < QG; ++qi) {
     if (!lane) sm.l[warp][qi] = dl[qi];
@@ -1049,10 +1102,10 @@ __device__ __forceinline__ void refine_kernel_item(const Args &a, SmemRefine<QG>
     if (!ch) dp[0] = ls;
   }
 }
-template <int CB, int FB, int QG, bool V>
+template <int CB, int FB, int QG, bool V, int Slices = MAX_SLICES>
 __global__ void __launch_bounds__(32 * W, 2) refine_kernel(const Args a) {
-  __shared__ SmemRefine<QG> sm;
-  refine_kernel_item<CB, FB, QG, Grid, V>(a, sm);
+  __shared__ SmemRefine<QG, Slices> sm;
+  refine_kernel_item<CB, FB, QG, Grid, V, Slices>(a, sm);
 }
 
 // ---- refinement pass, four queries per KV head ---------------------------------------------------
@@ -1065,14 +1118,15 @@ struct RefineSlots4 {
   float dl[4];
   alignas(16) float o[4][D];         // corrections do per query (the final combine's buffer as well)
 };
-struct SmemRefine4 {
+template <int Slices> struct SmemRefine4Storage {
   alignas(16) float qs[4][D];
   RefineSlots4 ws[W];
-  int pre[MAX_SLICES + 1];
+  int pre[Slices + 1];
 };
+using SmemRefine4 = SmemRefine4Storage<MAX_SLICES>;
 
-template <int CB, int FB, class Pos, bool V = false>
-__device__ __forceinline__ void refine_kernel4_item(const Args &a, SmemRefine4 &sm) {
+template <int CB, int FB, class Pos, bool V = false, int Slices = MAX_SLICES>
+__device__ __forceinline__ void refine_kernel4_item(const Args &a, SmemRefine4Storage<Slices> &sm) {
   constexpr int QG = 4, RC = record_bytes<CB>(), RF = record_bytes<FB>();
   constexpr float HOFF = .5f * ((1 << FB) - 1);
   const int lane = Pos::tid() & 31, warp = Pos::tid() >> 5, half = lane >> 4;
@@ -1081,6 +1135,12 @@ __device__ __forceinline__ void refine_kernel4_item(const Args &a, SmemRefine4 &
   auto row0 = [&] { return Pos::kReread ? (int)Pos::y() * QG : row0_; };  // (kReread: not kept live)
   auto cta = [&] { return Pos::kReread ? (int)Pos::x() : cta_; };
   auto P = [&] { return Pos::kReread ? (int)Pos::nx() : P_; };
+  if constexpr (Slices == 1) {
+    if (cta() * W >= Pos::ro(a.counts + vh)) {
+      empty_partial<QG, Pos, false>(a);
+      return;
+    }
+  }
   RefineSlots4 &ws = sm.ws[warp];
 
   if (warp < QG) {
@@ -1090,18 +1150,7 @@ __device__ __forceinline__ void refine_kernel4_item(const Args &a, SmemRefine4 &
     reinterpret_cast<float4 *>(sm.qs[warp])[lane] =
         make_float4(qf[0], qf[1], qf[2], qf[3]);
   }
-  if (warp == QG) {  // prefix sums of the slice counts
-    int run = 0;
-    for (int s0 = 0; s0 < a.nslices; s0 += 32) {
-      const int s = s0 + lane, n = s < a.nslices ? Pos::ro(a.counts + (size_t)vh * a.nslices + s) : 0;
-      int x = n;
-#pragma unroll
-      for (int o = 1; o < 32; o <<= 1) { const int y = __shfl_up_sync(FULL, x, o); x += lane >= o ? y : 0; }
-      if (s < a.nslices) sm.pre[s] = run + x - n;
-      run += __shfl_sync(FULL, x, 31);
-    }
-    if (!lane) sm.pre[a.nslices] = run;
-  }
+  if (warp == QG) refine_prefix<Pos>(a, vh, sm.pre);
 #pragma unroll
   for (int qi = 0; qi < QG; ++qi) reinterpret_cast<float4 *>(ws.o[qi])[lane] = make_float4(0.f, 0.f, 0.f, 0.f);
   if (lane < QG) ws.dl[lane] = 0.f;
@@ -1114,8 +1163,11 @@ __device__ __forceinline__ void refine_kernel4_item(const Args &a, SmemRefine4 &
   struct Load { int it; Codes<CB> kc, vc; Codes<FB> kf, vf; uint4 km, vm; };
   int s = 0;
   auto item_at = [&](int k) {
-    while (sm.pre[s + 1] <= k) ++s;
-    return Pos::ro(items + (size_t)s * SLICE + (k - sm.pre[s]));
+    if constexpr (Slices == 1) return Pos::ro(items + k);
+    else {
+      while (sm.pre[s + 1] <= k) ++s;
+      return Pos::ro(items + (size_t)s * SLICE + (k - sm.pre[s]));
+    }
   };
   auto fetch = [&](Load &L, int it) {
     const int sb = it >> 4;
@@ -1132,20 +1184,20 @@ __device__ __forceinline__ void refine_kernel4_item(const Args &a, SmemRefine4 &
   for (; k < total; k += P() * W) {
     const Load cur = nx;
     if (k + P() * W < total) fetch(nx, item_at(k + P() * W));
-    {
-      GroupState<QG> gs;
-      setup_group<CB, FB, QG>(lane, cur.km, cur.vm, sm.qs, a.scale_log2, ws.stage, gs);
-      if (!lane)
-#pragma unroll
-        for (int qi = 0; qi < QG; ++qi) ws.gq[qi] = make_float4(gs.sq[qi], gs.qb[qi], gs.c0[qi], gs.sqc[qi]);
-      __syncwarp();
-    }
     float vb[4], vs[4];
     bf16x4(cur.vm.x, cur.vm.y, vb); bf16x4(cur.vm.z, cur.vm.w, vs);
 #pragma unroll 1
     for (int h = 0; h < 2; ++h) {
       const int q0 = 2 * h;
       if (!((cur.it >> q0) & 3)) continue;  // warp-uniform: neither query of this half refines the item
+      {
+        GroupState<2> gs;
+        setup_group<CB, FB, 2>(lane, cur.km, cur.vm, sm.qs + q0, a.scale_log2, ws.stage + q0, gs);
+        if (!lane)
+#pragma unroll
+          for (int j = 0; j < 2; ++j) ws.gq[q0 + j] = make_float4(gs.sq[j], gs.qb[j], gs.c0[j], gs.sqc[j]);
+        __syncwarp();
+      }
       float xh[2], xl[2];
       qk<CB, 2>(ws.stage + q0, half, cur.kc, xh);
       qk<FB, 2>(ws.stage + q0, half, cur.kf, xl);
@@ -1191,7 +1243,7 @@ __device__ __forceinline__ void refine_kernel4_item(const Args &a, SmemRefine4 &
     }
   }
 
-  // the CTA's corrections, then the last CTA of the (batch, KV head) writes the output
+  // The CTA's correction partial; the separate merge pass writes the output.
   __syncthreads();
   for (int i = Pos::tid(); i < QG * D; i += blockDim.x) {
     const int qi = i / D, ch = i - qi * D;
@@ -1203,17 +1255,16 @@ __device__ __forceinline__ void refine_kernel4_item(const Args &a, SmemRefine4 &
     if (!ch) dp[0] = ls;
   }
 }
-template <int CB, int FB, bool V>
+template <int CB, int FB, bool V, int Slices = MAX_SLICES>
 __global__ void __launch_bounds__(32 * W, 2) refine_kernel4(const Args a) {
-  __shared__ SmemRefine4 sm;
-  refine_kernel4_item<CB, FB, Grid, V>(a, sm);
+  __shared__ SmemRefine4Storage<Slices> sm;
+  refine_kernel4_item<CB, FB, Grid, V, Slices>(a, sm);
 }
 
 // ---- final combine ----------------------------------------------------------------------------------
-// One CTA per (batch, KV head, query, slice of MC channels): the partials are many and the traffic of one SM is
-// bound by its outstanding misses, so the row is split over SMs by channel.  Thread (g, ch) sums the coarse
-// partials and the corrections of the CTAs g, g + MG, ...; the loads of a round (MU partials of both arrays) are in
-// flight together.  The grid does not depend on the context.
+// One CTA per (batch, KV head, query, slice of MC channels), splitting the row over SMs by channel.
+// Thread (g, ch) sums the partials of the CTAs g, g + MG, ...; the MU loads of a round are in flight together.
+// The grid does not depend on the context.
 constexpr int MC = 16, MG = 16, MU = 9, MSLICES = D / MC;
 struct SmemMerge {
   float o[MG][MC], l[MG];
@@ -1263,9 +1314,10 @@ __global__ void __launch_bounds__(MC * MG) merge_kernel(const Args a) {
 // ---- launch ---------------------------------------------------------------------------------------
 // CTAs per (batch, KV head): the device's resident CTAs split over the heads (persistent, one wave), at
 // most bound (the scratch's partials).  The grid is a function of the device only, not of the context.
+#ifndef __CUDACC_RTC__
 inline int blocks_per_sm(const void *kernel) {
-  static struct { const void *k; int dev, occ; } cache[64];
-  static int n = 0;
+  static thread_local struct { const void *k; int dev, occ; } cache[64];
+  static thread_local int n = 0;
   int dev = 0;
   cudaGetDevice(&dev);
   for (int i = 0; i < n; ++i) if (cache[i].k == kernel && cache[i].dev == dev) return cache[i].occ;
@@ -1282,10 +1334,16 @@ inline int per_head(const void *kernel, int bound, const Args &a) {
   return std::max(1, std::min(std::max(1, slots / heads), bound));
 }
 
-// The select and merge passes do not depend on the format: one copy of their kernels (the object built with
-// MLOPS_FBLA_DEFINE_SHARED, fbla_inst.cu), launched from both format objects through these host functions.  From
-// CUDA 12.8 on a kernel template's launch stub is local to its object (-static-global-template-stub), so the
-// kernel itself cannot be shared (and a copy in each object is a duplicate entry kernel).
+struct DecodeGrid {
+  int coarse, refine;
+  static DecodeGrid make(const void *coarse_kernel, const void *refine_kernel, int bound, const Args &a) {
+    return {per_head(coarse_kernel, bound, a), per_head(refine_kernel, bound, a)};
+  }
+};
+
+// Select and merge are format-independent: one copy (MLOPS_FBLA_DEFINE_SHARED, fbla_inst.cu) is launched
+// from both format objects through these host functions.  Since CUDA 12.8 a template kernel's launch stub is
+// object-local (-static-global-template-stub), so the kernel itself cannot be shared.
 void launch_select(const Args &a, int qg, dim3 grid, cudaStream_t stream);
 void launch_merge(const Args &a, int qg, int heads, cudaStream_t stream);
 #ifdef MLOPS_FBLA_DEFINE_SHARED
@@ -1303,25 +1361,31 @@ void launch_merge(const Args &a, int qg, int heads, cudaStream_t stream) {
 #endif
 
 // QG queries per (virtual) KV head; V: virtual heads (a.vg of them per KV head)
-template <int CB, int FB, int QG, bool V> cudaError_t launch_qg(Args a, int bound, cudaStream_t stream) {
+template <int CB, int FB, int QG, bool V, int Slices> cudaError_t launch_qg_impl(Args a, int bound, cudaStream_t stream) {
   const int heads = a.batch * a.kv_heads * a.vg;
   const void *ck, *rk;
   if constexpr (QG == 4) {
     ck = reinterpret_cast<const void *>(coarse_kernel4<CB, FB, V>);
-    rk = reinterpret_cast<const void *>(refine_kernel4<CB, FB, V>);
+    rk = reinterpret_cast<const void *>(refine_kernel4<CB, FB, V, Slices>);
   } else {
     ck = reinterpret_cast<const void *>(coarse_kernel<CB, FB, QG, V>);
-    rk = reinterpret_cast<const void *>(refine_kernel<CB, FB, QG, V>);
+    rk = reinterpret_cast<const void *>(refine_kernel<CB, FB, QG, V, Slices>);
   }
-  const int p1 = per_head(ck, bound, a), p2 = per_head(rk, bound, a);  // the device's resident CTAs, not the context
+  const DecodeGrid grid = DecodeGrid::make(ck, rk, bound, a);
+  const int p1 = grid.coarse, p2 = grid.refine;
   a.ctas = p1; a.rctas = p2;
   if constexpr (QG == 4) coarse_kernel4<CB, FB, V><<<dim3(p1, heads), 32 * W, 0, stream>>>(a);
   else coarse_kernel<CB, FB, QG, V><<<dim3(p1, heads), 32 * W, 0, stream>>>(a);
   launch_select(a, QG, dim3(a.nslices, heads), stream);
-  if constexpr (QG == 4) refine_kernel4<CB, FB, V><<<dim3(p2, heads), 32 * W, 0, stream>>>(a);
-  else refine_kernel<CB, FB, QG, V><<<dim3(p2, heads), 32 * W, 0, stream>>>(a);
+  if constexpr (QG == 4) refine_kernel4<CB, FB, V, Slices><<<dim3(p2, heads), 32 * W, 0, stream>>>(a);
+  else refine_kernel<CB, FB, QG, V, Slices><<<dim3(p2, heads), 32 * W, 0, stream>>>(a);
   launch_merge(a, QG, heads, stream);
   return cudaGetLastError();
+}
+
+template <int CB, int FB, int QG, bool V> cudaError_t launch_qg(Args a, int bound, cudaStream_t stream) {
+  if (a.nslices == 1) return launch_qg_impl<CB, FB, QG, V, 1>(a, bound, stream);
+  return launch_qg_impl<CB, FB, QG, V, MAX_SLICES>(a, bound, stream);
 }
 
 template <int CB, int FB> cudaError_t launch(const Args &a, int bound, cudaStream_t stream) {
@@ -1339,6 +1403,109 @@ template <int CB, int FB> cudaError_t launch(const Args &a, int bound, cudaStrea
     default: return launch_qg<CB, FB, 4, true>(a, bound, stream);
   }
 }
+
+// ---- the work items (mlops_fbla_items.h): the passes of a decode as the launches above run them ---------------------
+// (host) one pass: the equivalent launch's kernel gives the registers and the architecture, geom[0..2] the item grid
+template <class A> constexpr const char *item_args_type();
+template <> constexpr const char *item_args_type<Args>() { return "mlops_fbla_detail::Args"; }
+template <> constexpr const char *item_args_type<PrefillArgs>() { return "mlops_fbla_detail::PrefillArgs"; }
+template <> constexpr const char *item_args_type<QkvArgs>() { return "mlops_fbla_detail::QkvArgs"; }
+
+template <class K, class A>
+inline bool item_of(K kernel, int kind, int gx, int gy, int gz, int threads, int smem, const char *entry,
+                    const A &a, mlops_fbla_items &p) {
+  static_assert(std::is_trivially_copyable<A>::value, "an item's argument blob must be trivially copyable");
+  static_assert(sizeof(A) <= MLOPS_FBLA_ITEM_ARGS_BYTES, "item argument storage is too small");
+  const long long items = (long long)gx * gy * gz;
+  if (gx <= 0 || gy <= 0 || gz <= 0 || items > 0x7fffffffLL) return false;
+  cudaFuncAttributes fa{};
+  if (cudaFuncGetAttributes(&fa, kernel) != cudaSuccess || fa.ptxVersion <= 0) return false;
+  p.kind = kind;
+  p.items = (int)items;
+  p.threads = threads;
+  p.smem_bytes = smem;
+  p.regs = fa.numRegs;
+  p.arch = fa.ptxVersion;
+  const int entry_chars = snprintf(p.entry, sizeof p.entry, "%s", entry);
+  const int type_chars = snprintf(p.args_type, sizeof p.args_type, "%s", item_args_type<A>());
+  if (entry_chars < 0 || entry_chars >= (int)sizeof p.entry || type_chars < 0 || type_chars >= (int)sizeof p.args_type)
+    return false;
+  p.args_bytes = sizeof(A);
+  memcpy(p.args.bytes, &a, sizeof(A));
+  p.geom[0] = gx;
+  p.geom[1] = gy;
+  p.geom[2] = gz;
+  return true;
+}
+
+// The Args as decode_args prepared them (a.ctas / a.rctas / a.nslices set); the pass order is the launches'.
+// scratch: the call's, for the pointers' offsets within it (geom[25..30], the access ranges of mlops_fbla_item_access).
+template <int CB, int FB>
+inline int decode_passes(const Args &input, const void *scratch, mlops_fbla_items *p, int max) {
+  if (max < 4) return -1;
+  Args a = input;
+  const int heads = a.batch * a.kv_heads * a.vg;
+  const int qg = a.q_heads / a.kv_heads / a.vg;
+  const bool v = a.vg != 1;
+  char e[160];
+  bool ok = true;
+  for (int i = 0; i < 4; ++i) {  // the scratch's layout (mlops_fbla_item_access)
+    p[i].geom[MLOPS_FBLA_GEOM_LSE] = (const char *)a.lse - (const char *)scratch;
+    p[i].geom[MLOPS_FBLA_GEOM_PART] = (const char *)a.part - (const char *)scratch;
+    p[i].geom[MLOPS_FBLA_GEOM_DPART] = (const char *)a.dpart - (const char *)scratch;
+    p[i].geom[MLOPS_FBLA_GEOM_ROW_LSE] = (const char *)a.row_lse - (const char *)scratch;
+    p[i].geom[MLOPS_FBLA_GEOM_ITEMS] = (const char *)a.items - (const char *)scratch;
+    p[i].geom[MLOPS_FBLA_GEOM_COUNTS] = (const char *)a.counts - (const char *)scratch;
+    p[i].geom[MLOPS_FBLA_GEOM_HEAD_STRIDE] = a.hs;
+    p[i].geom[MLOPS_FBLA_GEOM_GROUP_STRIDE] = a.gs;
+  }
+  auto coarse_refine = [&](auto kern_c, auto kern_r, auto smem_c, auto smem_r, const char *ce, const char *re) {
+    if (!a.rctas) {
+      const DecodeGrid grid = DecodeGrid::make((const void *)kern_c, (const void *)kern_r, a.ctas, a);
+      a.ctas = grid.coarse;
+      a.rctas = grid.refine;
+    }
+    snprintf(e, sizeof e, "%s", ce);
+    ok &= item_of(kern_c, MLOPS_FBLA_ITEM_COARSE, a.ctas, heads, 1, 32 * W, (int)smem_c, e, a, p[0]);
+    snprintf(e, sizeof e, "%s", re);
+    ok &= item_of(kern_r, MLOPS_FBLA_ITEM_REFINE, a.rctas, heads, 1, 32 * W, (int)smem_r, e, a, p[2]);
+  };
+  char ce[160], re[160];
+  auto describe = [&](auto slices) {
+    constexpr int NS = decltype(slices)::value;
+    if (qg == 4) {  // four queries a warp: the coarse and refine passes' own kernels
+      snprintf(ce, sizeof ce, "mlops_fbla_detail::coarse_kernel4_item<%d, %d, mlops_fbla::Pos, %s>", CB, FB, v ? "true" : "false");
+      snprintf(re, sizeof re, "mlops_fbla_detail::refine_kernel4_item<%d, %d, mlops_fbla::Pos, %s, %d>", CB, FB, v ? "true" : "false", NS);
+      if (v) coarse_refine(coarse_kernel4<CB, FB, true>, refine_kernel4<CB, FB, true, NS>, sizeof(SmemCoarse4), sizeof(SmemRefine4Storage<NS>), ce, re);
+      else coarse_refine(coarse_kernel4<CB, FB, false>, refine_kernel4<CB, FB, false, NS>, sizeof(SmemCoarse4), sizeof(SmemRefine4Storage<NS>), ce, re);
+    } else {
+      snprintf(ce, sizeof ce, "mlops_fbla_detail::coarse_kernel_item<%d, %d, %d, mlops_fbla::Pos, %s>", CB, FB, qg,
+               v ? "true" : "false");
+      snprintf(re, sizeof re, "mlops_fbla_detail::refine_kernel_item<%d, %d, %d, mlops_fbla::Pos, %s, %d>", CB, FB, qg,
+               v ? "true" : "false", NS);
+      if (v) {
+        if (qg == 1) coarse_refine(coarse_kernel<CB, FB, 1, true>, refine_kernel<CB, FB, 1, true, NS>, sizeof(SmemCoarse<1>), sizeof(SmemRefine<1, NS>), ce, re);
+        else coarse_refine(coarse_kernel<CB, FB, 2, true>, refine_kernel<CB, FB, 2, true, NS>, sizeof(SmemCoarse<2>), sizeof(SmemRefine<2, NS>), ce, re);
+      } else {
+        if (qg == 1) coarse_refine(coarse_kernel<CB, FB, 1, false>, refine_kernel<CB, FB, 1, false, NS>, sizeof(SmemCoarse<1>), sizeof(SmemRefine<1, NS>), ce, re);
+        else coarse_refine(coarse_kernel<CB, FB, 2, false>, refine_kernel<CB, FB, 2, false, NS>, sizeof(SmemCoarse<2>), sizeof(SmemRefine<2, NS>), ce, re);
+      }
+    }
+  };
+  if (a.nslices == 1) describe(std::integral_constant<int, 1>{});
+  else describe(std::integral_constant<int, MAX_SLICES>{});
+  auto sel_merge = [&](auto sel, auto mrg) {
+    snprintf(e, sizeof e, "mlops_fbla_detail::select_kernel_item<%d, mlops_fbla::Pos>", qg);
+    ok &= item_of(sel, MLOPS_FBLA_ITEM_SELECT, a.nslices, heads, 1, 32 * W, qg * 4 + W * 4, e, a, p[1]);
+    snprintf(e, sizeof e, "mlops_fbla_detail::merge_kernel_item<%d, mlops_fbla::Pos>", qg);
+    ok &= item_of(mrg, MLOPS_FBLA_ITEM_MERGE, qg * MSLICES, heads, 1, MC * MG, sizeof(SmemMerge), e, a, p[3]);
+  };
+  if (qg == 1) sel_merge(select_kernel<1>, merge_kernel<1>);
+  else if (qg == 2) sel_merge(select_kernel<2>, merge_kernel<2>);
+  else sel_merge(select_kernel<4>, merge_kernel<4>);
+  return ok ? 4 : -1;
+}
+#endif  // !__CUDACC_RTC__
 
 }  // namespace mlops_fbla_detail
 #endif

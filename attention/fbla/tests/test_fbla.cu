@@ -455,6 +455,174 @@ static int run_prefill(int cb, int fb, int B, int QH, int KH, int N, unsigned se
   return f;
 }
 
+// The prefill's chunks at the device length and count: n0 tokens prefilled into both caches, then the same chunks two
+// ways -- mlops_fbla_prefill per chunk on the host, and one CUDA graph of mlops_fbla_prefill_at calls with the length
+// and each chunk's count in device memory (no launch of either call depending on them) -- bit for bit, every chunk's
+// outputs and the caches.  The chunk buffers are the ceiling's size; the last chunk holds fewer tokens.
+__global__ void step_chunk(int *length, int *count, const int *counts, int i) {
+  if (threadIdx.x == 0) { *count = counts[i + 1]; *length += counts[i]; }
+}
+static int run_prefill_at(int cb, int fb, int B, int QH, int KH, int n0, std::vector<int> counts, unsigned seed,
+                          bool append_only = false) {
+  const int max_count = *std::max_element(counts.begin(), counts.end());
+  int total = 0;
+  for (int c : counts) total += c;
+  const int cap = n0 + total + 100;
+  const size_t heads = (size_t)B * KH, cg = (cap + G - 1) / G;
+  const size_t uc = 8u * 2 * cb * 256, uf = 8u * 2 * fb * 256;
+  const mlops_fbla_format fmt = cb == 3 ? MLOPS_FBLA_3P3 : MLOPS_FBLA_4P2;
+  std::mt19937 r(seed);
+  std::normal_distribution<float> n01(0.f, 1.f);
+  auto randn = [&](size_t n, float sd) { std::vector<uint16_t> v(n); for (auto &x : v) x = f2b(sd * n01(r)); return v; };
+  struct Cache { uint8_t *c, *f; uint16_t *m, *e; mlops_fbla_cache x; uint8_t *cb_, *fb_; uint16_t *mb_; uint8_t *im = nullptr; } cache[2];
+  {
+    const mlops_fbla_config one{1, 1, 1, 0, 0.f, 0.f, fmt, G};
+    const size_t slot = mlops_fbla_images_bytes(&one);  // (0 where the prefill runs on CUDA cores)
+    for (Cache &k : cache) {
+      place(std::vector<uint8_t>(heads * cg * uc, 0), uc, heads, cg, &k.cb_);
+      place(std::vector<uint8_t>(heads * cg * uf, 0), uf, heads, cg, &k.fb_);
+      place(std::vector<uint16_t>(heads * cg * 512, 0), 512, heads, cg, &k.mb_);
+      k.e = up(std::vector<uint16_t>(4 * heads * G * D, 0));
+      k.x = {own(k.cb_, uc, heads), own(k.fb_, uf, heads), own(k.mb_, 512, heads), k.e, k.e + heads * G * D,
+             k.e + 2 * heads * G * D, k.e + 3 * heads * G * D, nullptr};
+      if (slot) {
+        place(std::vector<uint8_t>(heads * cg * slot, 0), slot, heads, cg, &k.im);
+        k.x.tc_images = own(k.im, slot, heads);
+      }
+    }
+  }
+  const std::vector<uint16_t> kv = randn(2 * heads * (n0 + total) * D, 2.f), qall = randn((size_t)B * QH * total * D, 1.5f);
+  mlops_fbla_config cfg{B, QH, KH, 0, 0.f, 0.f, fmt, cap};
+  set_strides(cfg, heads);
+  {  // the prompt, n0 tokens, into both, attending (the closed groups get their images: a prefill_at cannot
+     // build images of groups older than its own chunk)
+    const std::vector<uint16_t> p(kv.begin(), kv.begin() + 2 * heads * n0 * D), pq = randn((size_t)B * QH * n0 * D, 1.5f);
+    uint16_t *d = up(p), *dq = up(pq), *dout;
+    CK(cudaMalloc(&dout, pq.size() * 2));
+    for (Cache &k : cache)
+      if (mlops_fbla_prefill(&cfg, n0, dq, d, d + heads * n0 * D, &k.x, dout, 0)) {
+        fprintf(stderr, "%s\n", mlops_fbla_last_error());
+        exit(1);
+      }
+    cudaFree(d);
+    cudaFree(dq);
+    cudaFree(dout);
+  }
+  // the host way: every chunk compact, into cache[0]
+  std::vector<std::vector<uint16_t>> outs;
+  int pos = n0;
+  for (int cnt : counts) {
+    std::vector<uint16_t> kh(heads * cnt * D), vh(kh.size()), qh((size_t)B * QH * cnt * D);
+    for (size_t h = 0; h < heads; ++h)
+      for (int t = 0; t < cnt; ++t)
+        for (int x = 0; x < D; ++x) {
+          kh[(h * cnt + t) * D + x] = kv[(h * (n0 + total) + pos + t) * D + x];
+          vh[(h * cnt + t) * D + x] = kv[(heads * (n0 + total) + h * (n0 + total) + pos + t) * D + x];
+        }
+    for (size_t hq = 0; hq < (size_t)B * QH; ++hq)
+      for (int t = 0; t < cnt; ++t)
+        for (int x = 0; x < D; ++x) qh[(hq * cnt + t) * D + x] = qall[(hq * total + (pos - n0) + t) * D + x];
+    uint16_t *dk = up(kh), *dv = up(vh), *dq = up(qh), *dout;
+    CK(cudaMalloc(&dout, qh.size() * 2));
+    mlops_fbla_config c = cfg;
+    c.tokens = pos;
+    if (mlops_fbla_prefill(&c, cnt, append_only ? nullptr : dq, dk, dv, &cache[0].x, append_only ? nullptr : dout, 0)) {
+      fprintf(stderr, "%s\n", mlops_fbla_last_error());
+      exit(1);
+    }
+    CK(cudaDeviceSynchronize());
+    if (!append_only) {
+      outs.emplace_back(qh.size());
+      CK(cudaMemcpy(outs.back().data(), dout, outs.back().size() * 2, cudaMemcpyDeviceToHost));
+    }
+    for (void *x : {(void *)dk, (void *)dv, (void *)dq, (void *)dout}) cudaFree(x);
+    pos += cnt;
+  }
+  // the graph way: one capture of every chunk, the buffers the ceiling's size, into cache[1]
+  const int n = (int)counts.size();
+  const std::vector<int> cvec = [&] { std::vector<int> v(counts); v.push_back(0); return v; }();  // the last step's count
+  int *dlen, *dcount, *dcounts;
+  CK(cudaMalloc(&dlen, 4)); CK(cudaMalloc(&dcount, 4)); CK(cudaMalloc(&dcounts, (n + 1) * 4));
+  CK(cudaMemcpy(dlen, &n0, 4, cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(dcount, cvec.data(), 4, cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(dcounts, cvec.data(), (n + 1) * 4, cudaMemcpyHostToDevice));
+  std::vector<uint16_t *> dk(n), dv(n), dq(n), dout(n);
+  pos = n0;
+  for (int i = 0; i < n; ++i) {
+    const int cnt = counts[i];
+    std::vector<uint16_t> kh(heads * max_count * D, 0), vh(kh.size()), qh((size_t)B * QH * max_count * D, 0);
+    for (size_t h = 0; h < heads; ++h)
+      for (int t = 0; t < cnt; ++t)
+        for (int x = 0; x < D; ++x) {
+          kh[(h * max_count + t) * D + x] = kv[(h * (n0 + total) + pos + t) * D + x];
+          vh[(h * max_count + t) * D + x] = kv[(heads * (n0 + total) + h * (n0 + total) + pos + t) * D + x];
+        }
+    for (size_t hq = 0; hq < (size_t)B * QH; ++hq)
+      for (int t = 0; t < cnt; ++t)
+        for (int x = 0; x < D; ++x) qh[(hq * max_count + t) * D + x] = qall[(hq * total + (pos - n0) + t) * D + x];
+    dk[i] = up(kh); dv[i] = up(vh); dq[i] = up(qh);
+    CK(cudaMalloc(&dout[i], qh.size() * 2));
+    pos += cnt;
+  }
+  cudaStream_t st;
+  CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+  cudaGraph_t graph;
+  cudaGraphExec_t exec;
+  CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+  int bad_call = 0;
+  for (int i = 0; i < n; ++i) {
+    bad_call |= mlops_fbla_prefill_at(&cfg, dlen, dcount, max_count, append_only ? nullptr : dq[i], dk[i], dv[i],
+                                      &cache[1].x, append_only ? nullptr : dout[i], st);
+    step_chunk<<<1, 32, 0, st>>>(dlen, dcount, dcounts, i);
+  }
+  CK(cudaStreamEndCapture(st, &graph));
+  if (bad_call) { fprintf(stderr, "%s\n", mlops_fbla_last_error()); exit(1); }
+  CK(cudaGraphInstantiate(&exec, graph, 0));
+  CK(cudaGraphLaunch(exec, st));
+  CK(cudaStreamSynchronize(st));
+  long differ = 0;
+  if (!append_only) {
+    std::vector<uint16_t> all((size_t)B * QH * max_count * D);
+    for (int i = 0; i < n; ++i) {
+      CK(cudaMemcpy(all.data(), dout[i], all.size() * 2, cudaMemcpyDeviceToHost));
+      for (size_t h = 0; h < (size_t)B * QH; ++h)  // the used rows within each head's ceiling-sized block
+        differ += memcmp(all.data() + h * max_count * D, outs[i].data() + h * counts[i] * D, (size_t)counts[i] * D * 2) != 0;
+    }
+  }
+  long bytes_differ = 0;  // the caches after the last chunk
+  {
+    const auto a = gather(cache[0].cb_, heads * cg * uc, uc, heads, cg), b = gather(cache[1].cb_, heads * cg * uc, uc, heads, cg);
+    const auto af = gather(cache[0].fb_, heads * cg * uf, uf, heads, cg), bf = gather(cache[1].fb_, heads * cg * uf, uf, heads, cg);
+    const auto am = gather(cache[0].mb_, heads * cg * 512, 512, heads, cg), bm = gather(cache[1].mb_, heads * cg * 512, 512, heads, cg);
+    std::vector<uint16_t> ae(4 * heads * G * D), be(ae.size());
+    CK(cudaMemcpy(ae.data(), cache[0].e, ae.size() * 2, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(be.data(), cache[1].e, be.size() * 2, cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < a.size(); ++i) bytes_differ += a[i] != b[i];
+    for (size_t i = 0; i < af.size(); ++i) bytes_differ += af[i] != bf[i];
+    for (size_t i = 0; i < am.size(); ++i) bytes_differ += am[i] != bm[i];
+    for (size_t i = 0; i < ae.size(); ++i) bytes_differ += ae[i] != be[i];
+    if (cache[0].im) {  // the images, as the attention reads them
+      const size_t slot = 34048 + 128;
+      const std::vector<uint8_t> ai = gather(cache[0].im, heads * cg * slot, slot, heads, cg);
+      const std::vector<uint8_t> bi = gather(cache[1].im, heads * cg * slot, slot, heads, cg);
+      for (size_t i = 0; i < ai.size(); ++i) bytes_differ += ai[i] != bi[i];
+    }
+  }
+  const bool ok = differ == 0 && bytes_differ == 0;
+  printf("[%s] prefill_at %d+%d B=%d heads %d/%d tokens %d..%d, %zu chunks (max %d)%s%s: chunk outputs differing %ld, cache elements differing %ld\n",
+         ok ? "PASS" : "FAIL", cb, fb, B, QH, KH, n0, n0 + total, counts.size(), max_count,
+         append_only ? ", append only" : "", g_strided ? " (strided)" : "", differ, bytes_differ);
+  cudaGraphExecDestroy(exec);
+  cudaGraphDestroy(graph);
+  cudaStreamDestroy(st);
+  for (Cache &k : cache)
+    for (void *x : {(void *)k.cb_, (void *)k.fb_, (void *)k.mb_, (void *)k.e, (void *)k.im}) cudaFree(x);
+  for (int i = 0; i < n; ++i)
+    for (void *x : {(void *)dk[i], (void *)dv[i], (void *)dq[i], (void *)dout[i]}) cudaFree(x);
+  for (void *x : {(void *)dlen, (void *)dcount, (void *)dcounts}) cudaFree(x);
+  return !ok;
+}
+
 // Device length: the same token by token two ways from the same prefilled cache -- host appends and decodes with the
 // length on the host, and one CUDA graph of append_at, the length's increment and decode_at replayed per token (the
 // launches do not depend on the length) -- bit for bit, outputs and caches.
@@ -721,6 +889,14 @@ int main() {
     f += run_prefill(cb, fb, 1, 32, 2, 1500, 31, {700, 800});           // GQA 16
     f += run_prefill(cb, fb, 1, 10, 2, 2000, 32, {900, 1100});          // GQA 5
     f += run_prefill(cb, fb, 1, 2, 2, 2000, 27, {1, 1, 254, 1744}, true);  // append only
+    f += run_prefill_at(cb, fb, 1, 2, 2, 100, {100, 100}, 61);           // inside the first group
+    f += run_prefill_at(cb, fb, 1, 4, 2, 1000, {300, 212, 128, 1, 1407}, 62);  // chunk edges on and off groups
+    f += run_prefill_at(cb, fb, 2, 8, 2, 2048, {512, 512, 700, 330}, 63);     // GQA 4, batch 2, the last chunk short
+    f += run_prefill_at(cb, fb, 1, 8, 2, 2048, {512, 512, 700, 330}, 68);    // GQA 4, batch 1
+    f += run_prefill_at(cb, fb, 2, 8, 4, 2048, {512, 512, 700, 330}, 69);    // GQA 2, batch 2
+    f += run_prefill_at(cb, fb, 1, 16, 8, 1024, {1024, 2048}, 64);       // Qwen3 geometry, the prompt over groups
+    f += run_prefill_at(cb, fb, 1, 10, 2, 120, {100, 100}, 65);          // GQA 5
+    f += run_prefill_at(cb, fb, 1, 2, 2, 2000, {1, 1, 254, 1744}, 66, true);  // append only
   }
   for (int fmt = 0; fmt < 2; ++fmt) {  // the length in device memory: across group edges, the sink's end, GQA 1 / 2 / 4;
     const int cb = fmt ? 4 : 3, fb = fmt ? 2 : 3;  // tau as the decode cases of the same geometry (4, 3, 1)
@@ -748,6 +924,7 @@ int main() {
       f += run_prefill(cb, fb, 1, 16, 8, 4096, 24, {1024, 1024, 2048});
       f += run_prefill(cb, fb, 1, 4, 2, 8177, 28, {6000, 2100, 77});
     }
+    f += run_prefill_at(cb, fb, 1, 4, 2, 1000, {300, 212, 128, 1, 1407}, 67);
     f += run_device_length(cb, fb, 1, 16, 8, 120, 280, 3e-4f, 44);
     f += run_qkv(cb, fb, 1, 32, 8, 120, 280, true, 54);
   }

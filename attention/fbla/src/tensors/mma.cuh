@@ -12,8 +12,12 @@
 #ifndef MLOPS_FBLA_TENSORS_MMA_CUH
 #define MLOPS_FBLA_TENSORS_MMA_CUH
 
+#ifdef __CUDACC_RTC__
+#include <cuda/std/utility>
+#else
 #include <cstdint>
 #include <utility>
+#endif
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
 #define MLOPS_FBLA_TC75 1
@@ -23,6 +27,11 @@
 #endif
 
 namespace mlops_fbla_detail {
+#ifdef __CUDACC_RTC__
+namespace sequence = cuda::std;
+#else
+namespace sequence = std;
+#endif
 namespace tc {
 
 __device__ __forceinline__ uint32_t smem_u32(const void *p) { return (uint32_t)__cvta_generic_to_shared(p); }
@@ -32,10 +41,10 @@ template <int I> struct ic {
   static constexpr int value = I;
   __host__ __device__ constexpr operator int() const { return I; }
 };
-template <class F, int... I> __device__ __forceinline__ void unroll_seq(F &&f, std::integer_sequence<int, I...>) {
+template <class F, int... I> __device__ __forceinline__ void unroll_seq(F &&f, sequence::integer_sequence<int, I...>) {
   (f(ic<I>{}), ...);
 }
-template <int N, class F> __device__ __forceinline__ void unroll(F &&f) { unroll_seq(f, std::make_integer_sequence<int, N>{}); }
+template <int N, class F> __device__ __forceinline__ void unroll(F &&f) { unroll_seq(f, sequence::make_integer_sequence<int, N>{}); }
 
 #ifdef MLOPS_FBLA_TC75
 template <int OFF = 0> __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], uint32_t addr) {

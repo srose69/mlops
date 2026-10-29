@@ -50,9 +50,20 @@
 #ifndef MLOPS_FBLA_H
 #define MLOPS_FBLA_H
 
+#ifdef __CUDACC_RTC__
+#include <cuda/std/cstdint>
+using cuda::std::uint8_t;
+using cuda::std::uint16_t;
+using cuda::std::uint32_t;
+using cuda::std::uint64_t;
+using cuda::std::int32_t;
+using cuda::std::int64_t;
+typedef struct CUstream_st *cudaStream_t;
+#else
 #include <stddef.h>
 #include <stdint.h>
 #include <cuda_runtime.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -120,6 +131,20 @@ size_t mlops_fbla_images_bytes(const mlops_fbla_config *cfg);
 mlops_fbla_status mlops_fbla_prefill(const mlops_fbla_config *cfg, int count, const uint16_t *q,
                                      const uint16_t *k, const uint16_t *v, const mlops_fbla_cache *cache,
                                      uint16_t *output, cudaStream_t stream);
+
+/* Prefill with the chunk's start and count in device memory, read when the kernels run: launches that depend on
+ * neither, for CUDA graphs and programs queued ahead of the host, as mlops_fbla_prefill otherwise.  The chunk starts
+ * at *length + cfg->tokens and holds *count tokens (both int, device, 4-byte aligned).  max_count (> 0, the chunk's
+ * ceiling) sizes every launch and sets the buffers: q / k / v / output [batch, heads, max_count, 128] BF16, the chunk
+ * their first *count positions.  cfg->capacity (> 0) with cfg->tokens + max_count <= capacity.  The counts' bounds
+ * (1 .. max_count, *length + *count <= capacity) are the caller's; nothing checks them.  Where the prefill runs on
+ * tensor cores (mlops_fbla_images_bytes) q non-null needs the cache's tc_images, and the cache must already hold an
+ * image of every group it holds closed: the launches, sized by the ceiling, transcode only the chunk's own groups --
+ * an image is built by the call that closes its group with q non-null (a prefilling engine's every chunk), and a
+ * group closed without one (q null) keeps none until a plain mlops_fbla_prefill with q passes over it. */
+mlops_fbla_status mlops_fbla_prefill_at(const mlops_fbla_config *cfg, const int *length, const int *count, int max_count,
+                                        const uint16_t *q, const uint16_t *k, const uint16_t *v,
+                                        const mlops_fbla_cache *cache, uint16_t *output, cudaStream_t stream);
 
 /* Decode and the one-token append with the cache's length in device memory, read when the kernels run: launches that
  * do not depend on it, for CUDA graphs and programs queued ahead of the host.  The length is *length (int, device,

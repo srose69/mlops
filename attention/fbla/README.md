@@ -85,8 +85,8 @@ delta_o = o_full - o_coarse.
 ```
 
 The next item's records and metadata are fetched before the current item is evaluated. Corrections are reduced
-per CTA. The last CTA, detected by a per-head counter after `__threadfence`, combines both passes and writes
-BF16 output; a separate fourth launch is unnecessary.
+per CTA. A fourth merge pass combines coarse partials and refinement corrections in a fixed order and writes
+BF16 output. Each merge CTA owns 16 channels of one query row.
 
 ## Prefill
 
@@ -94,6 +94,12 @@ BF16 output; a separate fourth launch is unnecessary.
 `close_kernel` quantizes the groups the chunk closes, writing the encoder's bytes bit for bit. The attention
 runs on tensor cores on sm_75 .. sm_89 and on DP4A elsewhere. `finish_kernel` updates the sink and the open
 group.
+
+`mlops_fbla_prefill_at` is the same prefill with the chunk's start and count in device memory: every launch is
+sized by the chunk's ceiling alone (any start, any count up to it), the kernels exiting on the device values, so
+CUDA graphs and programs queued ahead of the host run the chunks without the host knowing either. Where the
+attention runs on tensor cores, q non-null needs the cache's persistent `tc_images` (the per-call tiles of the
+plain call depend on the start's groups).
 
 Prefill is compute-bound, so it reads every closed group through its full codes `c 2^FB + f` (every block
 refined); the output does not depend on the mode.
@@ -179,8 +185,13 @@ mostly from L2), with its own refinement list.
   and the final cross-warp merge; the query buffer aliases the merge buffer because their lifetimes do not
   overlap.
 * GQA 4 has separate coarse/refine kernels. They process two queries at a time over the same code registers;
-  query-indexed `(m,l,o)` and group state live in warp-local shared slots, which keeps two CTAs resident without
-  spilling.
+  query-indexed `(m,l,o)` and group state live in warp-local shared slots to reduce register pressure.
+  Actual residency and spills depend on the architecture, compiler and enclosing executor.
+* A single-slice refinement uses a two-entry prefix buffer instead of reserving the maximum 4097 entries.
+  Its standalone kernel and work-item plan select the same storage specialization from the scratch layout.
+* Coarse CTAs beyond the actual units, and single-slice refinement CTAs beyond the selected items, publish
+  neutral partials without loading Q or initializing the mainloop's shared storage. The grid and the reduction
+  order stay fixed, including when the cache length resides on the device.
 * Special-register values used once per group are reread through volatile PTX instead of being kept live
   across the loop. Streamed record loads are volatile so ptxas cannot sink the prefetch past the computation it
   is meant to overlap.

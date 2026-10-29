@@ -24,7 +24,11 @@ __device__ __forceinline__ float lo_bf16(uint32_t w) { return __uint_as_float(w 
 __device__ __forceinline__ float hi_bf16(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
 __device__ __forceinline__ float bf16_half(uint32_t w, int e) { return e ? hi_bf16(w) : lo_bf16(w); }
 // KM / VM: shared memory (the slot, sm_80+) or global (the image, sm_75)
-__device__ __forceinline__ uint4 meta128(const uint8_t *p) { return *reinterpret_cast<const uint4 *>(p); }
+template <class Pos, bool Shared>
+__device__ __forceinline__ uint4 meta128(const uint8_t *p) {
+  if constexpr (Shared) return *reinterpret_cast<const uint4 *>(p);
+  else return InputLoad<Pos>::get(reinterpret_cast<const uint4 *>(p));
+}
 
 // 0, data-dependent on b: min(|b|, +0) is +0 for every bit pattern (one FMNMX)
 __device__ __forceinline__ int zero_of(uint32_t b) {
@@ -37,19 +41,21 @@ __device__ __forceinline__ float q_half(uint32_t w, int e, int zk) {  // BF16 ha
 }
 
 // q rows g and g + 8 (row0, row1), lane t's words 4 c + t
+template <class Pos = Grid>
 __device__ __forceinline__ void q_load(uint32_t (&q)[2][16], const uint16_t *row0, const uint16_t *row1, int t) {
   const uint32_t *p0 = reinterpret_cast<const uint32_t *>(row0) + t, *p1 = reinterpret_cast<const uint32_t *>(row1) + t;
-  unroll<16>([&](auto c) { q[0][c] = __ldg(p0 + 4 * c); q[1][c] = __ldg(p1 + 4 * c); });
+  unroll<16>([&](auto c) { q[0][c] = Pos::ro(p0 + 4 * c); q[1][c] = Pos::ro(p1 + 4 * c); });
 }
 
 // ---- q-hat: quant_p1<0 .. 3>, quant_scale, quant_p2<0 .. 3> in this order -----------------------------------------
 // km = KM + 48 t (record (KS, t) at + 192 KS: 8 FP32 steps, 8 BF16 bases).  Each step's loads and q unpacks wait for the
 // previous step through zk (else LICM hoists the unpacks out of the group loop and ptxas merges pass 2's loads into
 // pass 1's).  Pass 1: max|z| (am) and q . base (qp, two chains a row).
-template <int KS>
+template <int KS, class Pos, bool Shared>
 __device__ __forceinline__ void quant_p1(const uint32_t (&q)[2][16], const uint8_t *&km, int &zk, float (&am)[2], float (&qp)[2][2]) {
   km += zk;
-  const uint4 s0 = meta128(km + 192 * KS), s1 = meta128(km + 192 * KS + 16), bw = meta128(km + 192 * KS + 32);
+  const uint4 s0 = meta128<Pos, Shared>(km + 192 * KS), s1 = meta128<Pos, Shared>(km + 192 * KS + 16),
+              bw = meta128<Pos, Shared>(km + 192 * KS + 32);
   const uint32_t st[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w}, b[4] = {bw.x, bw.y, bw.z, bw.w};
   unroll<2>([&](auto r) {
     float az[8];
@@ -92,10 +98,10 @@ __device__ __forceinline__ void quant_scale(int &zk, float sl, float (&am)[2], c
   zk = zero_of(__float_as_uint(rq[0]) | __float_as_uint(rq[1]));
 }
 // Pass 2: the s8 A fragment of k step KS (z recomputed), qa[2 h + r] = row r's bytes of channels j = 2 h, 2 h + 1
-template <int KS>
+template <int KS, class Pos, bool Shared>
 __device__ __forceinline__ void quant_p2(const uint32_t (&q)[2][16], const uint8_t *&km, int &zk, const float (&rq)[2], uint32_t (&qa)[4]) {
   km += zk;
-  const uint4 s0 = meta128(km + 192 * KS), s1 = meta128(km + 192 * KS + 16);
+  const uint4 s0 = meta128<Pos, Shared>(km + 192 * KS), s1 = meta128<Pos, Shared>(km + 192 * KS + 16);
   const uint32_t st[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
   unroll<2>([&](auto h) {
     unroll<2>([&](auto r) {
@@ -110,13 +116,14 @@ __device__ __forceinline__ void quant_p2(const uint32_t (&q)[2][16], const uint8
   });
   zk = zero_of(qa[0] | qa[1] | qa[2] | qa[3]);
 }
+template <class Pos>
 __device__ __forceinline__ void quantize(const uint32_t (&q)[2][16], const uint8_t *km, float sl, uint32_t (&qa)[4][4], float (&sq)[2],
                                          float (&qb)[2]) {
   float qp[2][2] = {{0.f, 0.f}, {0.f, 0.f}}, am[2] = {0.f, 0.f}, rq[2];
   int zk = 0;
-  unroll<4>([&](auto ks) { quant_p1<decltype(ks)::value>(q, km, zk, am, qp); });
+  unroll<4>([&](auto ks) { quant_p1<decltype(ks)::value, Pos, false>(q, km, zk, am, qp); });
   quant_scale(zk, sl, am, qp, rq, sq, qb);
-  unroll<4>([&](auto ks) { quant_p2<decltype(ks)::value>(q, km, zk, rq, qa[ks]); });
+  unroll<4>([&](auto ks) { quant_p2<decltype(ks)::value, Pos, false>(q, km, zk, rq, qa[ks]); });
 }
 
 // ---- QK -------------------------------------------------------------------------------------------------------
@@ -226,10 +233,10 @@ __device__ __forceinline__ void p128_weight(const uint32_t (&mx)[2], const float
 // ---- PV and the fold -----------------------------------------------------------------------------------------------
 // Microtile CB's fold: o += w (step acc - step MAGIC) + ws base, three FFMA an output, exact inner product (step BF16);
 // vm = VM + 16 t, record (CB, t) at + 64 CB.  Returns the OR of its outputs: the gate for the next microtiles.
-template <int CB>
+template <int CB, class Pos, bool Shared>
 __device__ __forceinline__ uint32_t fold_tile(float (&o)[16][4], const uint32_t (&acc)[2][4], const uint8_t *vm, const float (&w)[2],
                                               const float (&ws)[2]) {
-  const uint4 m = meta128(vm + 64 * CB);
+  const uint4 m = meta128<Pos, Shared>(vm + 64 * CB);
   const uint32_t bw[2] = {m.x, m.z}, sw[2] = {m.y, m.w};
   uint32_t u = 0;
   unroll<2>([&](auto j) {
@@ -244,7 +251,7 @@ __device__ __forceinline__ uint32_t fold_tile(float (&o)[16][4], const uint32_t 
 // PV of the group, microtile cb = channels 16 cb .. + 15 over the 4 V quarters (vt + VQ Q; vo = v_lane_off), then its
 // fold.  Microtile cb + 2's first IMMA wait for fold cb (B operand + zero: at most 16 accumulators live), microtile
 // cb + 3's loads too (vt + zero).  step(cb): work placed after microtile cb (the next group's q-hat).
-template <class F>
+template <class Pos, bool Shared, class F>
 __device__ __forceinline__ void pv_group(float (&o)[16][4], const uint32_t (&pa)[4][4], const float (&w)[2], const float (&ws)[2],
                                          uint32_t vt, uint32_t vo, const uint8_t *vm, F step) {
   constexpr int ILAG = 2, LAG = 3;
@@ -264,7 +271,7 @@ __device__ __forceinline__ void pv_group(float (&o)[16][4], const uint32_t (&pa)
         mma_u8u8(acc[1], pa[Q], v[2], v[3]);
       }
     });
-    u[CB] = fold_tile<CB>(o, acc, vm + z, w, ws);
+    u[CB] = fold_tile<CB, Pos, Shared>(o, acc, vm + z, w, ws);
     if constexpr (CB + 1 - ILAG >= 0 && CB < 7) zc = zero_of(u[CB + 1 - ILAG]);
     if constexpr (CB + 1 - LAG >= 0 && CB < 7) {
       z = zero_of(u[CB + 1 - LAG]);
@@ -275,6 +282,7 @@ __device__ __forceinline__ void pv_group(float (&o)[16][4], const uint32_t (&pa)
 }
 // One closed group for the warp's rows (kt, vt: the slot's K and V; vm = VM + 16 t; on[r]: the group is row r's), the
 // next group's q-hat (kmn = its KM + 48 t) under the PV: qa, sq, qb in this group's, out the next one's.
+template <class Pos>
 __device__ __forceinline__ void closed_group(float (&o)[16][4], float (&m)[2], float (&l)[2], const uint32_t (&q)[2][16], float sl,
                                              const uint8_t *kmn, const uint8_t *vm, uint32_t kt, uint32_t vt, uint32_t ko, uint32_t vo,
                                              const bool (&on)[2], uint32_t (&qa)[4][4], float (&sq)[2], float (&qb)[2]) {
@@ -292,12 +300,17 @@ __device__ __forceinline__ void closed_group(float (&o)[16][4], float (&m)[2], f
   float qp[2][2] = {{0.f, 0.f}, {0.f, 0.f}}, am[2] = {0.f, 0.f}, rq[2];
   int zk = 0;
   const uint8_t *km = kmn;
-  pv_group(o, pa, w, ws, vt, vo, vm, [&](auto cb) {
+#ifdef MLOPS_FBLA_TC80
+  constexpr bool Shared = true;
+#else
+  constexpr bool Shared = false;
+#endif
+  pv_group<Pos, Shared>(o, pa, w, ws, vt, vo, vm, [&](auto cb) {
     constexpr int CB = decltype(cb)::value;
-    if constexpr (CB < 4) quant_p1<CB>(q, km, zk, am, qp);
+    if constexpr (CB < 4) quant_p1<CB, Pos, Shared>(q, km, zk, am, qp);
     if constexpr (CB == 4) quant_scale(zk, sl, am, qp, rq, sq, qb);
-    if constexpr (CB >= 5) quant_p2<CB - 5>(q, km, zk, rq, qa[CB - 5]);
-    if constexpr (CB == 7) quant_p2<3>(q, km, zk, rq, qa[3]);
+    if constexpr (CB >= 5) quant_p2<CB - 5, Pos, Shared>(q, km, zk, rq, qa[CB - 5]);
+    if constexpr (CB == 7) quant_p2<3, Pos, Shared>(q, km, zk, rq, qa[3]);
   });
 }
 
@@ -310,7 +323,7 @@ __host__ __device__ constexpr uint32_t bf_off(int row, int chunk) { return row *
 
 // P in place of s (tokens > tlim[r] masked, tlim < 0: none), the block's maximum mb and sum sp
 __device__ __forceinline__ void exact_p(float (&s)[8][4], float sl, const int (&tlim)[2], int t, float (&mb)[2], float (&sp)[2]) {
-  float mx[2] = {-INFINITY, -INFINITY};
+  float mx[2] = {static_cast<float>(-INFINITY), static_cast<float>(-INFINITY)};
   unroll<8>([&](auto j) {
     unroll<4>([&](auto e) {
       const int r = e >> 1, tk = 8 * decltype(j)::value + 2 * t + (e & 1);

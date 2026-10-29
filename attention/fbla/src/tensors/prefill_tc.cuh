@@ -15,7 +15,11 @@
 #define MLOPS_FBLA_TENSORS_PREFILL_TC_CUH
 
 #include "fn.cuh"
+#ifdef __CUDACC_RTC__
+#include <cuda/std/climits>
+#else
 #include <climits>
+#endif
 
 namespace mlops_fbla_detail {
 namespace tc {
@@ -47,15 +51,15 @@ __device__ __forceinline__ void copy_group(uint32_t slot, const uint8_t *img, co
 #endif
 
 // tiles: group g of KV head bh at tiles + bh hstep + (g - toff) gstep (bytes)
-template <int GQA>
-__global__ void __launch_bounds__(THREADS, 1) prefill_tc_kernel(const PrefillArgs a, const uint8_t *tiles, size_t hstep, size_t gstep, int toff,
-                                                                float2 *part_ml, float *part_o) {
+template <int GQA, class Pos = Grid>
+__device__ __forceinline__ void prefill_tc_item(const PrefillArgs &a, const uint8_t *tiles, size_t hstep, size_t gstep, int toff,
+                                                float2 *part_ml, float *part_o, uint8_t *smem) {
 #ifdef MLOPS_FBLA_TC75
-  extern __shared__ __align__(128) uint8_t smem[];
-  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, t = lane & 3;
-  const int bq = blockIdx.y, bb = bq / a.q_heads, hq = bq - bb * a.q_heads;
+  const int tid = Pos::tid(), lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, t = lane & 3;
+  const int bq = Pos::y(), bb = bq / a.q_heads, hq = bq - bb * a.q_heads;
   const int bh = bb * a.kv_heads + (GQA ? hq / GQA : hq / a.qg);
-  const int n1 = a.n0 + a.count, gb = a.n0 / G + blockIdx.x;  // the CTA's own group
+  const int n0 = n0_of<Pos>(a), n1 = n0 + count_of<Pos>(a), gb = n0 / G + Pos::x();  // the CTA's own group
+  if (gb * G >= n1) return;  // (CTA-uniform)
   const float sl = a.scale_log2;
   const uint32_t s0 = smem_u32(smem);
 
@@ -63,18 +67,18 @@ __global__ void __launch_bounds__(THREADS, 1) prefill_tc_kernel(const PrefillArg
   int pos[2];
   unroll<2>([&](auto r) {
     pos[r] = gb * G + 16 * warp + g8 + 8 * r;
-    valid[r] = pos[r] >= a.n0 && pos[r] < n1;
+    valid[r] = pos[r] >= n0 && pos[r] < n1;
   });
   uint32_t q[2][16];
   {
     const uint16_t *qh = a.q + (size_t)bq * a.count * D;
-    q_load(q, qh + (size_t)min(max(pos[0] - a.n0, 0), a.count - 1) * D, qh + (size_t)min(max(pos[1] - a.n0, 0), a.count - 1) * D, t);
+    q_load<Pos>(q, qh + (size_t)min(max(pos[0] - n0, 0), a.count - 1) * D, qh + (size_t)min(max(pos[1] - n0, 0), a.count - 1) * D, t);
   }
-  float o[16][4], m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
+  float o[16][4], m[2] = {static_cast<float>(-INFINITY), static_cast<float>(-INFINITY)}, l[2] = {0.f, 0.f};
   unroll<16>([&](auto n) { unroll<4>([&](auto e) { o[n][e] = 0.f; }); });
 
   // ---- BF16 blocks (split piece 0): the sink's two (gb > 0), the own group's first and, if a row reaches it, second
-  const int z = blockIdx.z, nsplit = gridDim.z;
+  const int z = Pos::z(), nsplit = Pos::nz();
   if (z == 0) {
     const size_t eh = (size_t)bh * G * D, ih = (size_t)bh * a.count * D;
     const uint16_t *sink_k = a.c.exact_sink_k + eh, *sink_v = a.c.exact_sink_v + eh;
@@ -88,11 +92,11 @@ __global__ void __launch_bounds__(THREADS, 1) prefill_tc_kernel(const PrefillArg
       unroll<8>([&](auto k) {
         constexpr int X = decltype(k)::value >> 2;
         const int tk = (tid >> 4) + 16 * (decltype(k)::value & 3), pt = min(t0 + tk, n1 - 1);
-        const uint16_t *src = token_row(X ? sink_v : sink_k, X ? open_v : open_k, X ? in_v : in_k, a.n0, pt) + 8 * c;
+        const uint16_t *src = token_row(X ? sink_v : sink_k, X ? open_v : open_k, X ? in_v : in_k, n0, pt) + 8 * c;
 #ifdef MLOPS_FBLA_TC80
         cp_async16(smem_u32(sl8) + X * KT + bf_off(tk, c), src);
 #else
-        *reinterpret_cast<uint4 *>(sl8 + X * KT + bf_off(tk, c)) = __ldg(reinterpret_cast<const uint4 *>(src));
+        *reinterpret_cast<uint4 *>(sl8 + X * KT + bf_off(tk, c)) = Pos::ro(reinterpret_cast<const uint4 *>(src));
 #endif
       });
 #ifdef MLOPS_FBLA_TC80
@@ -139,7 +143,7 @@ __global__ void __launch_bounds__(THREADS, 1) prefill_tc_kernel(const PrefillArg
     if (warp < min(ng, 2)) copy_group(s0 + SLOT * warp, img0 + warp * gstep, warp + 1 < ng ? img0 + (warp + 1) * gstep : nullptr, lane);
 #else
     for (int i = tid; i < min(ng, 2) * SLOT / 16; i += THREADS)
-      reinterpret_cast<uint4 *>(smem)[i] = __ldg(reinterpret_cast<const uint4 *>(img0 + (i / (SLOT / 16)) * gstep) + i % (SLOT / 16));
+      reinterpret_cast<uint4 *>(smem)[i] = Pos::ro(reinterpret_cast<const uint4 *>(img0 + (i / (SLOT / 16)) * gstep) + i % (SLOT / 16));
     __syncthreads();
     auto meta_pf = [&](int jk, int jv) {  // KM of group jk, VM of jv into L1 (6 + 4 lines)
       if (lane < 6 && jk < ng) prefetch_l1(img0 + jk * gstep + O_KM + 128 * lane);
@@ -149,7 +153,7 @@ __global__ void __launch_bounds__(THREADS, 1) prefill_tc_kernel(const PrefillArg
 #endif
     uint32_t qa[4][4];
     float sq[2], qb[2];
-    quantize(q, img0 + O_KM + 48 * t, sl, qa, sq, qb);
+    quantize<Pos>(q, img0 + O_KM + 48 * t, sl, qa, sq, qb);
     for (int j = 0; j < ng; ++j) {
       const uint8_t *im = img0 + j * gstep;
       const uint32_t kt = s0 + SLOT * (j & 1);
@@ -166,7 +170,7 @@ __global__ void __launch_bounds__(THREADS, 1) prefill_tc_kernel(const PrefillArg
       const uint8_t *kmn = j + 1 < ng ? im + gstep + O_KM : im + O_KM, *vmj = im + O_VM;
       meta_pf(j + 2, j + 1);
 #endif
-      closed_group(o, m, l, q, sl, kmn + 48 * t, vmj + 16 * t, kt, kt + O_V, ko, vo, on, qa, sq, qb);
+      closed_group<Pos>(o, m, l, q, sl, kmn + 48 * t, vmj + 16 * t, kt, kt + O_V, ko, vo, on, qa, sq, qb);
 #ifdef MLOPS_FBLA_TC80
       if (j + 2 < ng) {
         const uint32_t e = BAR_EMPTY + (j & 1);
@@ -183,7 +187,7 @@ __global__ void __launch_bounds__(THREADS, 1) prefill_tc_kernel(const PrefillArg
       if (j + 1 < ng) __syncthreads();  // group j + 1 published, slot j & 1 free
       if (j + 2 < ng) {
         uint4 x[SLOT / 16 / THREADS];
-        unroll<SLOT / 16 / THREADS>([&](auto k) { x[k] = __ldg(reinterpret_cast<const uint4 *>(im + 2 * gstep) + tid + THREADS * k); });
+        unroll<SLOT / 16 / THREADS>([&](auto k) { x[k] = Pos::ro(reinterpret_cast<const uint4 *>(im + 2 * gstep) + tid + THREADS * k); });
         unroll<SLOT / 16 / THREADS>([&](auto k) { reinterpret_cast<uint4 *>(smem + SLOT * (j & 1))[tid + THREADS * k] = x[k]; });
       }
 #endif
@@ -194,29 +198,37 @@ __global__ void __launch_bounds__(THREADS, 1) prefill_tc_kernel(const PrefillArg
   unroll<2>([&](auto r) {
     if (!valid[r]) return;
     const float inv = l[r] > 0.f ? 1.f / l[r] : 0.f;
-    const int i = pos[r] - a.n0;
+    const int i = pos[r] - n0;
     if (nsplit == 1) {
       uint32_t *dst = reinterpret_cast<uint32_t *>(a.out + ((size_t)bq * a.count + i) * D) + t;
       unroll<16>([&](auto n) { dst[4 * n] = to_bf16(o[n][2 * r] * inv) | (uint32_t)to_bf16(o[n][2 * r + 1] * inv) << 16; });
     } else {
-      const size_t pr = ((size_t)z * gridDim.y + bq) * a.count + i;  // [piece][q head][position]
+      const size_t pr = ((size_t)z * Pos::ny() + bq) * a.count + i;  // [piece][q head][position]
       if (t == 0) part_ml[pr] = make_float2(m[r], l[r]);
       float2 *dst = reinterpret_cast<float2 *>(part_o + pr * D) + t;
       unroll<16>([&](auto n) { dst[4 * n] = make_float2(o[n][2 * r] * inv, o[n][2 * r + 1] * inv); });
     }
   });
+#endif  // MLOPS_FBLA_TC75
+}
+template <int GQA>
+__global__ void __launch_bounds__(THREADS, 1) prefill_tc_kernel(const PrefillArgs a, const uint8_t *tiles, size_t hstep, size_t gstep, int toff,
+                                                                float2 *part_ml, float *part_o) {
+#ifdef MLOPS_FBLA_TC75
+  extern __shared__ __align__(128) uint8_t smem[];
+  prefill_tc_item<GQA, Grid>(a, tiles, hstep, gstep, toff, part_ml, part_o, smem);
 #endif
 }
 
 // Split pieces merged: o = sum_s w_s o_s / sum_s w_s, w_s = l_s 2^(m_s - M); 8 channels a thread, nsplit <= 8
-template <int = 0>
-__global__ void __launch_bounds__(256) merge_kernel(const PrefillArgs a, const float2 *part_ml, const float *part_o, int nsplit) {
+template <class Pos = Grid>
+__device__ __forceinline__ void merge_item(const PrefillArgs &a, const float2 *part_ml, const float *part_o, int nsplit) {
   constexpr int MAXS = 8;
-  const int heads = gridDim.y, bq = blockIdx.y, i = blockIdx.x * 16 + (threadIdx.x >> 4), c = threadIdx.x & 15;
-  if (i >= a.count) return;
+  const int heads = Pos::ny(), bq = Pos::y(), i = Pos::x() * 16 + (Pos::tid() >> 4), c = Pos::tid() & 15;
+  if (i >= count_of<Pos>(a)) return;
   const size_t hs = (size_t)heads * a.count, r0 = (size_t)bq * a.count + i;
   float2 ml[MAXS];
-  unroll<MAXS>([&](auto s) { ml[s] = s < nsplit ? part_ml[r0 + s * hs] : make_float2(-INFINITY, 0.f); });
+  unroll<MAXS>([&](auto s) { ml[s] = s < nsplit ? InputLoad<Pos>::get(part_ml + r0 + s * hs) : make_float2(-INFINITY, 0.f); });
   float M = ml[0].x;
   unroll<MAXS - 1>([&](auto s) { M = fmaxf(M, ml[s + 1].x); });
   float acc[8] = {}, L = 0.f;
@@ -224,7 +236,7 @@ __global__ void __launch_bounds__(256) merge_kernel(const PrefillArgs a, const f
     const float w = ml[s].y > 0.f ? ml[s].y * ex2(ml[s].x - M) : 0.f;
     if (w > 0.f) {
       const float4 *p = reinterpret_cast<const float4 *>(part_o + (r0 + s * hs) * D) + 2 * c;
-      const float4 x0 = p[0], x1 = p[1];
+      const float4 x0 = InputLoad<Pos>::get(p), x1 = InputLoad<Pos>::get(p + 1);
       const float x[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
       unroll<8>([&](auto k) { acc[k] = fmaf(w, x[k], acc[k]); });
     }
@@ -234,6 +246,10 @@ __global__ void __launch_bounds__(256) merge_kernel(const PrefillArgs a, const f
   uint32_t ow[4];
   unroll<4>([&](auto k) { ow[k] = to_bf16(acc[2 * k] * inv) | (uint32_t)to_bf16(acc[2 * k + 1] * inv) << 16; });
   reinterpret_cast<uint4 *>(a.out + r0 * D)[c] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
+}
+template <int = 0>
+__global__ void __launch_bounds__(256) merge_kernel(const PrefillArgs a, const float2 *part_ml, const float *part_o, int nsplit) {
+  merge_item<Grid>(a, part_ml, part_o, nsplit);
 }
 
 }  // namespace tc

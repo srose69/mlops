@@ -3,8 +3,14 @@
 #ifndef MLOPS_FBLA_COMMON_CUH
 #define MLOPS_FBLA_COMMON_CUH
 
-#include "mlops_fbla.h"
+#include "../../include/mlops_fbla.h"
+#ifndef __CUDACC_RTC__  // (the host pass: the work-item plan builders, mlops_fbla_items.h)
+#include "../../include/mlops_fbla_items.h"
+#include <cstdio>
+#include <cstring>
+#include <type_traits>
 #include <cstdint>
+#endif
 
 namespace mlops_fbla_detail {
 
@@ -53,35 +59,43 @@ struct PrefillArgs {
   const uint16_t *q;      // [batch, q_heads, count, 128] BF16, or null (append only)
   const uint16_t *k, *v;  // [batch, kv_heads, count, 128] BF16: the chunk's tokens
   uint16_t *out;          // [batch, q_heads, count, 128] BF16
-  const int *length;  // null, or a length in device memory: the chunk starts at *length + n0 (close_kernel,
-                      // finish_kernel; the attention kernels run with null only)
-  int batch, q_heads, kv_heads, qg, n0, count;
+  const int *length;  // null, or a length in device memory: the chunk starts at *length + n0
+  int batch, q_heads, kv_heads, qg, n0, count;  // count: the chunk's tokens, or its ceiling when dcount is set
+                                                // (the buffers' stride between heads and rows)
   int hs, gs;  // units between consecutive KV heads and groups, as Args
   float scale_log2;
+  const int *dcount;  // null, or the chunk's token count in device memory (mlops_fbla_prefill_at: the launches
+                      // sized by count, the ceiling, the extra CTAs exiting on *dcount)
 };
 
 // The cache length, read where it is used (a parameter, or one load of the device length through Pos::ro -- the
 // position policy's, fbla_kernels.cuh): not kept live through the kernels' loops.
 template <class Pos> __device__ __forceinline__ int tokens_of(const Args &a) { return a.length ? Pos::ro(a.length) + a.tokens : a.tokens; }
 template <class Pos> __device__ __forceinline__ int n0_of(const PrefillArgs &a) { return a.length ? Pos::ro(a.length) + a.n0 : a.n0; }
+template <class Pos> __device__ __forceinline__ int count_of(const PrefillArgs &a) { return a.dcount ? Pos::ro(a.dcount) : a.count; }
 
 // instantiated per format in fbla_inst.cu (one object each); fbla.cu sees only these declarations
 template <int CB, int FB> cudaError_t launch(const Args &, int bound, cudaStream_t);
 template <int CB, int FB> cudaError_t launch_prefill(const PrefillArgs &, cudaStream_t);
+template <int CB, int FB> cudaError_t launch_prefill_at(const PrefillArgs &, cudaStream_t);
 template <int CB, int FB> cudaError_t launch_append(const PrefillArgs &, cudaStream_t);
 struct QkvArgs;
 template <int CB, int FB> cudaError_t launch_qkv(const QkvArgs &, cudaStream_t);
 bool prefill_tc_device();
-// For a program that runs the passes' items itself (fbla_kernels.cuh, fbla_qkv.cuh): the Args of a decode and the
-// QkvArgs of a step's input, checked and prepared as mlops_fbla_decode_at / mlops_fbla_qkv_at prepare them -- the layout
-// of cfg->capacity (> 0), the length *length + cfg->tokens or, length null, cfg->tokens (Args.tokens, QkvArgs.p.n0: the
-// program sets them per step).  decode_args: the coarse and refine passes over per_head (>= 1) CTAs per KV head, the
-// scratch (decode_scratch_bytes of the same per_head) laid out for them.  Errors: mlops_fbla_last_error().
+// For a program that runs the items itself: Args of a decode and QkvArgs of a step, prepared as
+// mlops_fbla_decode_at / mlops_fbla_qkv_at do (capacity layout, length *length + cfg->tokens or cfg->tokens).
+// decode_args: per_head (>= 1) CTAs per KV head, scratch sized by decode_scratch_bytes.  Errors: mlops_fbla_last_error().
 size_t decode_scratch_bytes(const mlops_fbla_config *cfg, int per_head);
 mlops_fbla_status decode_args(const mlops_fbla_config *cfg, const int *length, const uint16_t *q, const mlops_fbla_cache *cache,
                               uint16_t *output, void *scratch, size_t scratch_bytes, int per_head, Args &a);
 mlops_fbla_status qkv_args(const mlops_fbla_config *cfg, const int *length, const mlops_fbla_token *token, const mlops_fbla_cache *cache,
-                           QkvArgs &a);  // the prefill's attention runs on tensor cores here (any head ratio), else on DP4A (1, 2, 4)
+                           QkvArgs &a);
+#ifndef __CUDACC_RTC__
+// the work-item plan builders (fbla_kernels.cuh, fbla_prefill.cuh, fbla_qkv.cuh; instantiated per format)
+template <int CB, int FB> int decode_passes(const Args &, const void *scratch, mlops_fbla_items *, int);
+template <int CB, int FB> int prefill_at_passes(const PrefillArgs &, bool append, mlops_fbla_items *, int);
+template <int CB, int FB> int qkv_passes(const QkvArgs &, mlops_fbla_items *, int);
+#endif  // the prefill's attention runs on tensor cores here (any head ratio), else on DP4A (1, 2, 4)
 // mlops_fbla_cache.tc_images: a slot per unit (head and group, by hs and gs): the image of IMAGE_BYTES
 // (tensors/transcode.cuh TGB), then a uint32 flag (nonzero: the image is the group's records'), 128-byte aligned
 constexpr size_t IMAGE_BYTES = 34048, IMAGE_SLOT = IMAGE_BYTES + 128;

@@ -4,9 +4,11 @@
 // of one pair in both arithmetics. Header-only and free of the kernel's layout, so fused kernels (attention,
 // cache writes) rotate in registers with the same bits as mlops_rope.
 #pragma once
+#ifndef __CUDACC_RTC__
 #include <cstdint>
+#endif
 #include <cuda_fp16.h>
-#include "mlops_rope.h"
+#include "../../include/mlops_rope.h"
 
 namespace mlops_rope_detail {
 

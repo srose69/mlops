@@ -30,9 +30,16 @@
 #ifndef MLOPS_ROPE_H
 #define MLOPS_ROPE_H
 
+#ifdef __CUDACC_RTC__
+#include <cuda/std/cstdint>
+using cuda::std::int32_t;
+using cuda::std::int64_t;
+typedef struct CUstream_st *cudaStream_t;
+#else
 #include <stddef.h>
 #include <stdint.h>
 #include <cuda_runtime.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {

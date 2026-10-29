@@ -42,31 +42,31 @@ template <int BITS> __host__ __device__ constexpr int v_slot_of(int c, int u) {
   while (v_channel<BITS>(s) != c || v_quad<BITS>(s) != u) ++s;
   return s;
 }
-__device__ __forceinline__ uint2 ld64(const uint8_t *p) { return __ldg(reinterpret_cast<const uint2 *>(p)); }
+template <class Pos> __device__ __forceinline__ uint2 ld64(const uint8_t *p) { return Pos::ro(reinterpret_cast<const uint2 *>(p)); }
 // a record lane's words: p = record + 16 l; p3 (3-bit low words) = record + 16 (l % 16) + 8 (l / 16) (K), + 8 l (V)
-template <int BITS> __device__ __forceinline__ void rec_k(Codes<BITS> &c, const uint8_t *p, const uint8_t *p3) {
-  const uint4 a = ld128<Grid>(p);
+template <int BITS, class Pos> __device__ __forceinline__ void rec_k(Codes<BITS> &c, const uint8_t *p, const uint8_t *p3) {
+  const uint4 a = ld128<Pos>(p);
   c.w[0] = a.x; c.w[1] = a.y; c.w[2] = a.z; c.w[3] = a.w;
-  if constexpr (BITS == 4) { const uint4 b = ld128<Grid>(p + 512); c.w[4] = b.x; c.w[5] = b.y; c.w[6] = b.z; c.w[7] = b.w; }
-  if constexpr (BITS == 3) { const uint2 b = ld64(p3 + 1024); c.w[4] = b.x; c.w[5] = b.y; }
+  if constexpr (BITS == 4) { const uint4 b = ld128<Pos>(p + 512); c.w[4] = b.x; c.w[5] = b.y; c.w[6] = b.z; c.w[7] = b.w; }
+  if constexpr (BITS == 3) { const uint2 b = ld64<Pos>(p3 + 1024); c.w[4] = b.x; c.w[5] = b.y; }
 }
-template <int BITS> __device__ __forceinline__ void rec_v(Codes<BITS> &c, const uint8_t *p, const uint8_t *p3) {
-  const uint4 a = ld128<Grid>(p + (BITS == 4 ? 1024 : 512));
+template <int BITS, class Pos> __device__ __forceinline__ void rec_v(Codes<BITS> &c, const uint8_t *p, const uint8_t *p3) {
+  const uint4 a = ld128<Pos>(p + (BITS == 4 ? 1024 : 512));
   c.w[0] = a.x; c.w[1] = a.y; c.w[2] = a.z; c.w[3] = a.w;
-  if constexpr (BITS == 4) { const uint4 b = ld128<Grid>(p + 1536); c.w[4] = b.x; c.w[5] = b.y; c.w[6] = b.z; c.w[7] = b.w; }
-  if constexpr (BITS == 3) { const uint2 b = ld64(p3 + 1280); c.w[4] = b.x; c.w[5] = b.y; }
+  if constexpr (BITS == 4) { const uint4 b = ld128<Pos>(p + 1536); c.w[4] = b.x; c.w[5] = b.y; c.w[6] = b.z; c.w[7] = b.w; }
+  if constexpr (BITS == 3) { const uint2 b = ld64<Pos>(p3 + 1280); c.w[4] = b.x; c.w[5] = b.y; }
 }
 
 // Sub-block j's K and V (coarse record rc, fine rf) into the shared image.  K lane l: token 16 j + l % 16, chunk cc
 // of its channel half = slots 4 cc, + 2, + 1, + 3 in KPERM order (two PRMT a word; stores conflict-free).  V lane l:
 // channels 4 l + cc, row 4 l + cc of quarter j / 2.
-template <int CB, int FB>
+template <int CB, int FB, class Pos>
 __device__ __forceinline__ void decode_sub_block(uint8_t *img, const uint8_t *rc, const uint8_t *rf, int j, int l) {
   const uint8_t *pc = rc + 16 * l, *pf = rf + 16 * l;
   const int k3 = 16 * (l & 15) + 8 * (l >> 4);  // (3-bit planes only)
   {
     Codes<CB> c; Codes<FB> f;
-    rec_k<CB>(c, pc, rc + k3); rec_k<FB>(f, pf, rf + k3);
+    rec_k<CB, Pos>(c, pc, rc + k3); rec_k<FB, Pos>(f, pf, rf + k3);
     uint32_t kc[16];
     unroll<16>([&](auto s) { kc[s] = k_code<CB, FB>(c, f, s); });
     const int row = 16 * j + k_row(l & 15), hh = l >> 4;
@@ -79,7 +79,7 @@ __device__ __forceinline__ void decode_sub_block(uint8_t *img, const uint8_t *rc
   }
   {
     Codes<CB> c; Codes<FB> f;
-    rec_v<CB>(c, pc, rc + 8 * l); rec_v<FB>(f, pf, rf + 8 * l);
+    rec_v<CB, Pos>(c, pc, rc + 8 * l); rec_v<FB, Pos>(f, pf, rf + 8 * l);
     uint8_t *base = img + O_V + (j >> 1) * VQ + 128 * l + (((j ^ l) & 1) << 4);
     unroll<4>([&](auto cc) {
       constexpr int CC = decltype(cc)::value;
@@ -92,38 +92,47 @@ __device__ __forceinline__ void decode_sub_block(uint8_t *img, const uint8_t *rc
 
 // Metadata chunk i (0 .. 79) from the cache metadata mw (256 words): i < 32 KM steps (FP32) of record i % 16, chunk
 // i / 16; i < 48 its bases; then VM record i - 48
-__device__ __forceinline__ uint4 meta_chunk(const uint32_t *mw, int i) {
+template <class Pos> __device__ __forceinline__ uint4 meta_chunk(const uint32_t *mw, int i) {
   const int r = i & 15, c = i < 32 ? 32 * (r >> 2) + 16 * (i >> 4) + 2 * (r & 3)  // KM steps, j = 2 p, 2 p + 1
                           : i < 48 ? 32 * (r >> 2) + 2 * (r & 3)                   // KM bases, j = 0 .. 3
                                    : 128 + 16 * ((i - 48) >> 2) + 2 * (i & 3);     // VM (cb, t)
   const uint32_t *p = mw + 4 * (c >> 2) + ((c >> 1) & 1);
   if (i < 32) {
-    const uint32_t s0 = __ldg(p + 2), s1 = __ldg(p + 10);
+    const uint32_t s0 = Pos::ro(p + 2), s1 = Pos::ro(p + 10);
     return make_uint4(s0 << 16, s0 & 0xffff0000u, s1 << 16, s1 & 0xffff0000u);
   }
-  if (i < 48) return make_uint4(__ldg(p), __ldg(p + 8), __ldg(p + 16), __ldg(p + 24));
-  return make_uint4(__ldg(p), __ldg(p + 2), __ldg(p + 8), __ldg(p + 10));
+  if (i < 48) return make_uint4(Pos::ro(p), Pos::ro(p + 8), Pos::ro(p + 16), Pos::ro(p + 24));
+  return make_uint4(Pos::ro(p), Pos::ro(p + 2), Pos::ro(p + 8), Pos::ro(p + 10));
 }
 
-// Group g = 1 + blockIdx.x of KV head blockIdx.y to tiles + bh hstep + (g - toff) gstep.  flagged (persistent images:
-// the slot's word after the image; close_kernel clears it): a group whose flag is set is skipped, a transcoded one sets it.
-template <int CB, int FB>
-__global__ void __launch_bounds__(XT) transcode_kernel(const PrefillArgs a, uint8_t *tiles, size_t hstep, size_t gstep, int toff, bool flagged) {
+// Group g = g_end - 1 - blockIdx.x (the chunk's newest closed group first, g_end = the last position's group) of KV head
+// blockIdx.y to tiles + bh hstep + (g - toff) gstep: the grid covers the chunk's own closed groups -- count/G + 2 from
+// g_end whatever the chunk's start -- and needs no launch sized by the start.  flagged (persistent images: the slot's
+// word after the image; close_kernel clears it): a group whose flag is set is skipped, a transcoded one sets it.
+template <int CB, int FB, class Pos = Grid>
+__device__ __forceinline__ void transcode_item(const PrefillArgs &a, uint8_t *tiles, size_t hstep, size_t gstep, int toff, bool flagged,
+                                               uint8_t *img) {
   constexpr int RC = record_bytes<CB>(), RF = record_bytes<FB>();
-  __shared__ __align__(128) uint8_t img[KT + VT];
-  const int tid = threadIdx.x, lane = tid & 31, j = tid >> 5, bh = blockIdx.y, g = 1 + blockIdx.x;
+  const int tid = Pos::tid(), lane = tid & 31, j = tid >> 5, bh = Pos::y();
+  const int g = (n0_of<Pos>(a) + count_of<Pos>(a) - 1) / G - 1 - Pos::x();  // (CTA-uniform bounds below)
+  if (g < 1) return;
   const size_t hg = (size_t)bh * a.hs + (size_t)g * a.gs;
   uint8_t *slot = tiles + bh * hstep + (g - toff) * gstep;
   uint32_t *flag = reinterpret_cast<uint32_t *>(slot + TGB);
-  if (flagged && *flag) return;  // (CTA-uniform)
+  if (flagged && Pos::ro(flag)) return;  // (CTA-uniform)
   uint4 *dst = reinterpret_cast<uint4 *>(slot);
   if (tid < (KMB + VMB) / 16)
     dst[O_KM / 16 + (tid < KMB / 16 ? 3 * (tid & 15) + (tid >> 4) : tid)] =
-        meta_chunk(reinterpret_cast<const uint32_t *>(a.c.meta + hg * 512), tid);
-  decode_sub_block<CB, FB>(img, a.c.coarse + (hg * SBG + j) * RC, a.c.fine + (hg * SBG + j) * RF, j, lane);
+        meta_chunk<Pos>(reinterpret_cast<const uint32_t *>(a.c.meta + hg * 512), tid);
+  decode_sub_block<CB, FB, Pos>(img, a.c.coarse + (hg * SBG + j) * RC, a.c.fine + (hg * SBG + j) * RF, j, lane);
   __syncthreads();
   unroll<(KT + VT) / (16 * XT)>([&](auto k) { dst[tid + XT * k] = *reinterpret_cast<const uint4 *>(img + 16 * (tid + XT * k)); });
   if (flagged && tid == 0) *flag = 1u;  // (read by later launches only)
+}
+template <int CB, int FB>
+__global__ void __launch_bounds__(XT) transcode_kernel(const PrefillArgs a, uint8_t *tiles, size_t hstep, size_t gstep, int toff, bool flagged) {
+  __shared__ __align__(128) uint8_t img[KT + VT];
+  transcode_item<CB, FB, Grid>(a, tiles, hstep, gstep, toff, flagged, img);
 }
 
 }  // namespace tc

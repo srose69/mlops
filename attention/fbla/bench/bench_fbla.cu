@@ -2,7 +2,7 @@
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 // mlops_fbla_decode latency and the DRAM traffic it implies, streaming: one cache laid out for 1M tokens
 // (capacity), filled on the device, decoded at a growing context 16K .. 1M.  B = 1, D = 128, one decode query
-// per head: one KV head with 2 or 4 q heads, and the Qwen3-0.6B geometry (8 KV heads, 16 q heads).
+// per head: one KV head with 2 or 4 q heads, the Qwen3-0.6B geometry (8 KV heads, 16 q heads) and 16 KV heads.
 //
 // The cache holds random codes, whose scores are flatter than a language model's: tau is chosen per context
 // so that the share of refined (q head, sub-block) pairs is the one measured on Qwen3-0.6B at 16K (3+3:
@@ -33,12 +33,13 @@ static uint16_t bf16(float x) { uint32_t u; memcpy(&u, &x, 4); return (uint16_t)
 // both the 40 us one-head/16K row and the 7 ms eight-head/1M row.  As in the other mlops benchmarks these
 // are only defaults: MLOPS_BENCH_REPS overrides every row for another GPU or a quick run.
 static int default_reps(int cb, int KH, int gqa, int tokens) {
-  static constexpr int reps[3][2][6] = {
+  static constexpr int reps[4][2][6] = {
     {{18000, 14500, 10000, 5500, 3000, 1600}, {25000, 16000, 10000, 5500, 3000, 1600}}, // KV1 GQA2
     {{ 9000,  8000,  6000, 4000, 2400, 1300}, {14000, 11000,  7500, 4500, 2600, 1400}}, // KV1 GQA4
     {{ 9000,  3000,  1700,  850,  300,  150}, {10000,  3000,  1600,  850,  300,  150}}, // KV8 GQA2
+    {{ 4500,  1500,   850,  425,  150,   75}, { 5000,  1500,   800,  425,  150,   75}}, // KV16 GQA2
   };
-  const int scenario = KH == 8 ? 2 : gqa == 4 ? 1 : 0;
+  const int scenario = KH == 16 ? 3 : KH == 8 ? 2 : gqa == 4 ? 1 : 0;
   const int size = tokens <= 16384 ? 0 : tokens <= 65536 ? 1 : tokens <= 131072 ? 2
                  : tokens <= 262144 ? 3 : tokens <= 524288 ? 4 : 5;
   return reps[scenario][cb == 4][size];
@@ -119,16 +120,18 @@ static void run_case(Bench &bench, double peak_gbs, const Cache &cc, int KH, int
   const size_t off_row_lse = off_dpart + up256((size_t)QH * max_ctas * (D + 1) * sizeof(float));
   std::vector<float> row_lse(QH);
   CUDA_OK(cudaMemcpy(row_lse.data(), (char *)scratch + off_row_lse, row_lse.size() * sizeof(float), cudaMemcpyDeviceToHost));
-  const int first = 8, last = (groups - 1) * 8, per = last - first;  // closed groups' sub-blocks
+  const int first = 8, last = (groups - 1) * 8, per = std::max(0, last - first);  // closed groups' sub-blocks
   std::vector<float> w;
   w.reserve((size_t)B * QH * per);
   for (int r = 0; r < B * QH; ++r) {
     for (int j = first; j < last; ++j) w.push_back((float)exp2(lse[(size_t)r * nb + j] - row_lse[r]));
   }
   std::vector<float> sorted = w;
-  const size_t k = std::max<size_t>(1, std::min(sorted.size() - 1, (size_t)llround((cb == 3 ? .123 : .048) * sorted.size())));
-  std::nth_element(sorted.begin(), sorted.begin() + k, sorted.end(), std::greater<float>());
-  cfg.tau = sorted[k];
+  if (!sorted.empty()) {
+    const size_t k = std::min(sorted.size() - 1, (size_t)llround((cb == 3 ? .123 : .048) * sorted.size()));
+    std::nth_element(sorted.begin(), sorted.begin() + k, sorted.end(), std::greater<float>());
+    cfg.tau = sorted[k];
+  }
   size_t refined = 0;
   for (int kh = 0; kh < KH; ++kh)
     for (int j = 0; j < per; ++j) {
@@ -136,7 +139,7 @@ static void run_case(Bench &bench, double peak_gbs, const Cache &cc, int KH, int
       for (int qi = 0; qi < QH / KH; ++qi) any |= w[(size_t)(kh * (QH / KH) + qi) * per + j] > cfg.tau;
       refined += any;
     }
-  const double share = (double)refined / ((size_t)KH * per);
+  const double share = per ? (double)refined / ((size_t)KH * per) : 0.;
   const double closed_tokens = std::max(0, groups - 2) * (double)G, exact_tokens = tokens - closed_tokens;
   const double bytes = heads * (closed_tokens * D * cb / 8.0 * 2 + std::max(0, groups - 2) * 4.0 * 256 +
                                 exact_tokens * D * 2 * 2 + share * closed_tokens / S * (cb + fb) * 256 * 2);
@@ -190,7 +193,8 @@ int main() {
   int memory_clock_khz = 0;  // cudaDeviceProp::memoryClockRate is gone in CUDA 13
   CUDA_OK(cudaDeviceGetAttribute(&memory_clock_khz, cudaDevAttrMemoryClockRate, dev));
   const double peak = 2.0 * memory_clock_khz * 1e3 * (p.memoryBusWidth / 8) * 1e-9;
-  const int cap = 1 << 20;
+  const bool short_decode = Bench::env("MLOPS_BENCH_SHORT", 0) != 0;
+  const int cap = short_decode ? 2048 : 1 << 20;
   printf("%s sm_%d%d, %d SMs: warming GPU (%d x 2048^3 FP32) and measuring D2D copy ...\n",
          p.name, p.major, p.minor, p.multiProcessorCount, Bench::env("MLOPS_BENCH_WARMUP", 4));
   fflush(stdout);
@@ -222,11 +226,12 @@ int main() {
          "------", "---", "---", "---------", "----------", "--------------", "----------", "----------",
          "------------", "---------", "--------");
   fflush(stdout);
-  const int heads[][2] = {{1, 2}, {1, 4}, {8, 2}};  // (KV heads, q heads per KV head)
+  const int heads[][2] = {{1, 2}, {1, 4}, {8, 2}, {16, 2}};  // (KV heads, q heads per KV head)
   for (const auto &hg : heads)
     for (int fmt = 0; fmt < 2; ++fmt) {
       const int KH = hg[0], gqa = hg[1], cb = fmt ? 4 : 3, fb = fmt ? 2 : 3;
-      const int sizes[] = {16384, 65536, 131072, 262144, 524288, 1048576};
+      const std::vector<int> sizes = short_decode ? std::vector<int>{16, 128, 300, 1024}
+                                                 : std::vector<int>{16384, 65536, 131072, 262144, 524288, 1048576};
       auto name = [&](char *s, size_t n, int t) { snprintf(s, n, "FBLA %d+%d KV=%d GQA=%d N=%d", cb, fb, KH, gqa, t); };
       bool any = false;
       for (int n : sizes) { char s[64]; name(s, sizeof s, n); any |= bench_want(s); }
@@ -241,6 +246,8 @@ int main() {
       }
       cudaFree(scratch);
     }
+
+  if (short_decode) return 0;
 
   // ---- prefill -----------------------------------------------------------------------------------------
   const int pcases[][2] = {{0, 2048}, {16384, 2048}, {65536, 512}, {65536, 2048}, {65536, 8192}, {262144, 2048}};
