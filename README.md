@@ -1,18 +1,38 @@
+<div align="center">
+
 # mlops
 
-ML ops in CUDA C++ for training and inference on NVIDIA GPUs without native FP4: sm_50 .. sm_90, from Maxwell
-to Hopper. Each op has a C API and PyTorch bindings. The NVFP4 ones build on
-[NVFP4EffMA](https://github.com/srose69/nvfp4effma) (NVFP4 tensors and GEMM) and, for GPUs below sm_89, on the
-FP8 codecs of [E5M2EffMA](https://github.com/srose69/e5m2effma); from sm_89 on, FP8 is native and they use the
-hardware `cvt`.
+**Fast CUDA operations for training and inference, with C APIs and PyTorch bindings**
 
-mlops is a set of packages, each installed on its own and with its own version; the meta package `mlops`
-installs all of them.
+![CUDA](https://img.shields.io/badge/CUDA-12.0%E2%80%9313.4-76B900?logo=nvidia)
+![Targets](https://img.shields.io/badge/targets-sm__50%E2%80%93sm__90-blue)
+![Tested](https://img.shields.io/badge/tested%20on-GTX%201080%20%7C%20L40S-orange)
+![API](https://img.shields.io/badge/API-C%20%2F%20CUDA%20C%2B%2B-lightgrey)
+[![Releases](https://img.shields.io/github/v/release/srose69/mlops?label=release)](https://github.com/srose69/mlops/releases)
+
+[![mlops-optimizers](https://img.shields.io/badge/mlops--optimizers-0.2.0-blue)](optimizers/README.md)
+[![mlops-positional](https://img.shields.io/badge/mlops--positional-0.1.0-violet)](positional/README.md)
+[![mlops-attention](https://img.shields.io/badge/mlops--attention-0.4.0-orange)](attention/README.md)
+[![mlops-vocab](https://img.shields.io/badge/mlops--vocab-0.1.0-teal)](vocab/README.md)
+[![mlops-norm](https://img.shields.io/badge/mlops--norm-0.1.0-green)](norm/README.md)
+
+[![NVFP4 training](https://img.shields.io/badge/training-NVFP4-76B900)](optimizers/README.md)
+[![Compressed KV cache](https://img.shields.io/badge/KV%20cache-6.25%20bits-orange)](attention/docs/overview.md)
+
+</div>
+
+mlops is a collection of CUDA C++ operations for training and inference on NVIDIA GPUs, from Maxwell
+to Hopper (sm_50 .. sm_90; support varies by operation). Use them directly from C / C++, or import the
+PyTorch bindings and plug them into an existing model or training loop. The bindings work directly on
+PyTorch CUDA tensors.
+
+Each package can be installed on its own and has its own version; the `mlops` meta package installs all
+of them. Performance comparisons, arithmetic and usage examples are linked in the table below.
 
 | package | Python | version | contents |
 |---|---|---|---|
-| [mlops-optimizers](optimizers) | `mlops.optim` | 0.2.0 | AdamW, and AdamWQAT: AdamW that trains NVFP4 weights in place, on GPUs from Maxwell to Hopper. Transformer Engine trains NVFP4 only on Blackwell (sm_100+), through an FP32 or FP16 master copy re-quantized every step. AdamWQAT keeps no such copy: each weight's position lives on the NVFP4 lattice as a 16-bit coordinate, the moments in FP8, and block scales move only on significant evidence and, UE5M3 by default, can grow 256x without an amax recompute (`to_e4m3` exports Transformer Engine's E4M3 scales bit-exact when they fit, else keeps UE5M3 and warns). 6 B per weight for weight + optimizer state, against 12.6 B for an FP32 master with FP32 moments. |
-| [mlops-positional](positional) | `mlops.positional` | 0.1.0 | RoPE of q and k in one pass, 4–8× transformers' eager path, with YaRN / Llama 3 / LongRoPE scaling built in. Its error does not grow with the position: at the floor of the dtype up to 10M tokens. transformers and torchtune take the angle as one FP32 product: in FP32 their error is 1.1e-3 already at 128K, 44 000× the float32 floor, and 9 % RMS at 10M, where they place every token up to ±1.4 positions off. A bit-exact drop-in for transformers' `apply_rotary_pos_emb`. |
+| [mlops-optimizers](optimizers) | `mlops.optim` | 0.2.0 | AdamW, and AdamWQAT: AdamW that trains NVFP4 weights in place, on GPUs from Maxwell to Hopper. Transformer Engine trains NVFP4 only on Blackwell (sm_100+), through an FP32 or FP16 master copy re-quantized every step. AdamWQAT keeps no such copy: each weight's position lives on the NVFP4 lattice as a 16-bit coordinate, the moments in FP8, and block scales move only on significant evidence and, UE5M3 by default, can grow 256x without an amax recompute (`to_e4m3` exports Transformer Engine's E4M3 scales bit-exact when they fit, else keeps UE5M3 and warns). 6 B per weight for weight + optimizer state, against 12.6 B for an FP32 master with FP32 moments. Details: [optimizers/README.md](optimizers/README.md). |
+| [mlops-positional](positional) | `mlops.positional` | 0.1.0 | RoPE of q and k in one pass, 4–8× transformers' eager path, with YaRN / Llama 3 / LongRoPE scaling built in. Its error does not grow with the position: at the floor of the dtype up to 10M tokens. transformers and torchtune take the angle as one FP32 product: in FP32 their error is 1.1e-3 already at 128K, 44 000× the float32 floor, and 9 % RMS at 10M, where they place every token up to ±1.4 positions off. A bit-exact drop-in for transformers' `apply_rotary_pos_emb`. Details: [positional/README.md](positional/README.md). |
 | [mlops-attention](attention) | `mlops.attention` | 0.4.0 | FBLA (Flash Block Attention): compressed-KV FlashAttention prefill and decode for GPUs sm_61+ (DP4A decode; the prefill is tuned for tensor cores on Turing, Ampere and Ada, sm_75 .. sm_89, DP4A elsewhere), 3+3 and 4+2 modes, 6.25 bits per KV element. On GTX 1080: decode 35–42× faster than PyTorch BF16 SDPA at 16K (at 256K SDPA runs out of memory, FBLA takes 1 ms), prefill 2× faster than PyTorch FP32 SDPA. On L40S against flash-attn 2: decode 2 .. 4.5×, prefill 1.3 .. 1.9× faster. As accurate as llama.cpp's `q8_0` cache (both within the noise of BF16 on Qwen3-0.6B) at 74 % of its size; `q4_0` raises the loss by 7 % (WikiText-2). The work of its calls is also exposed as items for an executor. Details: [attention/docs/overview.md](attention/docs/overview.md). |
 | [mlops-vocab](vocab) | `mlops.vocab` | 0.1.0 | Everything along the vocabulary axis: embedding rows for device-side ids with the first RMSNorm's inputs, the BF16 LM head for 1 .. 8 tokens (cut along hidden; CUDA cores everywhere, tensor cores from sm_80) with the sampler's statistics in its epilogue, and exact token sampling (greedy, temperature, top-k, top-p, penalty) without sorting. On an L40S the head reads at 98 % of DRAM peak; the work of every call is also exposed as items for an executor. Details: [vocab/README.md](vocab/README.md). |
 | [mlops-norm](norm) | `mlops.norm` | 0.1.0 | RMSNorm and LayerNorm in the flavors of current models (weight, zero-centered, bias, Hugging Face's or single-rounding order, silu gates, groups), a residual add before and INT8 / NVFP4 quantization after, for GPUs sm_50 .. sm_90. The quantized outputs are what NVFP4EffMA's `nvfp4a_quantize` makes of y, bit for bit, using its primitives; the sums are order-fixed, so every launch shape and every GPU gives the same bytes. Details: [norm/README.md](norm/README.md). |
