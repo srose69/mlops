@@ -1,0 +1,7 @@
+[build-system]
+# PyTorch is needed at build time and must be the installed one: build with --no-build-isolation.
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

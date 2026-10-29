@@ -2,7 +2,7 @@
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 # Runs a target in every package (PKGS) that has it, e.g.  make lib  /  make test qat  /  make lib ARCHS=native
 # Targets and variables: <package>/Makefile and build/arch.mk.
-PKGS ?= optimizers positional attention
+PKGS ?= optimizers positional attention vocab norm
 TARGETS = all lib test qat bench install clean
 
 $(TARGETS):

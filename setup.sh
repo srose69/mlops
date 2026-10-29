@@ -8,14 +8,14 @@
 #   ./setup.sh all                 every package and the meta package "mlops"
 #
 # Nothing is downloaded (pip --no-index): PyTorch, and for optimizers the EffMA packages, must be installed first --
-#   nvfp4effma   optimizers (https://github.com/srose69/nvfp4effma/releases)
+#   nvfp4effma   optimizers, norm (https://github.com/srose69/nvfp4effma/releases)
 #   e5m2effma    optimizers, only to build for GPUs below sm_89, headers only (https://github.com/srose69/e5m2effma/releases)
 # Variables: PYTHON (default python3), MLOPS_ARCHS="61 89" (default: the visible GPUs), MAX_JOBS, MLOPS_CCBIN,
 # CUDA_HOME; see build/torch_ext.py.
 set -euo pipefail
 cd "$(dirname "$0")"
 PYTHON=${PYTHON:-python3}
-PACKAGES=(optimizers positional attention)  # directories with include/mlops_<name>.h and python/setup.py
+PACKAGES=(optimizers positional attention vocab norm)  # directories with include/mlops_<name>.h and python/setup.py
 
 version() { sed -n "s/^#define MLOPS_${1^^}_VERSION \"\(.*\)\"/\1/p" "$1/include/mlops_$1.h"; }
 meta_version() { sed -n 's/^VERSION = "\(.*\)"/\1/p' meta/setup.py; }
