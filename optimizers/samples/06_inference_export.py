@@ -1,18 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""After training: inference, and exporting the NVFP4 weights.
-
-    python 06_inference_export.py
-
-* Inference with the trained model as is: QATLinear's forward is the NVFP4 GEMM, nothing to convert.
-* layer.nvfp4_weight(): the nvfp4effma.NVFP4Tensor the forward reads (views of the layer's buffers);
-  usable with nvfp4effma.linear directly, without mlops.optim.
-* For deployment you only need codes, scales and amax; the optimizer state (`qat_state`) can be dropped.
-* .dequantize() gives the exact dense weight the model computes with, e.g. to build a plain nn.Linear.
-* to_e4m3: the weights with E4M3 block scales, the same values bit for bit -- the NVFP4 that Transformer
-  Engine, cuBLASLt's FP4 GEMM on Blackwell and ModelOpt read. If training spread a weight's scales wider than
-  E4M3 spans, it stays UE5M3 (with a warning): check .ue5m3.
-"""
+"""After training: inference, and exporting the NVFP4 weights. Run: python 06_inference_export.py
+Inference with the trained model as is: QATLinear's forward is the NVFP4 GEMM, nothing to convert. layer.nvfp4_weight(): the nvfp4effma.NVFP4Tensor the forward
+reads (views of the layer's buffers), usable with nvfp4effma.linear directly. For deployment only codes, scales and amax are needed (`qat_state` can be dropped)."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Token-distribution comparison of one FBLA configuration (or KIVI / llama.cpp KV quantization) against bf16
-attention, on one window of the WikiText-2 test split unless text files are given.
-
-The two model forwards retain only the evaluated hidden states on CPU.  The LM head is then applied in small
-chunks, so a [tokens, vocabulary] logits tensor is never kept in GPU memory.
-"""
+"""Token-distribution comparison of one FBLA configuration (or KIVI / llama.cpp KV quantization) against bf16 attention, on one window of the WikiText-2
+test split unless text files are given. The two forwards retain only the evaluated hidden states on CPU; the LM head is applied in small chunks, so a
+[tokens, vocabulary] logits tensor is never kept in GPU memory."""
 import argparse
 import gc
 import os

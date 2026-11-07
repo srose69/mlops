@@ -3,6 +3,8 @@
 // mlops_embed against a host emulation, bit for bit: the rows, xw = bf16(x * w), the parts; every variant and
 // element count (the outputs do not depend on the split); a table in device and in mapped host memory; ids out
 // of range.
+#include <cuda_fp16.h>
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -56,6 +58,65 @@ static float unit_sq(const float *v) {  // 256 elements: 32 lanes of 8, in order
     memcpy(lane, nxt, sizeof lane);
   }
   return lane[0];
+}
+
+// x in BF16 (the table's own bits) or FP16 (rounded to nearest even), alone and with the other outputs, which come from the FP32 values.
+static int run_x_dtype(int x_dtype, int vocab, int hidden, int n_tok) {
+  std::normal_distribution<float> d(0.f, 3.f);
+  std::vector<uint16_t> table((size_t)vocab * hidden), w(hidden);
+  for (auto &v : table) v = bf16(d(rng));
+  for (auto &v : w) v = bf16(d(rng) * 0.5f + 1.f);
+  std::vector<int> ids(n_tok);
+  for (auto &i : ids) i = rng() % vocab;
+  const int per = hidden / 256;
+  const uint16_t *dtable = up(table), *dw = up(w);
+  const mlops_embed_config c{vocab, hidden, n_tok, 0, x_dtype};
+  const int nv = mlops_embed_variants(&c, nullptr, 0);
+  std::vector<mlops_embed_variant> vs(nv);
+  mlops_embed_variants(&c, vs.data(), nv);
+  int *dids = up(ids);
+  uint16_t *dx, *dxw;
+  float *dparts;
+  CK(cudaMalloc(&dx, (size_t)n_tok * hidden * 2 + 16));
+  CK(cudaMalloc(&dxw, (size_t)n_tok * hidden * 2 + 16));
+  CK(cudaMalloc(&dparts, (size_t)n_tok * per * 4 + 16));
+  long bad = 0, n = 0;
+  for (const auto &v : vs)
+    for (int alone = 0; alone < 2; ++alone) {
+      CK(cudaMemset(dx, 0xff, (size_t)n_tok * hidden * 2));
+      if (mlops_embed(&c, &v, dtable, dids, alone ? nullptr : dw, dx, alone ? nullptr : dxw, alone ? nullptr : dparts, nullptr, 0)) {
+        fprintf(stderr, "%s\n", mlops_embed_last_error());
+        return 1;
+      }
+      CK(cudaDeviceSynchronize());
+      const auto x = down(dx, (size_t)n_tok * hidden);
+      const auto xw = down(dxw, (size_t)n_tok * hidden);
+      const auto parts = down(dparts, (size_t)n_tok * per);
+      for (int col = 0; col < n_tok; ++col) {
+        std::vector<float> row(hidden);
+        for (int k = 0; k < hidden; ++k) row[k] = f32(table[(size_t)ids[col] * hidden + k]);
+        for (int k = 0; k < hidden; ++k) {
+          const __half half = __float2half_rn(row[k]);
+          uint16_t want = table[(size_t)ids[col] * hidden + k];
+          if (x_dtype == MLOPS_EMBED_X_FP16) memcpy(&want, &half, 2);
+          bad += x[(size_t)col * hidden + k] != want;
+          ++n;
+          if (!alone) { bad += xw[(size_t)col * hidden + k] != bf16(row[k] * f32(w[k])); ++n; }
+        }
+        if (!alone)
+          for (int u = 0; u < per; ++u) {
+            const float ref = unit_sq(row.data() + 256 * u);
+            uint32_t u0, u1;
+            memcpy(&u0, &parts[(size_t)col * per + u], 4);
+            memcpy(&u1, &ref, 4);
+            bad += u0 != u1;
+            ++n;
+          }
+      }
+    }
+  char what[160];
+  snprintf(what, sizeof what, "embed x as %s, %d x %d, n %d: %d variants, alone and with xw and parts", x_dtype == MLOPS_EMBED_X_BF16 ? "BF16" : "FP16", vocab, hidden, n_tok, nv);
+  return report(what, bad, n);
 }
 
 static int run_case(int vocab, int hidden, int n_tok, int items, bool mapped) {
@@ -172,6 +233,10 @@ int main() {
   f += run_case(3000, 2560, 8, 3, false);     // fewer elements than units
   f += run_case(3000, 2560, 3, 1000, false);  // more elements than units
   f += run_case(4000, 2048, 2, 0, true);      // mapped host memory
+  for (int x_dtype : {MLOPS_EMBED_X_BF16, MLOPS_EMBED_X_FP16}) {
+    f += run_x_dtype(x_dtype, 3000, 2560, 5);
+    f += run_x_dtype(x_dtype, 1000, 1024, 1);
+  }
   f += run_ids_and_invalid();
   printf(f ? "\n%d FAILED\n" : "\nALL PASS\n", f);
   return f != 0;

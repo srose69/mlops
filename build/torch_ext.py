@@ -1,18 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Shared by every package's setup.py: target architectures, the dependencies' headers, and a build_ext that
-builds the package's static library with its Makefile (parallel, every architecture in one go) before the
-PyTorch extension links it.
-
-Variables (all optional):
-  MLOPS_ARCHS="61 89"            architectures, or TORCH_CUDA_ARCH_LIST="6.1;8.9"; default: the GPUs visible to
-                                 PyTorch, or all of sm_50..sm_90 if none is. Packages that use sm_89's FP8 cvt
-                                 need nvcc 12.1+ for sm_89.
-  MLOPS_CCBIN, MAX_JOBS          host compiler for nvcc, parallel jobs
-  MLOPS_OBJDIR                   object directory that already holds the library for these architectures
-                                 (dev/release.sh builds it once for every wheel)
-  MLOPS_LOCAL_VERSION            local version label of a release wheel (e.g. cu126torch2.7)
-"""
+"""Shared by every package's setup.py: target architectures, the dependencies' headers, and a build_ext that builds the package's static library with its
+Makefile (parallel, every architecture in one go) before the PyTorch extension links it. Variables are described beside their use below."""
 import importlib.util
 import os
 import re
@@ -45,6 +34,7 @@ def nvcc_version(cuda_home):
 def target_archs(name, cuda_home, sm89_fp8=False):
     """sm89_fp8: the package uses sm_89's FP8 cvt (PTX ISA 8.1): sm_89 is dropped with an nvcc older than 12.1."""
     import torch
+    # MLOPS_ARCHS="61 89" or TORCH_CUDA_ARCH_LIST="6.1;8.9"; default: the GPUs visible to PyTorch, or all of sm_50..sm_90 if none is
     env = os.environ.get("MLOPS_ARCHS") or os.environ.get("TORCH_CUDA_ARCH_LIST")
     if env:
         archs = set()
@@ -89,7 +79,7 @@ def dependency(name, pkg, why):
 
 
 def local_version(version):
-    lv = os.environ.get("MLOPS_LOCAL_VERSION")
+    lv = os.environ.get("MLOPS_LOCAL_VERSION")  # local version label of a release wheel (e.g. cu126torch2.7)
     return f"{version}+{lv}" if lv else version
 
 
@@ -109,6 +99,8 @@ def make_build(name, pkg_dir, lib, archs, deps):
 
     class Build(BuildExtension):
         def run(self):
+            # MLOPS_OBJDIR: an object directory that already holds the library for these architectures (dev/release.sh builds it once for every wheel);
+            # MLOPS_CCBIN: host compiler for nvcc; MAX_JOBS: parallel jobs
             objdir = os.path.abspath(os.environ.get("MLOPS_OBJDIR") or os.path.join(self.build_temp, f"lib{lib}"))
             cmd = ["make", "-C", pkg_dir, f"OBJDIR={objdir}", f"ARCHS={' '.join(map(str, archs))}",
                    f"CUDA_HOME={CUDA_HOME}", f"{objdir}/lib{lib}.a"] + [f"{k}={v}" for k, v in deps.items() if v]

@@ -1,34 +1,9 @@
 /* SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
  * Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
- *
- * mlops_norm: RMSNorm and LayerNorm of rows of hidden values, in the flavors of current models, with an optional residual
- * add before and a quantization after.
- *
- * Per row (or per group of hidden / groups values, normalized independently), with c = v (RMS) or v - mean(v) (LayerNorm):
- *     v = round_x(x + residual)                          (v is also written to residual_out)
- *     v = v * silu(gate)                                 with gate BEFORE (Mamba-2 / Nemotron-H with norm_before_gate off)
- *     r = 1 / sqrt(mean(c^2) + eps)                      (the sums in FP32, in units of 256 elements: a lane's eight
- *                                                         values in order, an xor butterfly, the unit sums lane-strided)
- *     w' = weight, 1 + weight (zero-centered gamma: Gemma, Qwen3-Next, Nemotron's LayerNorm1P) or 1 (no weight)
- *   ORDER_ROUND_THEN_SCALE (Llama, Qwen, Mistral, DeepSeek; RMS only, no bias, no gate):
- *     y = round_y(round_x(c * r) * w')                 (Hugging Face's order of roundings)
- *   ORDER_FP32 (Gemma, Qwen3-Next, LayerNorm of PyTorch, bias, gates): one rounding at the end
- *     y = round_y(fma(c * r, w', bias));   with gate AFTER (Qwen3-Next, Mamba-2 with norm_before_gate): y *= silu(gate)
- * round_x / round_y round to nearest even to the dtype of x / of y (FP32: no rounding); silu(g) = g / (1 + exp(-g)).
- * The sums do not depend on the variant or the element count, so the result is the same on every GPU and every launch
- * shape (the gates' exp aside: libm's on the device).
- *
- * The output is y itself, or y quantized as NVFP4EffMA's nvfp4a_quantize quantizes it -- with its primitives, imported:
- *   MLOPS_NORM_OUT_INT8   int8 [rows][hidden] and FP32 scales [rows][ld_scale], one per block of 16: sb = amax / 127,
- *                         q = RNE(y / sb) (0 where sb = 0).
- *   MLOPS_NORM_OUT_NVFP4  E2M1 nibbles [rows][hidden / 2] (element 2i in the low nibble) and E4M3 scales [rows][ld_scale],
- *                         one per block of 16, the global a decode factor g (device float; NULL: 1).
- *
- * x may be BF16, FP16 or FP32 (an FP32 residual stream); weight, bias and y are in y_dtype; x_dtype is y_dtype or FP32; the
- * gate is in x_dtype. residual_out may be x or residual (every thread reads before it writes). A group is a multiple of
- * 256 values (a per-head norm of 64 or 128 is the attention library's: mlops_fbla_qkv_at). Stateless C call over raw device
- * pointers, explicit stream.
  */
+/* mlops_norm: RMSNorm and LayerNorm of rows of hidden values, in the flavors of current models, with an optional residual add
+ * before and a quantization after. Stateless C call over raw device pointers, explicit stream. The sums do not depend on the
+ * variant or the element count: the result is the same on every GPU and launch shape (the gates' exp aside: libm's on the device). */
 #ifndef MLOPS_NORM_LAYER_H
 #define MLOPS_NORM_LAYER_H
 
@@ -48,12 +23,27 @@ extern "C" {
 #endif
 
 typedef enum { MLOPS_NORM_OK = 0, MLOPS_NORM_INVALID_VALUE = 1, MLOPS_NORM_CUDA_ERROR = 2 } mlops_norm_status;
+/* x may be BF16, FP16 or FP32 (an FP32 residual stream); weight, bias and y are in y_dtype; x_dtype is y_dtype or FP32; the gate is in
+ * x_dtype. round_x / round_y round to nearest even to the dtype of x / of y (FP32: no rounding); silu(g) = g / (1 + exp(-g)). */
 typedef enum { MLOPS_NORM_BF16 = 0, MLOPS_NORM_FP16 = 1, MLOPS_NORM_FP32 = 2 } mlops_norm_dtype;
+/* The output is y itself, or y quantized as NVFP4EffMA's nvfp4a_quantize does (its primitives imported). INT8: int8 [rows][hidden], FP32 scales
+ * [rows][ld_scale] (one per block of 16): sb = amax / 127, q = RNE(y / sb) (0 where sb = 0). NVFP4: E2M1 nibbles [rows][hidden / 2] (element 2i
+ * in the low nibble), E4M3 scales [rows][ld_scale] (one per block of 16), the global a decode factor g (device float; NULL: 1). */
 typedef enum { MLOPS_NORM_OUT_DTYPE = 0, MLOPS_NORM_OUT_INT8 = 1, MLOPS_NORM_OUT_NVFP4 = 2 } mlops_norm_out;
+/* Per row (or per group of hidden / groups values, normalized independently), c = v (RMS) or v - mean(v) (LayerNorm):
+ * v = round_x(x + residual) (also written to residual_out); v = v * silu(gate) with gate BEFORE (Mamba-2 / Nemotron-H with norm_before_gate off);
+ * r = 1 / sqrt(mean(c^2) + eps) (sums in FP32, in units of 256 elements: a lane's eight values in order, an xor butterfly, the unit sums lane-strided). */
 typedef enum { MLOPS_NORM_RMS = 0, MLOPS_NORM_LAYER = 1 } mlops_norm_kind;
+/* w' = weight, 1 + weight (zero-centered gamma: Gemma, Qwen3-Next, Nemotron's LayerNorm1P) or 1 (no weight) */
 typedef enum { MLOPS_NORM_SCALE_NONE = 0, MLOPS_NORM_SCALE_WEIGHT = 1, MLOPS_NORM_SCALE_ONE_PLUS_WEIGHT = 2 } mlops_norm_scale;
+/* ROUND_THEN_SCALE (Llama, Qwen, Mistral, DeepSeek; RMS only, no bias, no gate): y = round_y(round_x(c * r) * w') (Hugging Face's order of roundings).
+ * FP32 (Gemma, Qwen3-Next, PyTorch LayerNorm, bias, gates): one rounding at the end, y = round_y(fma(c * r, w', bias)), with gate AFTER
+ * (Qwen3-Next, Mamba-2 with norm_before_gate): y *= silu(gate). */
 typedef enum { MLOPS_NORM_ORDER_ROUND_THEN_SCALE = 0, MLOPS_NORM_ORDER_FP32 = 1 } mlops_norm_order;
 typedef enum { MLOPS_NORM_GATE_NONE = 0, MLOPS_NORM_GATE_AFTER = 1, MLOPS_NORM_GATE_BEFORE = 2 } mlops_norm_gate;
+
+/* residual_out may be x or residual (every thread reads before it writes). A group is a multiple of 256 values (a per-head norm of 64 or
+ * 128 is the attention library's: mlops_fbla_qkv_at). */
 
 typedef struct {
   int rows, hidden;          /* hidden a multiple of 256 * groups, at most 32768 */
@@ -71,10 +61,9 @@ typedef struct {
   int items;                 /* CTAs the rows are split over; 0: the device's resident CTAs */
 } mlops_norm_config;
 
-/* The pointers of a call: x [rows][hidden]; residual and residual_out both or neither; weight [hidden] unless scale is NONE;
- * bias [hidden] when config.bias; gate [rows][hidden] unless the gate is NONE; y [rows][hidden] (y_dtype, or int8, or
- * [rows][hidden / 2] bytes); scales [rows][ld_scale] (FP32 for INT8, E4M3 bytes for NVFP4); global: NVFP4's g. All 16-byte
- * aligned (scales: 4-byte). */
+/* The pointers of a call: x [rows][hidden]; residual and residual_out both or neither; weight [hidden] unless scale is NONE; bias [hidden]
+ * when config.bias; gate [rows][hidden] unless the gate is NONE; y [rows][hidden] (y_dtype, or int8, or [rows][hidden / 2] bytes); scales
+ * [rows][ld_scale] (FP32 for INT8, E4M3 bytes for NVFP4); global: NVFP4's g. All 16-byte aligned (scales: 4-byte). */
 typedef struct {
   const void *x, *residual, *weight, *bias, *gate;
   void *residual_out, *y, *scales;

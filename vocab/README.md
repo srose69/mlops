@@ -67,8 +67,8 @@ Short runnable examples in [`samples/`](samples):
 * **Variants.** `mlops_embed_variants`, `mlops_lm_head_variants`: the instances for a shape, as data; the element count is
   the caller's.
 * **Items.** [`mlops_vocab_items.h`](include/mlops_vocab_items.h) describes a call as work items for an executor: the CTA
-  geometry, the arguments, the entry compiled with NVRTC from [`mlops_vocab_items.cuh`](include/mlops_vocab_items.cuh), and the
-  byte ranges each item reads and writes.
+  geometry, the arguments, the entry (in [`mlops_vocab_items.cuh`](include/mlops_vocab_items.cuh), compiled with nvcc ahead of time
+  or with NVRTC at run time), and the byte ranges each item reads and writes.
 
 ## Build and test
 

@@ -1,18 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""mlops.positional: positional encodings on CUDA (the mlops-positional package).
-
-* ``RoPE``                    rotary position embedding of q and k from token positions, no error growth with the position,
-                              with YaRN / Llama 3 / linear / dynamic NTK / LongRoPE frequency scaling
-                              (``RoPE.from_hf(config)``), differentiable.
-* ``rope_frequencies``        the inverse frequencies and attention factor of a scaling (float64).
-* ``apply_rotary_pos_emb``    transformers' function of that name on the kernel, bit for bit, forward and backward.
-* ``patch_transformers``      installs it into transformers' modeling modules.
-
-    from mlops.positional import RoPE
-    rope = RoPE.from_hf(model.config).cuda()
-    q, k = rope(q, k, position_ids, layout="bhsd")
-"""
+"""mlops.positional: ``RoPE`` (q and k from token positions, no error growth with the position; YaRN / Llama 3 / linear / dynamic NTK /
+LongRoPE scaling via ``RoPE.from_hf(config)``; differentiable), ``rope_frequencies`` (float64), ``apply_rotary_pos_emb`` (transformers', bit for
+bit, forward and backward), ``patch_transformers``. Use: ``q, k = RoPE.from_hf(model.config).cuda()(q, k, position_ids, layout="bhsd")``."""
 import torch  # noqa: F401  (loads libtorch / libc10, which _C links)
 
 from . import _C

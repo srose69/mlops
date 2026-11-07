@@ -1,19 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Gradient accumulation, bfloat16 autocast, and the activation formats of QATLinear (`act`).
-
-    python 05_accumulation_amp.py
-
-* Accumulation: call backward() several times before step(), as usual. FP8 gradients (grad_fp8) are
-  summed in float32 and re-encoded once per backward, so the sum is not limited by FP8 range.
-* Autocast: QATLinear's GEMM takes activations in their own dtype (float32 / bfloat16 / float16) and
-  returns that dtype, so it works inside an autocast region; autocast casts the dense layers around it.
-* act: how activations enter the NVFP4 GEMM. "exact" (default, W4A16) keeps them as they are; "int8"
-  (W4A8, int8 with an FP32 scale per 16 values) is about 2x faster on GPUs with DP4A (sm_61+); "nvfp4"
-  (W4A4) is the smallest; "auto" is exact for up to 2 rows, int8 beyond. The backward uses the
-  activations the GEMM actually read, and keeps them in that format (less activation memory).
-* Dense parameters may be bfloat16 themselves: AdamW keeps FP32 moments for them.
-"""
+"""Gradient accumulation, bfloat16 autocast, and the activation formats of QATLinear (`act`). Run: python 05_accumulation_amp.py
+Accumulation: call backward() several times before step(), as usual; FP8 gradients (grad_fp8) are summed in float32 and re-encoded once per backward, so the
+sum is not limited by FP8 range. Autocast: QATLinear's GEMM takes activations in their own dtype and returns that dtype, so it works inside an autocast region."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,6 +14,9 @@ target = torch.randn(dim, dim, device="cuda", generator=torch.Generator("cuda").
 
 
 def build(act):
+    # act: how activations enter the NVFP4 GEMM. "exact" (default, W4A16) keeps them as they are; "int8" (W4A8, int8 with an FP32 scale per 16 values,
+    # DP4A on sm_61+); "nvfp4" (W4A4) is the smallest; "auto" is exact for up to 2 rows, int8 beyond. The backward uses the activations the GEMM
+    # actually read and keeps them in that format (less activation memory). Autocast casts the dense layers around QATLinear.
     torch.manual_seed(0)
     model = nn.Sequential(
         nn.LayerNorm(dim),
@@ -32,7 +24,7 @@ def build(act):
         nn.GELU(),
         QATLinear(4 * dim, dim, grad_dtype=torch.float8_e5m2, act=act),
     ).cuda()
-    model[0].to(torch.bfloat16)  # a bfloat16 dense parameter, to show AdamW handles it
+    model[0].to(torch.bfloat16)  # a bfloat16 dense parameter, to show AdamW handles it (it keeps FP32 moments for it)
     dense, qat = split_params(model)
     return model, AdamW(dense, lr=2e-3), AdamWQAT(qat, lr=2e-3, weight_decay=0.1)
 

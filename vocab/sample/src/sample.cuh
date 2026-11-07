@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// Sampling passes over chunks of kChunk tokens (include/mlops_sample.h). Each pass is closed by its last item,
-// found by an arrival counter that only grows (a multiple of the item count between runs).
-//   stats         maximum M and argmax of the sampled logits (the lower index on ties); greedy ends here
-//   mass          Z, the total mass: the target of top-p without a small top-k
-//   radix 0 .. 3  8 bits of the order key per pass, a histogram (counts or masses) of the keys under the prefix
-//   count, write  top-k <= kGather: candidates (key >= threshold) counted per chunk, written in index order,
-//                 sorted, cut by top-p and drawn from by the last item
-//   draw          otherwise: per-chunk mass of the kept tokens, then the chunk holding the draw and the token
-// Runs (sample_passes): greedy: stats. top-k <= kGather: stats, radix, count, write. top-p alone: stats, mass,
-// radix, draw. Larger top-k: stats, radix, draw. Temperature alone: stats, draw.
+// Sampling passes over chunks of kChunk tokens (include/mlops_sample.h). Each pass is closed by its last item, found by an arrival counter that
+// only grows (a multiple of the item count between runs). Passes: stats (maximum M and argmax of the sampled logits, the lower index on ties;
+// greedy ends here), mass (Z, the total mass: the target of top-p without a small top-k), radix 0 .. 3 (8 bits of the order key per pass).
 #pragma once
 #include "mlops_sample.h"
 
@@ -477,9 +470,15 @@ __device__ __forceinline__ bool sample_draw_item(const SampleOp &op, int c, Samp
 }
 
 // ---- runs --------------------------------------------------------------------------------------------------------
+// stats: maximum M and argmax of the sampled logits (the lower index on ties); mass: Z, the total mass (the target of top-p without a small top-k);
+// radix 0 .. 3: 8 bits of the order key per pass, a histogram (counts or masses) of the keys under the prefix.
 enum SamplePass { kPassStats, kPassMass, kPassRadix0, kPassCount = kPassRadix0 + 4, kPassWrite, kPassDraw, kPassPre, kPassRadix0Pre, kPasses };
 
-// The passes of the configuration's run, in order; their number.
+// count, write: top-k <= kGather: candidates (key >= threshold) counted per chunk, written in index order, sorted, cut by top-p and drawn from by
+// the last item; draw: otherwise, the per-chunk mass of the kept tokens, then the chunk holding the draw and the token.
+
+// The passes of the configuration's run, in order; their number. Greedy: stats. top-k <= kGather: stats, radix, count, write. top-p alone: stats,
+// mass, radix, draw. Larger top-k: stats, radix, draw. Temperature alone: stats, draw.
 __host__ __device__ inline int sample_passes(float temperature, int top_k, float top_p, bool pre, bool pre_hist, int pass[8]) {
   int n = 0;
   pass[n++] = pre ? kPassPre : kPassStats;

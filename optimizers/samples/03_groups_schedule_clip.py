@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Parameter groups, an LR schedule and gradient clipping: everything a real training loop has.
-
-    python 03_groups_schedule_clip.py
-
-Both optimizers are torch.optim.Optimizer subclasses, so groups, `param_groups[i]["lr"]` and
-torch.optim.lr_scheduler work unchanged.
-"""
+"""Parameter groups, an LR schedule and gradient clipping: everything a real training loop has. Run: python 03_groups_schedule_clip.py
+Both optimizers are torch.optim.Optimizer subclasses, so groups, `param_groups[i]["lr"]` and torch.optim.lr_scheduler work unchanged."""
 import math
 
 import torch
@@ -62,10 +57,8 @@ schedulers = [torch.optim.lr_scheduler.LambdaLR(o, warmup_cosine) for o in (opt,
 
 
 def clip_grad_norm_all_(model, max_norm):
-    """Global-norm clipping over dense and NVFP4 gradients together.
-
-    Float32 gradients (p.grad) are scaled in place. FP8 gradients (p.grad_fp8 = (bytes, scale)) are
-    clipped exactly by multiplying their decode scale: no FP8 bytes change."""
+    """Global-norm clipping over dense and NVFP4 gradients together: float32 gradients (p.grad) are scaled in place; FP8 gradients
+    (p.grad_fp8 = (bytes, scale)) are clipped exactly by multiplying their decode scale (no FP8 bytes change)."""
     dense, qat = split_params(model)
     sq = [p.grad.float().pow(2).sum() for p in dense + qat if p.grad is not None]
     sq += [(g8.float().pow(2).sum() * gs * gs) for g8, gs in (p.grad_fp8 for p in qat if p.grad_fp8 is not None)]

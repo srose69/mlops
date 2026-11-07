@@ -1,25 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// mlops_adamw_qat number formats the sibling repos do not have: stochastic rounding (SR) into E4M3,
-// E5M2 (E[s^2] exact), BF16 and fixed point, the secant maps of the E2M1 lattice, the Quake rsqrt and
-// the counter-based uniforms SR draws from. Decodes and RNE encodes are NVFP4EffMA's (E2M1, E4M3); the
-// FP8 ones (E5M2 encode, E4M3 / E5M2 x4 decode) are E5M2EffMA's in the device passes below sm_89, the
-// native cvt from sm_89 on (QAT_FP8_CVT) and cuda_fp8.h on the host (bit-identical to both on all 2^32
-// inputs), so E5M2EffMA is needed only to build for GPUs below sm_89. Host + device, so the tests run the
-// same code on the CPU; arithmetic goes through mul / add / sub / fmar so neither side contracts it
-// differently.
+// mlops_adamw_qat number formats the sibling repos do not have: stochastic rounding (SR) into E4M3, E5M2 (E[s^2] exact), BF16 and fixed point, the
+// secant maps of the E2M1 lattice, the Quake rsqrt and the counter-based uniforms SR draws from. Decodes and RNE encodes are NVFP4EffMA's (E2M1, E4M3);
+// FP8 codec sources below. Host + device, so the tests run the same code on the CPU; arithmetic goes through mul / add / sub / fmar so neither side contracts it differently.
 #pragma once
 #include <cstdint>
 #include <cstring>
 #include <cmath>
 #include <nvfp4effma.cuh>
 
-// FP8 codec source of this compilation pass:
-//   QAT_FP8_CVT        device pass for sm_89+: cvt.rn.f16x2.{e4m3x2,e5m2x2} / cvt.rn.satfinite.e5m2x2.f32
-//                      (PTX ISA 7.8 on sm_90, 8.1 = CUDA 12.1 on sm_89; the gating of CUTLASS's float8.h)
-//   QAT_FP8_CVT_MODEL  tests only: the same wrappers through cuda_fp8.h, NVIDIA's model of those cvt
-//                      instructions below sm_90, so the sm_89+ code path runs on any GPU
-//   otherwise          E5M2EffMA in the sm_50..sm_87 device passes, cuda_fp8.h in the host pass
+// FP8 codec source of this pass (bit-identical on all 2^32 inputs; E5M2EffMA only to build for GPUs below sm_89). QAT_FP8_CVT: device pass for sm_89+,
+// cvt.rn.f16x2.{e4m3x2,e5m2x2} / cvt.rn.satfinite.e5m2x2.f32 (PTX ISA 7.8 on sm_90, 8.1 = CUDA 12.1 on sm_89). QAT_FP8_CVT_MODEL: tests only, the same
+// wrappers through cuda_fp8.h (NVIDIA's model of those cvt below sm_90). Otherwise E5M2EffMA in the sm_50..sm_87 device passes, cuda_fp8.h in the host pass.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
 #if __CUDA_ARCH__ == 890 && (__CUDACC_VER_MAJOR__ < 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ < 1))
 #error "mlops_adamw_qat for sm_89 needs CUDA 12.1+ (PTX ISA 8.1: cvt with .e4m3x2 / .e5m2x2); drop sm_89 or upgrade nvcc"
@@ -39,9 +31,8 @@
 namespace qat {
 
 // ---- FP8 codecs ---------------------------------------------------------------------------------------
-// Finite codes decode exactly on every path (E5M2EffMA's raw-bits FMUL == cvt, checked on all 256 codes);
-// non-finite codes are outside the contract: cvt gives Inf / NaN (as torch and the PyTorch reference do),
-// E5M2EffMA large finite values. The stored r (E4M3, <= 0x7E) and s (E5M2, <= 123) are always finite.
+// Finite codes decode exactly on every path (E5M2EffMA's raw-bits FMUL == cvt, checked on all 256 codes); non-finite codes are outside the contract:
+// cvt gives Inf / NaN (as torch and the PyTorch reference do), E5M2EffMA large finite values. Stored r (E4M3, <= 0x7E), s (E5M2, <= 123) are finite.
 #if defined(__CUDA_ARCH__) && !defined(QAT_FP8_CVT) && !defined(QAT_FP8_CVT_MODEL)
 template <bool E5M2> __device__ __forceinline__ void dec_fp8x4(uint32_t w, float &v0, float &v1, float &v2, float &v3) {
   if (E5M2) e5ma::decode_e5m2x4(w, v0, v1, v2, v3);

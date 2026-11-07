@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// mlops_adamw / mlops_adamw_qat bandwidth, n = 16Mi elements (a 4096 x 4096 weight).
-//   mlops_adamw:     grad (read), param (rw), exp_avg + exp_avg_sq (rw, FP32)
-//   mlops_adamw_qat: grad (read), u (rw, 2 B), r / s / qbar (rw, 1 B each), codes (rw, 0.5 B), plus per
-//                    16-element block the scale byte, s_exp, cusum, hnum, hden and the next-byte scratch
-// Bytes moved are counted from those formats and compared with the DRAM peak and a device-to-device
-// copy of the same byte count. QAT rows run in the ALU-heaviest regime: every block's secant estimate
-// is positive, so each block votes (evaluates its 17-candidate scale window) on its 1-in-1/(1-beta1)
-// step. Median time per row after an idle pause (see bench_util.h).
+// mlops_adamw / mlops_adamw_qat bandwidth, n = 16Mi elements (a 4096 x 4096 weight): bytes moved are counted from the formats at each row and
+// compared with the DRAM peak and a device-to-device copy of the same byte count. QAT rows run in the ALU-heaviest regime: every block's secant
+// estimate is positive, so each block votes (evaluates its 17-candidate scale window) on its 1-in-1/(1-beta1) step. Median per row after an idle pause.
 #include "mlops_adamw.h"
 #include "mlops_adamw_qat.h"
 #include "bench_util.h"
@@ -57,6 +52,7 @@ int main() {
   mlops_adamw_config cfg{};
   cfg.lr = 1e-3f; cfg.beta1 = 0.9f; cfg.beta2 = 0.999f; cfg.eps = 1e-8f; cfg.weight_decay = 0.01f;
   cfg.step = 1; cfg.bias_correction = 1; cfg.grad_scale = 1.0f;
+  // mlops_adamw bytes: grad (read), param (rw), exp_avg + exp_avg_sq (rw, FP32)
   for (mlops_adamw_dtype pdt : {MLOPS_ADAMW_FP32, MLOPS_ADAMW_BF16, MLOPS_ADAMW_FP16})
     for (mlops_adamw_dtype gdt : {MLOPS_ADAMW_FP32, MLOPS_ADAMW_BF16, MLOPS_ADAMW_FP16}) {
       char name[48]; snprintf(name, sizeof name, "adamw param=%s grad=%s", dtn(pdt), dtn(gdt));
@@ -86,6 +82,8 @@ int main() {
   const size_t sbytes = mlops_adamw_qat_state_bytes(rows, cols);
   cudaMalloc(&sb, sbytes);
   mlops_adamw_qat_state st; mlops_adamw_qat_state_bind(sb, rows, cols, &st);
+  // mlops_adamw_qat bytes: grad (read), u (rw, 2 B), r / s / qbar (rw, 1 B each), codes (rw, 0.5 B), plus per 16-element block the scale byte, s_exp,
+  // cusum, hnum, hden and the next-byte scratch
   const double per_block = 1 /* scale */ + 2 /* s_exp */ + 4 /* cusum */ + 8 /* hnum, hden */ + 3 /* next + commit */;
   for (bool ue : {false, true}) {  // block scales E4M3 / UE5M3
     nvfp4a_tensor q{qd, NVFP4A_NVFP4, qs, 0, qg, nullptr, NVFP4A_GLOBAL_AMAX | (ue ? NVFP4A_SCALES_UE5M3 : 0u), 0};

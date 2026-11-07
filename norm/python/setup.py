@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Build of mlops-norm (import mlops.norm): RMSNorm and LayerNorm with a residual add, gates and INT8 / NVFP4 quantization.
-
-    pip install ./norm/python --no-build-isolation        (from the mlops root; or ./setup.sh norm)
-
-Needs, installed beforehand (nothing is downloaded): PyTorch; nvfp4effma 0.6+ (its headers: the quantizer's primitives
-are imported from it; compiled in, not needed at run time). Architectures and the other variables: ../../build/torch_ext.py.
-"""
+"""Build of mlops-norm (import mlops.norm): ``pip install ./norm/python --no-build-isolation`` (from the mlops root; or ./setup.sh norm).
+Needs, installed beforehand (nothing is downloaded): PyTorch; nvfp4effma 0.6+ (its headers, compiled in: not needed at run time).
+Architectures and the other variables: ../../build/torch_ext.py."""
 import os
 import sys
 

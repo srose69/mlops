@@ -1,16 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Checkpoint and resume, verified bit-exact against an uninterrupted run.
-
-    python 04_checkpoint_resume.py
-
-Where the state lives:
-  * model.state_dict()     NVFP4 codes, block scales, amax AND AdamWQAT's moments (QATLinear buffers),
-                           plus dense parameters
-  * opt.state_dict()       AdamW's FP32 moments and step counts (as for torch.optim.AdamW)
-  * opt_qat.state_dict()   only step counts and hyperparameters; the AdamWQAT `seed` is a constructor
-                           argument, pass the same one when resuming
-"""
+"""Checkpoint and resume, verified bit-exact against an uninterrupted run. Run: python 04_checkpoint_resume.py
+State: model.state_dict() holds NVFP4 codes, block scales, amax AND AdamWQAT's moments (QATLinear buffers), plus dense parameters; opt.state_dict() AdamW's
+FP32 moments and step counts; opt_qat.state_dict() only step counts and hyperparameters (the AdamWQAT `seed` is a constructor argument: pass the same one)."""
 import io
 
 import torch

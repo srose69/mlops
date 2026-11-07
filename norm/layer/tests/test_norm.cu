@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// mlops_norm against a host emulation of its arithmetic, bit for bit: every flavor (RMSNorm and LayerNorm; the weight, one plus
-// it, none; a bias; Hugging Face's order and the single-rounding one; groups), every variant and element count, every dtype pair,
-// with and without a residual (also in place). The gates, whose exp is libm's, within a bound. The INT8 and NVFP4 outputs are
-// the bytes nvfp4a_quantize makes of the call's own y.
-// `test_norm bench`: the call against a device-to-device copy of the same bytes.
+// mlops_norm against a host emulation of its arithmetic, bit for bit: every flavor (RMSNorm and LayerNorm; the weight, one plus it, none; a bias;
+// Hugging Face's order and the single-rounding one; groups), variant, element count and dtype pair, with and without a residual (also in place);
+// the gates (libm's exp) within a bound; INT8 / NVFP4 outputs = nvfp4a_quantize of the call's own y. `test_norm bench`: vs a device-to-device copy.
 #include <cuda_fp16.h>
 
 #include <algorithm>

@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// Closed groups' records -> attention images (full 6-bit codes, metadata in consumption order): one CTA per (group,
-// KV head), warp j decodes sub-block j into shared memory, 16-byte coalesced stores.  sm_75+.
-//
-// Image (TGB = 34048 bytes, sections on 128):
-//   K   [0, 16384)      [128 rows][128 B].  Token 16 b + tau at row 16 b + k_row(tau) (QK's accumulators of lane t
-//                       are tokens 4t .. + 3: PV's A fragment as it is); row chunk c = channels 16 c + KPERM (lane t's
-//                       s8 k positions = its q register channels); chunk c stored at c ^ k_swz(row).
-//   V   [16384, 32768)  4 token quarters of [128 channel rows][32 B] (PV's B fragments), chunk j at j ^ v_swz(row).
-//   KM  [32768, 33536)  record (ks, t) at 48 (4 ks + t): FP32 steps of channels 32 ks + 8 j + 2 t + e, then BF16 bases.
-//   VM  [33536, 34048)  record (cb, t) at 16 (4 cb + t): BF16 (base, step) of channels 16 cb + 2 t, + 1, + 8, + 9.
+// Closed groups' records -> attention images (full 6-bit codes, metadata in consumption order): one CTA per (group, KV head), warp j decodes sub-block j into
+// shared memory, 16-byte coalesced stores. sm_75+. Image layout (TGB = 34048 bytes, sections on 128) beside the section constants below.
 // The swizzles' row-block parts are constant: an ldmatrix address is a lane offset ^ a k-step constant + an immediate.
 #ifndef MLOPS_FBLA_TENSORS_TRANSCODE_CUH
 #define MLOPS_FBLA_TENSORS_TRANSCODE_CUH
@@ -19,7 +11,12 @@
 namespace mlops_fbla_detail {
 namespace tc {
 
+// K [0, 16384): [128 rows][128 B]; token 16 b + tau at row 16 b + k_row(tau) (QK's accumulators of lane t are tokens 4t .. + 3: PV's A fragment as it is); row chunk c = channels
+// 16 c + KPERM (lane t's s8 k positions = its q register channels); chunk c stored at c ^ k_swz(row). V [16384, 32768): 4 token quarters of [128 channel rows][32 B] (PV's B
+// fragments), chunk j at j ^ v_swz(row).
 constexpr int KT = 128 * 128, VT = 128 * 128, VQ = 32 * 128;  // K, V tiles; a V quarter
+// KM [32768, 33536): record (ks, t) at 48 (4 ks + t): FP32 steps of channels 32 ks + 8 j + 2 t + e, then BF16 bases. VM [33536, 34048): record (cb, t) at 16 (4 cb + t):
+// BF16 (base, step) of channels 16 cb + 2 t, + 1, + 8, + 9.
 constexpr int KMB = 16 * 48, VMB = 32 * 16;                    // K, V metadata
 constexpr int O_V = KT, O_KM = KT + VT, O_VM = O_KM + KMB, TGB = O_VM + VMB;
 static_assert(TGB == 34048 && TGB == IMAGE_BYTES && TGB % 128 == 0 && O_KM % 128 == 0 && O_VM % 128 == 0, "the image's sections on 128 bytes");
@@ -105,10 +102,9 @@ template <class Pos> __device__ __forceinline__ uint4 meta_chunk(const uint32_t 
   return make_uint4(Pos::ro(p), Pos::ro(p + 2), Pos::ro(p + 8), Pos::ro(p + 10));
 }
 
-// Group g = g_end - 1 - blockIdx.x (the chunk's newest closed group first, g_end = the last position's group) of KV head
-// blockIdx.y to tiles + bh hstep + (g - toff) gstep: the grid covers the chunk's own closed groups -- count/G + 2 from
-// g_end whatever the chunk's start -- and needs no launch sized by the start.  flagged (persistent images: the slot's
-// word after the image; close_kernel clears it): a group whose flag is set is skipped, a transcoded one sets it.
+// Group g = g_end - 1 - blockIdx.x (the chunk's newest closed group first, g_end = the last position's group) of KV head blockIdx.y to tiles + bh hstep + (g - toff) gstep:
+// the grid covers the chunk's own closed groups (count/G + 2 from g_end whatever the chunk's start) and needs no launch sized by the start. flagged (persistent images:
+// the slot's word after the image; close_kernel clears it): a group whose flag is set is skipped, a transcoded one sets it.
 template <int CB, int FB, class Pos = Grid>
 __device__ __forceinline__ void transcode_item(const PrefillArgs &a, uint8_t *tiles, size_t hstep, size_t gstep, int toff, bool flagged,
                                                uint8_t *img) {

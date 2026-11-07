@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// Shared measurement helper of the mlops_adamw benchmark (methodology lifted from NVFP4EffMA's
-// bench_util.h, env var prefix renamed MLOPS_BENCH_*).
-//
-// Before the first row: MLOPS_BENCH_WARMUP (default 4) plain FP32 matrix products 2048 x 2048, 0.5 s
-// apart, so that GPU Boost has raised the clocks (otherwise the first rows run at a lower SM clock).
-// Every row: one untimed call (module loading), MLOPS_BENCH_COOL seconds of idle GPU (default 2) so
-// each row starts from a similar temperature, then MLOPS_BENCH_REPS timed calls (default per bench).
-// The reported time is the median. While a row runs, a host thread samples the SM clock through NVML
-// every 5 ms; percentages of a peak use that row's own mean clock, so rows that heat the GPU more
-// (and run at a lower clock) are not compared against a clock they never had.
+// Shared measurement helper of the mlops_adamw benchmark (NVFP4EffMA's bench_util.h, env prefix MLOPS_BENCH_*): MLOPS_BENCH_WARMUP (4) FP32
+// products first so the clocks are raised, then per row one untimed call, MLOPS_BENCH_COOL (2) s idle and MLOPS_BENCH_REPS timed calls; the time
+// is the median. A host thread samples the SM clock through NVML every 5 ms; percentages of a peak use the row's own mean clock.
 #pragma once
 #include <algorithm>
 #include <atomic>

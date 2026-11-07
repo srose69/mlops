@@ -1,18 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""mlops.optim: AdamW and the NVFP4 AdamW-QAT on CUDA (the mlops-optimizers package).
-
-* ``AdamW``         dense CUDA parameters (bfloat16 / float16 / float32), FP32 moments, matches torch.optim.AdamW.
-* ``AdamWQAT``      the NVFP4 weights of ``QATLinear`` layers, trained in place: no master copy, 5 B of state per
-                    weight + 8 per 16-weight block.
-* ``QATLinear``     bias-free linear layer with an NVFP4 weight (NVFP4EffMA's GEMM), ``QATParameter`` its handle.
-* ``split_params``  (dense, QAT) parameters of a model, for the two optimizers.
-* ``to_e4m3``       an NVFP4 weight's UE5M3 block scales as E4M3 ones, the same values (export to TE / cuBLASLt).
-* ``functional``    the kernels as functions (``adamw``, ``QATState``, ``fp8_grad``); ``reference`` the QAT step in
-                    PyTorch, bit-identical to the kernel.
-
-    from mlops.optim import AdamW, AdamWQAT, QATLinear, split_params
-"""
+"""mlops.optim: ``AdamW`` (dense CUDA parameters, FP32 moments, matches torch.optim.AdamW), ``AdamWQAT`` (the NVFP4 weights of ``QATLinear`` layers,
+trained in place: 5 B of state per weight + 8 per 16-weight block), ``QATLinear`` / ``QATGroupedLinear`` / ``QATParameter`` (NVFP4 linear layer, the stacked layer of a mixture of experts, and the handle),
+``split_params``, ``to_e4m3`` (UE5M3 block scales as E4M3, export), ``functional`` (the kernels as functions), ``reference`` (the QAT step in PyTorch)."""
 import torch  # noqa: F401  (loads libtorch / libc10, which _C links)
 
 from . import _C
@@ -35,7 +25,7 @@ def _check_nvfp4effma():
 _check_nvfp4effma()
 
 from . import functional, reference  # noqa: E402
-from .optim import AdamW, AdamWQAT, QATLinear, QATParameter, split_params, to_e4m3  # noqa: E402
+from .optim import AdamW, AdamWQAT, QATGroupedLinear, QATLinear, QATParameter, split_params, to_e4m3  # noqa: E402
 
-__all__ = ["AdamW", "AdamWQAT", "QATLinear", "QATParameter", "split_params", "to_e4m3", "functional", "reference",
+__all__ = ["AdamW", "AdamWQAT", "QATGroupedLinear", "QATLinear", "QATParameter", "split_params", "to_e4m3", "functional", "reference",
            "__version__"]

@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 """Build of mlops-positional (import mlops.positional): positional encodings (RoPE) for PyTorch.
-
-    pip install ./positional/python --no-build-isolation        (from the mlops root; or ./setup.sh positional)
-
-Needs only PyTorch and the CUDA toolkit. Architectures and the other variables: ../../build/torch_ext.py.
-"""
+``pip install ./positional/python --no-build-isolation`` (from the mlops root; or ./setup.sh positional); needs only PyTorch and the CUDA
+toolkit. Architectures and the other variables: ../../build/torch_ext.py."""
 import os
 import sys
 

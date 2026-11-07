@@ -1,13 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Convert an existing model: replace its nn.Linear layers with QATLinear, initialized from their weights.
-
-    python 02_convert_model.py
-
-Typical for QAT fine-tuning of a pretrained model. QATLinear has no bias and needs in_features % 64 == 0,
-so layers with a bias are handled by keeping the bias as a separate dense parameter, and layers of
-another shape stay dense.
-"""
+"""Convert an existing model: replace its nn.Linear layers with QATLinear, initialized from their weights (QAT fine-tuning of a pretrained model).
+QATLinear has no bias and needs in_features % 64 == 0: layers with a bias keep the bias as a separate dense parameter, layers of another shape stay dense.
+Run: python 02_convert_model.py"""
 import torch
 import torch.nn as nn
 

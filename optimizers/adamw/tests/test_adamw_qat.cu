@@ -1,19 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-/* mlops_adamw_qat tests.
- *   1. codecs: SR into E4M3 / E5M2 (E[s^2] = v) / BF16 / fixed point is unbiased, the Quake rsqrt stays
- *      within 6.5e-4, e2m1_round agrees with NVFP4EffMA's f32_to_e2m1 on every 7th float in [0, 8).
- *   2. one step vs an independent double-precision reference of include/mlops_adamw_qat.h, linear and
- *      swizzled scales, E4M3 and UE5M3 scales: every stored s, r is one of the two SR neighbours of the
- *      exact value, u and qbar are within one quantum, code == round(u), the secant accumulators are BF16
- *      neighbours, voting blocks update the CUSUM and move exactly as the reference (a move keeps the
- *      master values), silent blocks keep their CUSUM and scale.
- *   3. behaviour over many steps, with E4M3 and with UE5M3 scales: pure-noise gradients leave the block
- *      scales put; blocks whose optimum is exactly representable 3 codes up find that scale; a constant
- *      gradient walks one element down its cells at lr / cell width per step.
- *   4. headroom: weights growing 32x -- every UE5M3 block follows exactly; E4M3 blocks that fit follow,
- *      the others settle at their vote's optimum within E4M3.
- */
+/* mlops_adamw_qat tests: 1. codecs, 2. one step vs a double-precision reference, 3. behaviour over many steps, 4. headroom (see each section). */
 #include "mlops_adamw_qat.h"
 #include "../src/qat_codec.cuh"
 #include <cstdio>
@@ -60,6 +47,8 @@ static double e2m1_round_d(double a) {  // nearest E2M1 magnitude, ties to the e
 }
 
 // ---- 1. codecs ------------------------------------------------------------------------------------
+// SR into E4M3 / E5M2 (E[s^2] = v) / BF16 / fixed point is unbiased, the Quake rsqrt stays within 6.5e-4, e2m1_round agrees with NVFP4EffMA's
+// f32_to_e2m1 on every 7th float in [0, 8)
 static int test_codecs() {
   std::mt19937 rng(3); std::uniform_real_distribution<float> U(0, 1);
   int f = 0;
@@ -158,7 +147,10 @@ static bool sr_ok(double got, double x, double (*dec)(uint32_t), int ncodes, dou
 }
 
 // ---- 2. one step vs double reference ----------------------------------------------------------------
+// an independent double-precision reference of include/mlops_adamw_qat.h, linear and swizzled scales, E4M3 and UE5M3 scales; checks beside the code
 static int test_reference(bool swz, bool ue) {
+  // every stored s, r is one of the two SR neighbours of the exact value, u and qbar are within one quantum, code == round(u), the secant accumulators
+  // are BF16 neighbours; voting blocks update the CUSUM and move exactly as the reference (a move keeps the master values), silent blocks keep theirs
   const int rows = 8, cols = 1024, n = rows * cols, nb = cols / 16, nblk = rows * nb;
   Q q(rows, cols, swz, ue);
   std::mt19937 rng((swz ? 21 : 20) + (ue ? 10 : 0)); std::normal_distribution<float> N(0, 1); std::uniform_real_distribution<float> U(0, 1);
@@ -303,6 +295,8 @@ static int test_reference(bool swz, bool ue) {
 }
 
 // ---- 3. behaviour over many steps ------------------------------------------------------------------
+// with E4M3 and with UE5M3 scales: pure-noise gradients leave the block scales put; blocks whose optimum is exactly representable 3 codes up find
+// that scale; a constant gradient walks one element down its cells at lr / cell width per step
 static int test_behaviour(bool ue) {
   const char *fmt = ue ? "UE5M3" : "E4M3 ";
   int f = 0;
@@ -377,15 +371,11 @@ static int test_behaviour(bool ue) {
 }
 
 // ---- 4. headroom: weights that grow 32x ---------------------------------------------------------------------
-// Init leaves 2^3 of growth with E4M3 scales (the top block 24 codes below 448) and 2^8 with UE5M3. Every
-// target weight is an exact lattice value of magnitude 0.5 .. 3 times a block scale that drifts up one code
-// every ~75 steps to 40 codes (32x) above the initial one, as growing weights do. A block fits if some code up
-// to the format's top puts all its weights on the E2M1 lattice (amax 3 needs UP - 8 codes up, 1.5 UP - 16);
-// a fitting block must represent its weights exactly. A block past the top settles where its vote is
-// minimal: the Huber distance (delta sigma) of its weights as the lattice sees them, |w| <= 8 sigma (u is
-// Q3.12), to each code's E2M1 lattice -- the top, or a code or two below when the saturated elements' losses
-// tie and the small ones prefer a finer scale. With UE5M3 every block fits.
+// Init leaves 2^3 of growth with E4M3 scales (the top block 24 codes below 448) and 2^8 with UE5M3. Every target weight is an exact lattice value of
+// magnitude 0.5 .. 3 times a block scale that drifts up one code every 75 steps to 40 codes (32x) above the initial one, as growing weights do.
 static int test_headroom(bool ue) {
+  // A block fits if some code up to the format's top puts all its weights on the E2M1 lattice (amax 3 needs UP - 8 codes up, 1.5 UP - 16); a fitting
+  // block must represent its weights exactly (every UE5M3 block fits).
   const int rows = 16, cols = 256, n = rows * cols, nblk = n / 16, UP = 40, T = 4000, ramp = 3000;
   std::mt19937 rng(9); std::normal_distribution<float> N(0, 1); std::uniform_int_distribution<int> C(0, 15);
   std::vector<float> w(n); for (auto &x : w) x = 0.02f * N(rng);  // the blocks' scales within a few codes of the top
@@ -411,6 +401,8 @@ static int test_headroom(bool ue) {
     up(dg, g); cfg.step = t; ST(mlops_adamw_qat(&cfg, rows, cols, dg, MLOPS_ADAMW_FP32, &q.t, &q.st, 0));
   }
   const auto s1 = down(q.sc, q.sbytes), d1 = down(q.data, n / 2);
+  // a block past the top settles where its vote is minimal: the Huber distance (delta sigma) of its weights as the lattice sees them, |w| <= 8 sigma
+  // (u is Q3.12), to each code's E2M1 lattice -- the top, or a code or two below when the saturated elements' losses tie and the small ones prefer a finer scale
   int fit = 0, exact = 0, past = 0, settled = 0;
   double perr = 0;
   for (int b = 0; b < nblk; b++) {

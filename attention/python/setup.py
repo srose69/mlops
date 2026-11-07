@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Build mlops-attention (import mlops.attention): FBLA compressed-KV FlashAttention prefill and decode.
-
-    pip install ./attention/python --no-build-isolation        (from the mlops root; or ./setup.sh attention)
-
-Needs PyTorch, the CUDA toolkit and a target GPU sm_61 or newer. Architectures and the other variables:
-../../build/torch_ext.py.
-"""
+"""Build mlops-attention (import mlops.attention): ``pip install ./attention/python --no-build-isolation`` (from the mlops root; or ./setup.sh attention).
+Needs PyTorch, the CUDA toolkit and a target GPU sm_61 or newer. Architectures and the other variables: ../../build/torch_ext.py."""
 import os
 import sys
 from setuptools import setup

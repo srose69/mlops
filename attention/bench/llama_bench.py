@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""llama-bench's tests for the mlops stack: a whole model on samples/04_generate.py's decoder (NVFP4EffMA linear
-layers, mlops.positional RoPE, FBLA prefill / decode), so its numbers sit beside llama.cpp's.
-
-    python bench/llama_bench.py MODEL_DIR [-p 512] [-n 128] [-d 0,4096] [-r 5] [--mode 4+2] [--nvfp4 mlp]
-
-As llama-bench: random tokens; `ppP` processes P prompt tokens in one batch, `tgN` generates N tokens one at a
-time; `@ dD` runs the test after a context of D tokens is already in the cache (not timed); one warm-up run,
-then -r timed runs on a fresh cache each, reported as mean +- standard deviation of tokens/s.  The model is
-placed per depth (the cache first, then the layers that fit); the rest stream from host memory (the column
-`GPU layers`).
-"""
+"""llama-bench's tests for the mlops stack: a whole model on samples/04_generate.py's decoder (NVFP4EffMA linear layers, RoPE, FBLA).
+Run: python bench/llama_bench.py MODEL_DIR [-p 512] [-n 128] [-d 0,4096] [-r 5] [--mode 4+2] [--nvfp4 mlp]. As llama-bench: random tokens; `ppP` = P prompt tokens
+in one batch, `tgN` = N tokens one at a time, `@ dD` after D cached tokens (not timed); one warm-up, then -r timed runs on a fresh cache (mean +- std of tokens/s)."""
 import argparse
 import importlib.util
 import os

@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// mlops_fbla_decode latency and the DRAM traffic it implies, streaming: one cache laid out for 1M tokens
-// (capacity), filled on the device, decoded at a growing context 16K .. 1M.  B = 1, D = 128, one decode query
-// per head: one KV head with 2 or 4 q heads, the Qwen3-0.6B geometry (8 KV heads, 16 q heads) and 16 KV heads.
-//
-// The cache holds random codes, whose scores are flatter than a language model's: tau is chosen per context
-// so that the share of refined (q head, sub-block) pairs is the one measured on Qwen3-0.6B at 16K (3+3:
-// 12.3 %, 4+2: 4.8 %); the printed share is that of (KV head, sub-block) pairs, which the GQA queries read
-// once.  Bytes read per call: the coarse planes of every closed group, the metadata (4 x 256 bytes per group),
-// the BF16 sink and open groups, and for every refined sub-block both planes of K and V once more; "BF16
-// equiv." is the K + V of a BF16 cache of that context.
+// mlops_fbla_decode latency and the DRAM traffic it implies, streaming: one cache laid out for 1M tokens (capacity), filled on the device, decoded at a growing
+// context 16K .. 1M. B = 1, D = 128, one decode query per head: one KV head with 2 or 4 q heads, the Qwen3-0.6B geometry (8 KV heads, 16 q heads), 16 KV heads.
 #include "mlops_fbla.h"
 #include "bench_util.h"
 #include <cmath>
@@ -29,9 +21,8 @@ template <class T> static T *upload(const std::vector<T> &h) {
 }
 static uint16_t bf16(float x) { uint32_t u; memcpy(&u, &x, 4); return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16); }
 
-// About one second of timed work per row on the reference GTX 1080.  A single repeat count cannot cover
-// both the 40 us one-head/16K row and the 7 ms eight-head/1M row.  As in the other mlops benchmarks these
-// are only defaults: MLOPS_BENCH_REPS overrides every row for another GPU or a quick run.
+// Repeat counts sized so every row times about the same total work: a single count cannot cover both the shortest (one head, 16K) and the longest (eight heads,
+// 1M) row. As in the other mlops benchmarks these are only defaults: MLOPS_BENCH_REPS overrides every row for another GPU or a quick run.
 static int default_reps(int cb, int KH, int gqa, int tokens) {
   static constexpr int reps[4][2][6] = {
     {{18000, 14500, 10000, 5500, 3000, 1600}, {25000, 16000, 10000, 5500, 3000, 1600}}, // KV1 GQA2
@@ -126,6 +117,8 @@ static void run_case(Bench &bench, double peak_gbs, const Cache &cc, int KH, int
   for (int r = 0; r < B * QH; ++r) {
     for (int j = first; j < last; ++j) w.push_back((float)exp2(lse[(size_t)r * nb + j] - row_lse[r]));
   }
+  // random codes score flatter than a language model's, so tau is chosen per context for a fixed share of refined (q head, sub-block) pairs (3+3: 12.3 %,
+  // 4+2: 4.8 %); the printed share is that of (KV head, sub-block) pairs, which the GQA queries read once
   std::vector<float> sorted = w;
   if (!sorted.empty()) {
     const size_t k = std::min(sorted.size() - 1, (size_t)llround((cb == 3 ? .123 : .048) * sorted.size()));
@@ -140,6 +133,8 @@ static void run_case(Bench &bench, double peak_gbs, const Cache &cc, int KH, int
       refined += any;
     }
   const double share = per ? (double)refined / ((size_t)KH * per) : 0.;
+  // bytes read per call: the coarse planes of every closed group, the metadata (4 x 256 bytes per group), the BF16 sink and open groups, and for every
+  // refined sub-block both planes of K and V once more; "BF16 equiv." is the K + V of a BF16 cache of that context
   const double closed_tokens = std::max(0, groups - 2) * (double)G, exact_tokens = tokens - closed_tokens;
   const double bytes = heads * (closed_tokens * D * cb / 8.0 * 2 + std::max(0, groups - 2) * 4.0 * 256 +
                                 exact_tokens * D * 2 * 2 + share * closed_tokens / S * (cb + fb) * 256 * 2);
@@ -185,6 +180,60 @@ static void run_prefill_case(Bench &bench, const Cache &cc, int KH, int gqa, int
          row.ms, pairs / (row.ms * 1e-3) * 1e-9, 4.0 * D * pairs / (row.ms * 1e-3) * 1e-12, row.mhz);
   fflush(stdout);
   for (void *x : {(void *)q, (void *)k, (void *)v, (void *)out, (void *)cache.tc_images}) cudaFree(x);
+}
+
+// A prefill program's chunk of `chunk` tokens at the device length: the attention inputs (qkv rows -> per-head q, k, v; norm and
+// RoPE) and the attention with its output as head-major rows or as token-major rows for the next projection.
+static void run_chunk_case(Bench &bench, double peak_gbs, const Cache &cc, int KH, int gqa, int ctx, int chunk) {
+  const int QH = gqa * KH, D = 128;
+  const mlops_fbla_format fmt = cc.cb == 3 ? MLOPS_FBLA_3P3 : MLOPS_FBLA_4P2;
+  const size_t row = (size_t)KH * (gqa + 2) * D;
+  uint16_t *proj, *q, *k, *v, *out, *qn, *kn;
+  float *freq;
+  int *len, *cnt;
+  CUDA_OK(cudaMalloc(&proj, row * chunk * 2)); CUDA_OK(cudaMalloc(&q, (size_t)QH * chunk * D * 2));
+  CUDA_OK(cudaMalloc(&out, (size_t)QH * chunk * D * 2));
+  CUDA_OK(cudaMalloc(&k, (size_t)KH * chunk * D * 2)); CUDA_OK(cudaMalloc(&v, (size_t)KH * chunk * D * 2));
+  CUDA_OK(cudaMalloc(&qn, D * 2)); CUDA_OK(cudaMalloc(&kn, D * 2)); CUDA_OK(cudaMalloc(&freq, 64 * 4 * 4));
+  CUDA_OK(cudaMalloc(&len, 4)); CUDA_OK(cudaMalloc(&cnt, 4));
+  fill_bf16<<<256, 256>>>(proj, row * chunk, 31, -2.f, 4.f);
+  fill_bf16<<<256, 256>>>(q, (size_t)QH * chunk * D, 21, -2.f, 4.f);
+  fill_bf16<<<256, 256>>>(k, (size_t)KH * chunk * D, 22, -2.f, 4.f);
+  fill_bf16<<<256, 256>>>(v, (size_t)KH * chunk * D, 23, -1.f, 2.f);
+  fill_bf16<<<1, D>>>(qn, D, 24, 0.f, 1.f); fill_bf16<<<1, D>>>(kn, D, 25, 0.f, 1.f);
+  std::vector<float> f(64 * 4, 1e-3f);
+  CUDA_OK(cudaMemcpy(freq, f.data(), f.size() * 4, cudaMemcpyHostToDevice));
+  const int zero = 0;
+  CUDA_OK(cudaMemcpy(len, &zero, 4, cudaMemcpyHostToDevice)); CUDA_OK(cudaMemcpy(cnt, &chunk, 4, cudaMemcpyHostToDevice));
+  mlops_fbla_config head_major{1, QH, KH, ctx, 0.f, 0.f, fmt, cc.cap}, token_major = head_major;
+  token_major.out_head_stride = D;
+  token_major.out_token_stride = (int64_t)QH * D;
+  mlops_fbla_cache cache{cc.coarse, cc.fine, cc.meta, cc.ex, cc.ex + KH * 128 * 128, cc.ex2, cc.ex2 + KH * 128 * 128, nullptr};
+  const size_t img_bytes = mlops_fbla_images_bytes(&head_major);
+  if (img_bytes) { CUDA_OK(cudaMalloc(&cache.tc_images, img_bytes)); CUDA_OK(cudaMemset(cache.tc_images, 0, img_bytes)); }
+  const mlops_fbla_token tok{proj, proj + gqa * D, proj + (gqa + 1) * D, (int64_t)row, (int64_t)(gqa + 2) * D, (int64_t)(gqa + 2) * D,
+                             qn, kn, 1e-6f, freq, 0.f, nullptr};
+  auto check = [](int st) { if (st) { fprintf(stderr, "%s\n", mlops_fbla_last_error()); exit(1); } };
+  check(mlops_fbla_prefill(&head_major, chunk, q, k, v, &cache, out, 0));  // the images of the context's closed groups
+  CUDA_OK(cudaDeviceSynchronize());
+  auto time_of = [&](auto call) {
+    call(); CUDA_OK(cudaDeviceSynchronize());
+    cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+    cudaEventRecord(e0); call(); cudaEventRecord(e1); cudaEventSynchronize(e1);
+    float est; cudaEventElapsedTime(&est, e0, e1);
+    return bench.run(call, std::max(3, std::min(300, (int)(800.f / std::max(est, 1e-3f)))));
+  };
+  const BenchRow inputs = time_of([&] { check(mlops_fbla_qkv_prefill_at(&head_major, len, cnt, chunk, &tok, q, k, v, 0)); });
+  const BenchRow heads = time_of([&] { check(mlops_fbla_prefill_at(&head_major, len, cnt, chunk, q, k, v, &cache, out, 0)); });
+  const BenchRow tokens = time_of([&] { check(mlops_fbla_prefill_at(&token_major, len, cnt, chunk, q, k, v, &cache, out, 0)); });
+  const double moved = (double)(row * chunk + (size_t)(QH + 2 * KH) * chunk * D) * 2;  // the inputs pass reads the rows, writes q, k, v
+  printf("%-6s %3d %3d %9d %7d %12.3f %10.1f %9.1f%% %14.3f %14.3f %+9.1f%%\n", cc.cb == 3 ? "3+3" : "4+2", KH, gqa, ctx, chunk, inputs.ms,
+         moved / (inputs.ms * 1e-3) * 1e-9, 100.0 * moved / (inputs.ms * 1e-3) * 1e-9 / peak_gbs, heads.ms, tokens.ms,
+         100.0 * (tokens.ms / heads.ms - 1.0));
+  fflush(stdout);
+  for (void *x : {(void *)proj, (void *)q, (void *)k, (void *)v, (void *)out, (void *)qn, (void *)kn, (void *)freq, (void *)len, (void *)cnt,
+                  (void *)cache.tc_images})
+    cudaFree(x);
 }
 
 int main() {
@@ -270,6 +319,31 @@ int main() {
     for (const auto &pc : pcases) {
       char s[96]; name(s, sizeof s, pc[0], pc[1]);
       if (bench_want(s)) run_prefill_case(bench, cc, KH, gqa, pc[0], pc[1]);
+    }
+  }
+
+  // ---- the prefill program's chunk: the attention inputs, and the output layout ----------------------------------------
+  const int ccases[][2] = {{0, 2048}, {16384, 2048}};
+  bool chunk_header = false;
+  for (int fmt = 0; fmt < 2; ++fmt) {
+    const int KH = 8, gqa = 4, cb = fmt ? 4 : 3, fb = fmt ? 2 : 3;  // Qwen3-8B heads
+    auto name = [&](char *s, size_t n, int ctx, int chunk) {
+      snprintf(s, n, "CHUNK %d+%d KV=%d GQA=%d ctx=%d chunk=%d", cb, fb, KH, gqa, ctx, chunk);
+    };
+    bool any = false;
+    for (const auto &cs : ccases) { char s[96]; name(s, sizeof s, cs[0], cs[1]); any |= bench_want(s); }
+    if (!any) continue;
+    if (!chunk_header) {
+      printf("\nprefill chunk at the device length (Qwen3-8B heads): inputs = norm + RoPE + head-major q, k, v from the projection's rows;\n"
+             "attention = prefill_at with its output head-major or token-major (the next projection's B)\n"
+             "%-6s %3s %3s %9s %7s %12s %10s %10s %14s %14s %10s\n", "format", "KV", "GQA", "context", "chunk", "inputs ms", "GB/s",
+             "DRAM peak", "attn head ms", "attn token ms", "token vs");
+      chunk_header = true;
+    }
+    Cache cc(cb, fb, 1 << 19, KH);
+    for (const auto &cs : ccases) {
+      char s[96]; name(s, sizeof s, cs[0], cs[1]);
+      if (bench_want(s)) run_chunk_case(bench, peak, cc, KH, gqa, cs[0], cs[1]);
     }
   }
   return 0;

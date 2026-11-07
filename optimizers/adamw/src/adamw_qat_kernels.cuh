@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// mlops_adamw_qat kernels: math and layout in include/mlops_adamw_qat.h; formats in qat_codec.cuh, E2M1 / E4M3
-// decode and RNE encode from NVFP4EffMA, FP8 decodes from qat_codec.cuh (E5M2EffMA below sm_89, native
-// cvt from sm_89). Four threads per 1x16 block, four elements each: a warp moves 8 whole blocks with coalesced 2-8 byte accesses per array and a block's sums
-// are two shuffles. (Two threads x 8 elements halves the access count but needs 72 registers: 3 thread
-// blocks per SM instead of 4, and slower.)
-//
-// The step kernel has one instance per gradient type, each in its own translation unit (adamw_qat_inst.cu),
-// so a multi-architecture build compiles them in parallel; the host side is adamw_qat.cu.
+// mlops_adamw_qat kernels: math and layout in include/mlops_adamw_qat.h; formats in qat_codec.cuh (E2M1 / E4M3 decode and RNE encode from NVFP4EffMA,
+// FP8 decodes from qat_codec.cuh: E5M2EffMA below sm_89, native cvt from sm_89). Four threads per 1x16 block, four elements each: a warp moves 8 whole
+// blocks with coalesced 2-8 byte accesses per array and a block's sums are two shuffles. One step-kernel instance per gradient type (adamw_qat_inst.cu), host side adamw_qat.cu.
 #pragma once
 #include "common.cuh"
 #include "qat_codec.cuh"

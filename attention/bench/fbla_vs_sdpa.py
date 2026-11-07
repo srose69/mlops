@@ -1,25 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""FBLA decode and prefill against the fastest attention the machine has: flash-attn 2 if installed, else
-PyTorch's scaled_dot_product_attention (the flash backend where it exists, the memory-efficient one otherwise).
-
-Accuracy (--qkv: q, k, v of every layer of a model at 16K, as captured for the format study): one decode query (the last position) per layer against
-float64 attention, relative error of the 16 q heads' outputs, for the FBLA kernel, the PyTorch model of its
-format (python/mlops/attention/fbla_reference.py, normalized-mass refinement, the same tau) and SDPA.
-
-Speed (random K / V, B = 1, KV heads 8, D = 128; the baseline reads the BF16 K / V of the whole context, FBLA its
-6.25-bit cache).  Every call is timed alone with CUDA events, 50 calls a mode, medians; the SM clock is the NVML
-median while the call is in flight.
-    idle   200 ms of pause before each call: the GPU is at its boost clock
-    warm   back-to-back calls after a second of load: the sustained clock under the board's power limit
-Decode: one query per q head, the L2 flushed before each call (a decode step reads a cache that is not there), both
-sides replayed from a CUDA graph where it captures (no launch overhead in the time).  Prefill: a chunk of queries
-appended to a cache of `context` tokens, causal over all of them; FBLA is the whole mlops.attention.prefill call
-(close, transcode, attention, finish) on a cache with persistent images.
-
-    python bench/fbla_vs_sdpa.py [--qkv qkv_16k.pt] [--decode 16384,65536,131072,262144] [--prefill]
-"""
+"""FBLA decode and prefill against the fastest attention the machine has: flash-attn 2 if installed, else PyTorch's scaled_dot_product_attention (the flash
+backend where it exists, the memory-efficient one otherwise): accuracy (--qkv) and speed (--decode, --prefill), described beside accuracy / measure / speed_*.
+Run: python bench/fbla_vs_sdpa.py [--qkv qkv_16k.pt] [--decode 16384,65536,131072,262144] [--prefill]"""
 import argparse
 import math
 import threading
@@ -62,6 +46,9 @@ def kernel_rows(q, k, v, mode, tau, scale, M):
     return torch.stack(out, 1)
 
 
+# --qkv: q, k, v of every layer of a model at 16K, as captured for the format study: one decode query (the last position) per layer against float64 attention,
+# relative error of the 16 q heads' outputs, for the FBLA kernel, the PyTorch model of its format (python/mlops/attention/fbla_reference.py, normalized-mass
+# refinement, the same tau) and SDPA
 def accuracy(path, layers, M):
     d = torch.load(path)
     scale = d.get("scale") or 1 / math.sqrt(128)
@@ -131,6 +118,9 @@ def med(x):
     return float("nan") if not n else s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
 
 
+# Speed: random K / V, B = 1, KV heads 8, D = 128; the baseline reads the BF16 K / V of the whole context, FBLA its 6.25-bit cache. Every call is timed alone with
+# CUDA events, 50 calls a mode, medians; the SM clock is the NVML median while the call is in flight. Modes: idle = 200 ms of pause before each call (the GPU
+# is at its boost clock), warm = back-to-back calls after a second of load (the sustained clock under the board's power limit)
 def measure(f, clock, flush=None):
     """-> {'idle': (ms, MHz), 'warm': (ms, MHz)}: medians of NRUN calls timed alone, with `flush()` before each call
     (outside the timing).  nan when PyTorch runs out of memory."""
@@ -235,6 +225,8 @@ def mhz(x):
     return "-" if x != x else f"{x:.0f}"
 
 
+# Decode: one query per q head, the L2 flushed before each call (a decode step reads a cache that is not there), both sides replayed from a CUDA graph where it
+# captures (no launch overhead in the time)
 def speed_decode(sizes, gqa):
     torch.manual_seed(0)
     clock, flush = Clock(), l2_flush()
@@ -272,6 +264,8 @@ def speed_decode(sizes, gqa):
     print()
 
 
+# Prefill: a chunk of queries appended to a cache of `context` tokens, causal over all of them; FBLA is the whole mlops.attention.prefill call (close,
+# transcode, attention, finish) on a cache with persistent images
 def speed_prefill(cases, mode):
     torch.manual_seed(0)
     clock = Clock()

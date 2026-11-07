@@ -1,24 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""A 3-layer transformer that learns to sort 24 numbers, trained with NVFP4 weights on the whole mlops stack
-(the dense model: mlops-positional's samples/04_training.py):
-
-* every linear layer of the blocks is an mlops.optim.QATLinear: its weight IS an NVFP4 tensor (E2M1 values, a UE5M3
-  scale per 16, an FP32 global), the forward runs NVFP4EffMA's GEMM on it, the backward hands the
-  optimizer FP8 (E5M2) gradients;
-* AdamWQAT trains those weights in place -- no FP32 master copy, FP8 moments, 5 B of state per weight -- and
-  mlops.optim.AdamW the dense rest (embedding, norms, output head);
-* mlops.positional.RoPE rotates q and k.
-
-It prints the weight + optimizer memory of the NVFP4 layers (6 B per weight) next to what FP32 weights with torch's
-AdamW take (16 B), and ends within a few points of the dense model: on a GTX 1080, 98.3 % of the tokens and 64.5 % of
-the sequences sorted, against 98.4 % and 67.6 %.
-
-    python 08_transformer_training.py [e4m3]    (needs mlops-positional and nvfp4effma; 40 s on a GTX 1080)
-
-"e4m3" trains with E4M3 block scales (8x of growth instead of UE5M3's 256x); this model never needs more, so
-the run is the same bit for bit.
-"""
+"""A 3-layer transformer that learns to sort 24 numbers (the dense model: mlops-positional's samples/04_training.py), trained with NVFP4 weights on the
+whole mlops stack: QATLinear layers (weight = NVFP4 tensor: E2M1 values, a UE5M3 scale per 16, an FP32 global) trained in place by AdamWQAT (5 B of state per
+weight), AdamW for the dense rest, RoPE for q and k. Prints the NVFP4 layers' weight + optimizer memory (6 B per weight) vs FP32 + torch AdamW (16 B). Run: python 08_transformer_training.py [e4m3]"""
 import sys
 
 import torch
@@ -30,7 +14,8 @@ from mlops.positional import RoPE
 
 N, NUMS = 24, 64
 VOCAB, DIM, HEADS, KV_HEADS, LAYERS, STEPS = NUMS + 1, 256, 8, 2, 3, 2000
-GRAD = torch.float8_e5m2                            # FP8 gradients for the NVFP4 weights
+GRAD = torch.float8_e5m2                            # FP8 (E5M2) gradients for the NVFP4 weights: the backward hands them to the optimizer
+# "e4m3" trains with E4M3 block scales (8x of growth instead of UE5M3's 256x); this model never needs more, so the run is the same bit for bit
 SCALES = "e4m3" if "e4m3" in sys.argv[1:] else "ue5m3"
 
 

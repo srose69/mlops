@@ -1,13 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Quickstart: a small MLP whose linear layers are NVFP4, trained with AdamW + AdamWQAT.
-
-    python 01_quickstart.py
-
-The two optimizers split a model between them:
-  * AdamW     dense parameters (norms, embeddings, biases, ordinary nn.Linear, ...)
-  * AdamWQAT  the NVFP4 weights of QATLinear layers, nothing else
-"""
+"""Quickstart: a small MLP whose linear layers are NVFP4, trained with AdamW + AdamWQAT. Run: python 01_quickstart.py
+The two optimizers split a model between them: AdamW the dense parameters (norms, embeddings, biases, ordinary nn.Linear, ...), AdamWQAT the NVFP4
+weights of QATLinear layers, nothing else."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

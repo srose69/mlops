@@ -12,12 +12,19 @@ struct EmbedOp {
   const uint16_t *table;  // [vocab][hidden], device or mapped host memory
   const int *ids;         // [n]
   const uint16_t *w;      // [hidden], or null
-  float *x;               // [n][hidden], or null
+  void *x;                // [n][hidden] of x_dtype, or null
   uint16_t *xw;           // [n][hidden], or null
   float *parts;           // [n][hidden / 256], or null
   int *error;             // or null
-  int vocab, hidden, n, items;
+  int vocab, hidden, n, items, x_dtype;
 };
+
+// f16(x) rounded to nearest even.
+__device__ __forceinline__ unsigned short round_f16(float x) {
+  unsigned short h;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(x));
+  return h;
+}
 
 // bf16(x) rounded to nearest even, NaN canonical.
 __device__ __forceinline__ unsigned short round_bf16(float x) {
@@ -45,8 +52,18 @@ __device__ __forceinline__ void embed_item(const EmbedOp &op, int item, unsigned
     for (int e = 0; e < 8; ++e) v[e] = __uint_as_float((ts[e / 2] << (16 * (1 - (e & 1)))) & 0xffff0000u);
     const size_t at = (size_t)col * op.hidden + k0 + 8 * lane;
     if (op.x) {
-      reinterpret_cast<float4 *>(op.x + at)[0] = make_float4(v[0], v[1], v[2], v[3]);
-      reinterpret_cast<float4 *>(op.x + at)[1] = make_float4(v[4], v[5], v[6], v[7]);
+      if (op.x_dtype == MLOPS_EMBED_X_FP32) {
+        float *x = static_cast<float *>(op.x) + at;
+        reinterpret_cast<float4 *>(x)[0] = make_float4(v[0], v[1], v[2], v[3]);
+        reinterpret_cast<float4 *>(x)[1] = make_float4(v[4], v[5], v[6], v[7]);
+      } else if (op.x_dtype == MLOPS_EMBED_X_BF16) {
+        reinterpret_cast<uint4 *>(static_cast<uint16_t *>(op.x) + at)[0] = t;  // the table's own bits
+      } else {
+        unsigned h[4];
+#pragma unroll
+        for (int e = 0; e < 8; e += 2) h[e / 2] = (unsigned)round_f16(v[e]) | ((unsigned)round_f16(v[e + 1]) << 16);
+        reinterpret_cast<uint4 *>(static_cast<uint16_t *>(op.x) + at)[0] = make_uint4(h[0], h[1], h[2], h[3]);
+      }
     }
     if (op.xw && op.w) {
       const uint4 wq = __ldg(reinterpret_cast<const uint4 *>(op.w + k0 + 8 * lane));

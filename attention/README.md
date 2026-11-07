@@ -123,7 +123,8 @@ replays them as the cache grows. `mlops_fbla_prefill_at` is the prefill the same
 device memory, every launch sized by the chunk's ceiling alone (where the prefill runs on tensor cores its q non-null
 needs the cache's `tc_images`, as `empty` above allocates). `head_stride` / `group_stride` place each (KV head, group) unit of the cache anywhere
 in its arrays -- e.g. every layer's groups side by side, so a cache mapped group by group as it grows (virtual memory)
-grows at one end.
+grows at one end. `mlops_fbla_cache_sizes` gives the bytes of every allocation of a cache for a configuration (planes,
+metadata, the four exact planes, the tensor-core images), strides included.
 
 [`include/mlops_fbla_items.h`](include/mlops_fbla_items.h) describes the same operations as passes of CTA-sized
 work items. A plan supplies each pass's device entry, argument blob, grid, shared storage and register usage;
@@ -131,11 +132,14 @@ work items. A plan supplies each pass's device entry, argument blob, grid, share
 which may overlap between items. An executor establishes release/acquire ordering and supplies a position policy
 whose `ro` reads mutable inputs through coherent L2. Tensor-core split partials belong to the executor; the header
 documents their sizes and entry arguments. `per_head = 0` describes decode with the ordinary API's occupancy;
-a positive value fixes the number of coarse/refine CTAs per virtual KV head.
+a positive value fixes the number of coarse/refine CTAs per virtual KV head, and `mlops_fbla_decode_scratch_bytes_for`
+sizes the scratch for it.
 
-For NVRTC include `mlops_fbla_items.cuh`, compile for the plan's `compute_<arch>` and use C++17 with
-`--device-as-default-execution-space`. The headers require the CUDA toolkit's `include/` (CUDA 13 also
-`include/cccl`). `make install` includes the complete device-header tree under `include/mlops/` and a top-level
+The entries are in `mlops_fbla_items.cuh`; compile them for the plan's `compute_<arch>` with C++17, ahead of time with
+nvcc (`-gencode arch=compute_<arch>,code=sm_<the device's>`) or at run time with NVRTC (`--device-as-default-execution-space`).
+An executor that generates its kernels' source may take each item's statements from `mlops_fbla_item_call`; one compiled
+ahead of time calls the entries itself with the arguments by kind the header lists. The headers require the CUDA
+toolkit's `include/` (CUDA 13 also `include/cccl`). `make install` includes the complete device-header tree under `include/mlops/` and a top-level
 `mlops_fbla_items.cuh`, so installed consumers do not need a source checkout.
 
 Decode refinement entries include their prefix capacity as the final template argument: `1` when

@@ -12,6 +12,18 @@
 
 using namespace mlops_norm_detail;
 
+// A device argument structure as bytes with its padding zeroed: equal calls give equal bytes.
+template <class T>
+inline void put_args(void *blob, const T &args) {
+  T copy = args;
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_clear_padding)
+  __builtin_clear_padding(&copy);
+#endif
+#endif
+  std::memcpy(blob, &copy, sizeof copy);
+}
+
 namespace {
 
 char *last_error_buf() {
@@ -202,10 +214,19 @@ extern "C" int mlops_norm_describe(const mlops_norm_config *c, const mlops_norm_
   snprintf(out->entry, sizeof out->entry, "mlops_norm_entries::norm<%d, %d, %d, %d, %d, %d>", in->kind, in->order, in->gate, in->xt, in->yt, in->out);
   snprintf(out->args_type, sizeof out->args_type, "mlops_norm_detail::Params");
   out->args_bytes = (int)sizeof op;
-  memcpy(out->args.bytes, &op, sizeof op);
+  put_args(out->args.bytes, op);
   out->geom[0] = op.rows; out->geom[1] = op.hidden; out->geom[2] = op.items; out->geom[3] = elem_bytes(c->x_dtype);
   out->geom[4] = elem_bytes(c->y_dtype); out->geom[5] = c->out; out->geom[6] = op.ld_scale; out->geom[7] = a->residual != nullptr;
   out->geom[8] = a->global != nullptr; out->geom[9] = op.has_weight; out->geom[10] = op.has_bias; out->geom[11] = a->gate != nullptr;
+  return 1;
+}
+
+extern "C" int mlops_norm_items_rows_device(mlops_norm_items *it, const int *rows) {
+  if (!it || !rows || it->kind != MLOPS_NORM_ITEM_NORM) return -1;
+  Params op;
+  memcpy(&op, it->args.bytes, sizeof op);
+  op.rows_device = rows;
+  put_args(it->args.bytes, op);
   return 1;
 }
 

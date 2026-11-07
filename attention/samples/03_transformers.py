@@ -1,21 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""FBLA inside a Hugging Face transformers model: prefill and decode against the FBLA cache.
-
-    python 03_transformers.py MODEL_DIR [--mode 4+2] [--tokens 64] [--context 4096] [TEXT_FILE ...]
-
-Works with models whose attention has head dim 128 and 1, 2 or 4 query heads per KV head (Qwen3, Llama 3, ...).
-Where FBLA goes: the model's attention function.  transformers calls it per layer with q, k, v after the
-projections, the q / k norm and RoPE; it is replaced through AttentionInterface:
-
-  prefill (many queries)  prefill(q, k, v, cache): the prompt's K / V go into that layer's FBLA cache and its
-                          queries attend through it (full 6-bit codes, streamed tiles: no BF16 score matrix)
-  decode  (one query)     the new token's K / V are appended to the cache, the query decodes against it
-
-transformers still keeps its own dense KV cache here (it is how the new token's K / V reach this function);
-an inference engine writes the FBLA layout instead and drops the BF16 cache.  The sample generates greedily
-with SDPA and with FBLA from the same prompt and compares the continuations.
-"""
+"""FBLA inside a Hugging Face transformers model: prefill and decode against the FBLA cache. Run: python 03_transformers.py MODEL_DIR [--mode 4+2] [--tokens 64]
+[--context 4096] [TEXT_FILE ...]. Works with head dim 128 and 1, 2 or 4 query heads per KV head (Qwen3, Llama 3, ...); FBLA replaces the model's attention function
+(AttentionInterface). Generates greedily with SDPA and with FBLA from the same prompt and compares the continuations."""
 import argparse
 import os
 
@@ -41,6 +28,9 @@ STATE = FBLAState()
 def fbla_attention(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs):
     """transformers attention interface: query [B, Hq, L, D], key / value [B, Hkv, T, D] (the whole context,
     the L new tokens last); returns [B, L, Hq, D]."""
+    # transformers calls this per layer with q, k, v after the projections, the q / k norm and RoPE. Prefill (many queries): the prompt's K / V go into that layer's
+    # FBLA cache and its queries attend through it (full 6-bit codes, streamed tiles: no BF16 score matrix); decode (one query): the new token's K / V are appended, the
+    # query decodes against the cache. transformers still keeps its own dense KV cache (how the new token's K / V reach here); an engine writes the FBLA layout instead
     L = query.shape[2]
     if STATE.mode is None:  # baseline: exact causal attention
         out = F.scaled_dot_product_attention(query, key, value, is_causal=L > 1, scale=scaling,

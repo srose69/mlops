@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// The device entries of the work items (include/mlops_norm_items.h names them and their argument types), for an
-// executor's kernels. NVRTC: --std=c++17 --device-as-default-execution-space, include paths: norm's include/, NVFP4EffMA's
-// include/ and src/ (the quantizer's primitives are imported from it), and the CUDA toolkit's include/ (CUDA 13 also
-// include/cccl). Every thread of the described CTA calls the entry (the CTA is the described number of threads: the warps of
-// a norm are blockDim.x / 32), and the CTA is synchronized before the entry's shared memory is reused.
+// Device entries of the work items (named in include/mlops_norm_items.h), for an executor's kernels, compiled ahead of time with nvcc
+// (-std=c++17 -gencode arch=compute_<arch>,code=sm_<the device's>) or at run time with NVRTC (--std=c++17
+// --device-as-default-execution-space, compute_<arch>); include paths: norm's include/, NVFP4EffMA's include/ and src/, the CUDA
+// toolkit's include/ (CUDA 13 also include/cccl). Every thread of the described CTA calls the entry (a norm's warps are blockDim.x / 32).
 #pragma once
 #include "../layer/src/norm.cuh"
 

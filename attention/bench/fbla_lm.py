@@ -1,27 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""End to end: a transformers model's LM loss with every attention layer replaced by FBLA (the numerical model of
-python/mlops/attention/fbla_reference.py) or by a runtime KV-cache quantization, against bf16 SDPA.
-
-Every quantized scheme runs with decode semantics inside each window: a query reads the sink group (the first 128
-tokens) and its own, still open, group of 128 in bf16, every other earlier group from the quantized cache (KIVI's
-own runtime keeps the last 128 tokens in fp16 the same way). Reported per scheme: the loss delta over the windows (mean, min, max),
-and for FBLA the share of quantized (query, 16-token sub-block) pairs whose refinement plane was read, which gives
-the bits per element actually read: coarse + 32 / G + fine * share.
-
-With --decode T the window is a long context whose first win - T positions are computed exactly (prefill writes
-the cache) and whose last T positions decode against the quantized cache; the loss is that of the last T tokens.
-
-    python bench/fbla_lm.py MODEL_DIR [TEXT_FILE ...] [--win 2048] [--windows 13]
-    python bench/fbla_lm.py MODEL_DIR [TEXT_FILE ...] --win 16384 --decode 1024 --windows 11
-
-Without text files the text is the WikiText-2 (raw) test split (about 299K Qwen3 tokens).
-
-The "FBLA kernel" rows run the CUDA kernels (the installed mlops.attention package): decode needs --decode; the
-prefill row runs the last T queries (or, without --decode, the whole window) through mlops_fbla_prefill, on tensor
-cores where the device has them (MLOPS_FBLA_DP4A=1: the DP4A path).
-"""
+"""End to end: a transformers model's LM loss with every attention layer replaced by FBLA (the numerical model of python/mlops/attention/fbla_reference.py)
+or by a runtime KV-cache quantization, against bf16 SDPA; text: the files, else the WikiText-2 (raw) test split. Run: python bench/fbla_lm.py MODEL_DIR
+[TEXT_FILE ...] [--win 2048] [--windows 13], or with --win 16384 --decode 1024 --windows 11; semantics of the schemes and rows are described beside the code."""
+# every quantized scheme runs with decode semantics inside each window: a query reads the sink group (the first 128 tokens) and its own, still open, group of
+# 128 in bf16, every other earlier group from the quantized cache. Reported per scheme: the loss delta over the windows (mean, min, max), and for FBLA the share
+# of quantized (query, 16-token sub-block) pairs whose refinement plane was read, i.e. the bits per element actually read: coarse + 32 / G + fine * share
 import argparse
 import os
 import sys
@@ -149,6 +134,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model"); ap.add_argument("text", nargs="*", help="text files; none: the WikiText-2 test split")
     ap.add_argument("--win", type=int, default=2048); ap.add_argument("--windows", type=int, default=13)
+    # --decode T: the window is a long context whose first win - T positions are computed exactly (prefill writes the cache) and whose last T positions
+    # decode against the quantized cache; the loss is that of the last T tokens. The "FBLA kernel" rows run the installed mlops.attention CUDA kernels: decode
+    # needs --decode; the prefill row runs the last T queries (or the whole window) through mlops_fbla_prefill, on tensor cores where present (MLOPS_FBLA_DP4A=1: DP4A)
     ap.add_argument("--decode", type=int, default=0)
     ap.add_argument("--only", help="comma-separated substrings: run only the schemes whose name contains one (and SDPA)")
     ap.add_argument("--absolute", action="store_true", help="with --only, skip SDPA and report absolute loss")

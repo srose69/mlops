@@ -36,27 +36,25 @@ def embed(table: torch.Tensor, ids: torch.Tensor, norm_weight: Optional[torch.Te
 
 
 def lm_head_variants(vocab: int, hidden: int, n: int) -> List[tuple]:
-    """(R, S, D, NB, tensor_cores, J, threads, smem_bytes, regs, arch) of every way the current device runs the
-    shape: R rows a unit, S warps over hidden, D steps of loads in flight, NB columns carried, J pieces a lane."""
+    """(R, S, D, NB, tensor_cores, J, threads, smem_bytes, regs, arch, x_staged) of every way the current device runs the
+    shape: R rows a unit, S warps over hidden, D steps of loads in flight, NB columns carried, J pieces a lane, x_staged 1 when x
+    is read into shared memory once (smem_bytes holds it; the statistics' counts, NB x 1 KiB more, may then not fit a CTA)."""
     return _C.lm_head_variants(vocab, hidden, n)
 
 
 def lm_head(weight: torch.Tensor, x: torch.Tensor, *, norm_parts: Optional[torch.Tensor] = None, inv_n: float = 0.0,
             eps: float = 0.0, logit_scale: float = 1.0, variant: int = 0, items: int = 0, want_logits: bool = True,
             want_stats: bool = False) -> Head:
-    """``logits[c] = s[c] * logit_scale * (weight @ x[c])`` for 1 .. 8 columns of x (bfloat16 [n, hidden]), FP32
-    accumulation, with ``s[c] = 1 / sqrt(sum(norm_parts[c]) * inv_n + eps)`` when ``norm_parts`` (float32
-    [n, parts]) is given. ``want_stats`` adds each element's maximum and lowest argmax per column, the input of
-    ``Sampler(..., stats=...)``. ``variant`` indexes ``lm_head_variants``; ``items`` is the element count."""
+    """``logits[c] = s[c] * logit_scale * (weight @ x[c])`` for 1 .. 8 columns of x (bfloat16 [n, hidden]), FP32 accumulation, with
+    ``s[c] = 1 / sqrt(sum(norm_parts[c]) * inv_n + eps)`` when ``norm_parts`` (float32 [n, parts]) is given. ``want_stats`` adds each element's
+    maximum and lowest argmax per column (the input of ``Sampler(..., stats=...)``); ``variant`` indexes ``lm_head_variants``, ``items`` is the element count."""
     return Head(*_C.lm_head(weight, x, norm_parts, inv_n, eps, logit_scale, variant, items, want_logits, want_stats))
 
 
 class Sampler:
-    """The next token from a row of logits. ``seed`` and the step counter are device tensors, so a loop of calls (or a
-    captured graph) needs no host value; every call advances the step. ``penalty`` != 1 needs ``seen`` (a packed bitmask,
-    int32 [ceil(vocab / 32)], bit i of word i // 32 set for the tokens to penalize). With ``stats`` (from
-    ``lm_head(..., want_stats=True)`` with ``logit_scale = 1 / temperature``, or 1 for greedy) the logits are not
-    scanned for the maximum, and with a top-k not for the first radix pass either; that needs penalty 1."""
+    """The next token from a row of logits. ``seed`` and the step counter are device tensors, so a loop of calls (or a captured graph) needs no
+    host value; every call advances the step. ``penalty`` != 1 needs ``seen`` (a packed bitmask, int32 [ceil(vocab / 32)], bit i of word i // 32
+    set for the tokens to penalize); ``stats`` is described beside ``__call__``."""
 
     def __init__(self, vocab: int, *, temperature: float = 0.0, top_k: int = 0, top_p: float = 1.0, penalty: float = 1.0,
                  seed: int = 0, ctas: int = 0, device="cuda"):
@@ -77,6 +75,8 @@ class Sampler:
         """The token (int32 [1], on the device, overwritten by the next call) drawn from ``logits`` ([vocab] float32,
         or a row ``column`` of a 2-D tensor)."""
         row = logits[column] if logits.dim() == 2 else logits
+        # stats (from lm_head(..., want_stats=True) with logit_scale = 1 / temperature, or 1 for greedy): the logits are not scanned for the
+        # maximum, and with a top-k not for the first radix pass either; that needs penalty 1
         smax = sarg = shist = None
         if stats is not None:
             smax, sarg = stats.stats_max[column].contiguous(), stats.stats_arg[column].contiguous()

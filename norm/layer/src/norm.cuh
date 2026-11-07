@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// The norm kernel (include/mlops_norm_layer.h), built as CUTLASS builds a kernel: Element traits (the dtypes), Traits (the
-// flavor), OutputOp (the epilogue: dtype, INT8 or NVFP4), Params and SharedStorage, and NormKernel::operator(). A CTA of
-// warps takes rows; a row is units of 256 elements, a lane holding 8 consecutive ones; a group is gu = hidden / (256 groups)
-// units. The CTA's warps are the launch's (blockDim.x / 32).
+// The norm kernel (include/mlops_norm_layer.h), built as CUTLASS builds a kernel: Element traits (the dtypes), Traits (the flavor), OutputOp
+// (the epilogue: dtype, INT8 or NVFP4), Params and SharedStorage, NormKernel::operator(). A CTA of blockDim.x / 32 warps takes rows; a row
+// is units of 256 elements, a lane holding 8 consecutive ones; a group is gu = hidden / (256 groups) units.
 #pragma once
 #include "mlops_norm_items.h"
 #include "nvfp4effma.cuh"  // the exact E2M1 / E4M3 primitives of the quantizer (nvfp4a::), NVRTC-safe
@@ -106,6 +105,7 @@ struct Params {
   const void *x, *residual, *weight, *bias, *gate;
   void *residual_out, *y, *scales;
   const float *global;
+  const int *rows_device;  // rows to run (at most `rows`), read at the item: null = all
   int rows, hidden, items, ld_scale, groups;
   float eps, inv_n;        // inv_n = 1 / (values of a group)
   float w_alpha, w_beta;   // w' = fma(weight, alpha, beta): (1, 0) the weight, (1, 1) one plus it, (0, 1) none
@@ -113,16 +113,16 @@ struct Params {
 };
 
 // ---- OutputOp: what becomes of a lane's rounded y -------------------------------------------------------------------
-// operator()(params, y, words, at, block, lane): at is the element index of the access, block the index of the access's
-// scale block in the row's scales. NVFP4 and INT8 follow nvfp4a_quantize (nvfp4effma.cu, quant_nvfp4effma.cuh).
-// nvfp4a::f32_to_e2m1 in fewer instructions: below 1 an integer of 2|x| (a magic add), from 1 the mantissa rounded to one bit
-// and the exponent field as the code, clamped to 6; equal to it for every float (tests/test_norm.cu checks all 2^32).
+// nvfp4a::f32_to_e2m1 in fewer instructions: below 1 an integer of 2|x| (a magic add), from 1 the mantissa rounded to one bit and
+// the exponent field as the code, clamped to 6; equal to it for every float (tests/test_norm.cu checks all 2^32).
 MLOPS_NORM_DEVICE unsigned e2m1(float x) {
   const unsigned u = __float_as_uint(x), a = u & 0x7fffffffu, s = (u >> 28) & 8u;
   const unsigned small = __float_as_uint(fmaf(__uint_as_float(a), 2.f, 8388608.f)) - 0x4B000000u;
   const unsigned big = ((a + 0x1fffffu + ((a >> 22) & 1u)) >> 22) - 252u;
   return s | min(a < 0x3f800000u ? small : big, 7u);
 }
+// operator()(params, y, words, at, block, lane): at is the element index of the access, block the index of the access's scale block
+// in the row's scales. NVFP4 and INT8 follow nvfp4a_quantize (nvfp4effma.cu, quant_nvfp4effma.cuh).
 template <int Out, int Dtype> struct OutputOp;
 
 template <int Dtype> struct OutputOp<MLOPS_NORM_OUT_DTYPE, Dtype> {
@@ -294,10 +294,11 @@ template <class Traits> struct NormKernel {
     return y;
   }
 
-  // Rows [item rows / items, (item + 1) rows / items); the CTA is synchronized on return
+  // Rows [item rows / items, (item + 1) rows / items) below rows_device; the CTA is synchronized on return
   MLOPS_NORM_DEVICE void operator()(int item) {
     const typename Traits::Output output(p);
-    const long long lo = (long long)item * p.rows / p.items, hi = (long long)(item + 1) * p.rows / p.items;
+    const long long lo = (long long)item * p.rows / p.items;
+    const long long hi = min((long long)(item + 1) * p.rows / p.items, p.rows_device ? (long long)__ldcg(p.rows_device) : (long long)p.rows);
     for (long long row = lo; row < hi; ++row) {
       const size_t base = (size_t)row * p.hidden;
       sum_units<false>(base, true);

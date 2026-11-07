@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// The mlops_rope kernel: one thread block per token. The block first puts its token's cos / sin factors of every
-// pair in shared memory (computed from the position, or loaded from the tables), then rotates every head of q
-// and k with them, V pairs per thread through one vector load / store per half. Template parameters: dtype,
-// V (1, 2, 4), pair layout, arithmetic (exact, or Hugging Face's with tables); rope_inst.cu instantiates them.
+// The mlops_rope kernel: one thread block per token. The block puts its token's cos / sin factors of every pair in shared memory (computed
+// from the position, or loaded from the tables), then rotates every head of q and k with them, V pairs per thread through one vector load /
+// store per half. Template parameters: dtype, V (1, 2, 4), pair layout, arithmetic (exact, or Hugging Face's with tables); see rope_inst.cu.
 #pragma once
 #include "rope.cuh"
 

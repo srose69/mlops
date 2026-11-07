@@ -13,7 +13,7 @@ namespace mlops_fbla_detail {
 struct QkvArgs {
   PrefillArgs p;  // the cache, the device length, n0 (the offset), count 1, hs / gs, batch and heads
   const uint16_t *q, *k, *v;
-  int64_t batch_stride, q_group_stride, kv_group_stride;
+  int batch_stride, q_group_stride, kv_group_stride;  // (elements; qkv_args checks that they fit)
   const uint16_t *q_norm, *k_norm;
   float eps, att;
   const mlops_rope_detail::Freq *freq;  // 64 pairs: the whole head, half split
@@ -60,7 +60,7 @@ __device__ __forceinline__ void norm_rope(const uint16_t *x, const uint16_t *w, 
 // v -- task t on warp t mod (threads / 32).
 template <int CB, int FB, bool NORM, int T, class Pos = Grid>
 __device__ __forceinline__ void qkv_item(const QkvArgs &a, int bh, QkvSmem &sm) {
-  const int pos = n0_of<Pos>(a.p), lane = Pos::tid() & 31, warp = Pos::tid() >> 5;
+  const int pos = n0_of<Pos>(a.p, bh), lane = Pos::tid() & 31, warp = Pos::tid() >> 5;
   const int b = a.kv.div(bh), kh = bh - b * a.p.kv_heads, qg = a.p.qg;
   for (int i = Pos::tid(); i < D / 2; i += T) {
     float c, s;
@@ -74,7 +74,7 @@ __device__ __forceinline__ void qkv_item(const QkvArgs &a, int bh, QkvSmem &sm) 
   const int row = pos % G;  // in the open window (the sink too below 128)
   for (int t = warp; t < qg + 2; t += T / 32) {
     if (t < qg) {
-      const uint16_t *x = a.q + b * a.batch_stride + kh * a.q_group_stride + (size_t)t * D;
+      const uint16_t *x = a.q + (int64_t)b * a.batch_stride + kh * a.q_group_stride + (size_t)t * D;
       uint16_t y[4];
       norm_rope<NORM, Pos>(x, a.q_norm, a.eps, sm.cs, lane, y);
       uint32_t *o = reinterpret_cast<uint32_t *>(a.q_out + ((size_t)b * a.p.q_heads + kh * qg + t) * D);
@@ -85,11 +85,11 @@ __device__ __forceinline__ void qkv_item(const QkvArgs &a, int bh, QkvSmem &sm) 
       uint32_t lo, hi;
       if (isk) {
         uint16_t y[4];
-        norm_rope<NORM, Pos>(a.k + b * a.batch_stride + kh * a.kv_group_stride, a.k_norm, a.eps, sm.cs, lane, y);
+        norm_rope<NORM, Pos>(a.k + (int64_t)b * a.batch_stride + kh * a.kv_group_stride, a.k_norm, a.eps, sm.cs, lane, y);
         lo = y[0] | (uint32_t)y[1] << 16;
         hi = y[2] | (uint32_t)y[3] << 16;
       } else {
-        const uint32_t *x = reinterpret_cast<const uint32_t *>(a.v + b * a.batch_stride + kh * a.kv_group_stride);
+        const uint32_t *x = reinterpret_cast<const uint32_t *>(a.v + (int64_t)b * a.batch_stride + kh * a.kv_group_stride);
         lo = InputLoad<Pos>::get(x + lane);
         hi = InputLoad<Pos>::get(x + D / 4 + lane);
       }
@@ -112,6 +112,69 @@ __device__ __forceinline__ void qkv_item(const QkvArgs &a, int bh, QkvSmem &sm) 
     }
 }
 
+// The attention inputs of a prefill chunk (mlops_fbla_qkv_prefill_at): the projection's rows [count][row_stride], per KV head
+// its q heads, k and v, become q [q_heads][count][128], k and v [kv_heads][count][128], the layout of mlops_fbla_prefill_at.
+// One item per KV head and QKV_TOK positions; the position of row i is *length + n0 + i, and rows past *count are not touched.
+constexpr int QKV_TOK = 8;
+struct QkvChunkArgs {
+  const int *length, *dcount;
+  int n0, count, q_heads, kv_heads, qg;  // count: the chunk's ceiling (the outputs' stride between heads)
+  const uint16_t *q, *k, *v;
+  int64_t row_stride, q_group_stride, kv_group_stride;
+  const uint16_t *q_norm, *k_norm;
+  float eps, att;
+  const mlops_rope_detail::Freq *freq;
+  uint16_t *q_out, *k_out, *v_out;
+};
+struct QkvChunkSmem {
+  float4 cs[QKV_TOK][D / 2];  // the (cos, sin, cos, sin) of every pair of the tile's positions
+};
+
+template <bool NORM, int T, class Pos = Grid>
+__device__ __forceinline__ void qkv_chunk_item(const QkvChunkArgs &a, int tile, int kh, QkvChunkSmem &sm) {
+  const int lane = Pos::tid() & 31, warp = Pos::tid() >> 5, base = a.length ? Pos::ro(a.length) + a.n0 : a.n0;
+  const int n = a.dcount ? Pos::ro(a.dcount) : a.count, i0 = tile * QKV_TOK, rows = max(0, min(QKV_TOK, n - i0));
+  for (int e = Pos::tid(); e < rows * (D / 2); e += T) {
+    float c, s;
+    mlops_rope_detail::angle_cos_sin(base + i0 + e / (D / 2), a.freq[e % (D / 2)], a.att, c, s);
+    sm.cs[e / (D / 2)][e % (D / 2)] = make_float4(c, s, c, s);
+  }
+  __syncthreads();  // the factors
+  // the tasks (position, q head | k | v) are independent: a warp takes every (T / 32)th, its loads overlap across tasks
+  const int per = a.qg + 2;
+#pragma unroll 2
+  for (int task = warp; task < rows * per; task += T / 32) {
+    {
+      const int i = i0 + task / per, t = task % per;
+      const float4 *cs = sm.cs[task / per];
+      if (t < a.qg) {
+        uint16_t y[4];
+        norm_rope<NORM, Pos>(a.q + i * a.row_stride + kh * a.q_group_stride + (size_t)t * D, a.q_norm, a.eps, cs, lane, y);
+        uint32_t *o = reinterpret_cast<uint32_t *>(a.q_out + (((size_t)kh * a.qg + t) * a.count + i) * D);
+        o[lane] = y[0] | (uint32_t)y[1] << 16;
+        o[D / 4 + lane] = y[2] | (uint32_t)y[3] << 16;
+      } else if (t == a.qg) {
+        uint16_t y[4];
+        norm_rope<NORM, Pos>(a.k + i * a.row_stride + kh * a.kv_group_stride, a.k_norm, a.eps, cs, lane, y);
+        uint32_t *o = reinterpret_cast<uint32_t *>(a.k_out + ((size_t)kh * a.count + i) * D);
+        o[lane] = y[0] | (uint32_t)y[1] << 16;
+        o[D / 4 + lane] = y[2] | (uint32_t)y[3] << 16;
+      } else {
+        const uint32_t *x = reinterpret_cast<const uint32_t *>(a.v + i * a.row_stride + kh * a.kv_group_stride);
+        uint32_t *o = reinterpret_cast<uint32_t *>(a.v_out + ((size_t)kh * a.count + i) * D);
+        o[lane] = InputLoad<Pos>::get(x + lane);
+        o[D / 4 + lane] = InputLoad<Pos>::get(x + D / 4 + lane);
+      }
+    }
+  }
+}
+
+template <bool NORM>
+__global__ void __launch_bounds__(2 * D) qkv_chunk_kernel(const QkvChunkArgs a) {
+  __shared__ QkvChunkSmem sm;
+  qkv_chunk_item<NORM, 2 * D>(a, blockIdx.x, blockIdx.y, sm);
+}
+
 template <int CB, int FB, bool NORM>
 __global__ void __launch_bounds__(2 * D) qkv_kernel(const QkvArgs a) {
   __shared__ QkvSmem sm;
@@ -125,6 +188,21 @@ template <int CB, int FB> cudaError_t launch_qkv(const QkvArgs &a, cudaStream_t 
   else qkv_kernel<CB, FB, false><<<heads, 2 * D, 0, stream>>>(a);
   return cudaGetLastError();
 }
+
+#ifdef MLOPS_FBLA_DEFINE_SHARED  // format-independent: one object
+cudaError_t launch_qkv_chunk(const QkvChunkArgs &a, cudaStream_t stream) {
+  const dim3 grid((a.count + QKV_TOK - 1) / QKV_TOK, a.kv_heads);
+  if (a.q_norm) qkv_chunk_kernel<true><<<grid, 2 * D, 0, stream>>>(a);
+  else qkv_chunk_kernel<false><<<grid, 2 * D, 0, stream>>>(a);
+  return cudaGetLastError();
+}
+bool qkv_chunk_pass(const QkvChunkArgs &a, mlops_fbla_items &p) {
+  char e[96];
+  snprintf(e, sizeof e, "mlops_fbla_detail::qkv_chunk_item<%s, %d, mlops_fbla::Pos>", a.q_norm ? "true" : "false", 2 * D);
+  return item_of(a.q_norm ? qkv_chunk_kernel<true> : qkv_chunk_kernel<false>, MLOPS_FBLA_ITEM_QKV_CHUNK, (a.count + QKV_TOK - 1) / QKV_TOK,
+                 a.kv_heads, 1, 2 * D, (int)sizeof(QkvChunkSmem), e, a, p);
+}
+#endif
 
 // (host) mlops_fbla_qkv_at as the executor's items (mlops_fbla_items.h): one item a (batch, KV head)
 template <int CB, int FB>

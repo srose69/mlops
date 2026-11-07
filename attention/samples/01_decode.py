@@ -1,25 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Quickstart: encode a BF16 KV cache as FBLA, decode one query per head, check it against exact attention.
-
-    python 01_decode.py [--mode 4+2 | 3+3]
-
-What FBLA replaces: the KV cache and the attention over it.  This sample is the decode side: a cache made from
-dense K / V and one query per head.  The prompt can go through FBLA as well (prefill: 02_streaming.py).
-
-  encode(k, v, mode)  [batch, kv_heads, tokens, 128] BF16 K / V -> FBLACache (6.25 bits per element stored)
-  decode(q, cache)    [batch, q_heads, 128] BF16, one query per head -> [batch, q_heads, 128] BF16
-
-The quantization mode is chosen once, in encode (or empty); the cache records it, and append / prefill / decode
-follow it:
-  "4+2"  4-bit coarse plane + 2-bit fine plane, default refinement threshold tau = 1e-3
-  "3+3"  3-bit coarse plane + 3-bit fine plane, default tau = 3e-4
-Both store the same 6-bit code; the split decides how much every decode step reads (the coarse plane) and how
-much only the refined blocks read (the fine plane).
-
-q_heads / kv_heads must be 1, 2 or 4 (GQA), head dim 128.  q is the query after the projection, the q / k norm
-and RoPE, exactly what goes into softmax(q k^T * scale) v.
-"""
+"""Quickstart: encode a BF16 KV cache as FBLA (the KV cache and the attention over it), decode one query per head, check it against exact attention.
+Run: python 01_decode.py [--mode 4+2 | 3+3]. encode(k, v, mode): [batch, kv_heads, tokens, 128] BF16 K / V -> FBLACache (6.25 bits per element stored);
+decode(q, cache): [batch, q_heads, 128] BF16, one query per head -> [batch, q_heads, 128] BF16. The prompt can go through FBLA as well (prefill: 02_streaming.py)."""
 import argparse
 import math
 
@@ -28,10 +11,14 @@ import torch
 from mlops.attention import decode, encode
 
 ap = argparse.ArgumentParser()
+# the quantization mode is chosen once, in encode (or empty); the cache records it, and append / prefill / decode follow it: "4+2" = 4-bit coarse plane +
+# 2-bit fine plane (default refinement threshold tau = 1e-3), "3+3" = 3-bit + 3-bit (default tau = 3e-4); both store the same 6-bit code, the split decides
+# how much every decode step reads (the coarse plane) and how much only the refined blocks read (the fine plane)
 ap.add_argument("--mode", default="4+2", choices=["4+2", "3+3"], help="FBLA quantization mode")
 mode = ap.parse_args().mode
 
 torch.manual_seed(0)
+# q_heads / kv_heads must be 1, 2 or 4 (GQA), head dim 128; q is the query after the projection, the q / k norm and RoPE, exactly what goes into softmax(q k^T * scale) v
 B, Hq, Hkv, N, D = 1, 16, 8, 16384, 128  # Qwen3-0.6B geometry: GQA 2
 
 # Synthetic K / V: uneven channel scales and a common offset in K, as in real keys.  Random data is a harsh

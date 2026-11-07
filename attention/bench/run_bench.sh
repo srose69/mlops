@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-# Controlled run behind benches/<gpu>.md (methodology: docs/performance.md).
-#
-#   bench/run_bench.sh
-#   GPU=1 COOLING="open bench, 100 % fan" NOTES="..." bench/run_bench.sh
-#
-# Raises the power limit to its maximum, allows the SM clock up to its top and locks the memory clock at its
-# maximum. All three are restored on exit, including Ctrl+C. Needs sudo for nvidia-smi. Raw output and the
-# 250 ms board telemetry stay in out/bench_<gpu>/; report.py writes benches/<gpu>.md and benches/table.md.
+# Controlled run behind benches/<gpu>.md (methodology: docs/performance.md): bench/run_bench.sh, or GPU=1 COOLING="open bench, 100 % fan" NOTES="..." bench/run_bench.sh
+# Needs sudo for nvidia-smi: power limit to its maximum, SM clock allowed up to its top, memory clock locked at its maximum; all restored on exit, also on Ctrl+C.
+# Raw output and the board telemetry (sampled every 250 ms) stay in out/bench_<gpu>/; report.py writes benches/<gpu>.md and benches/table.md.
 set -u
 cd "$(dirname "$0")/.."
 GPU=${GPU:-0}

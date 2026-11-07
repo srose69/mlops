@@ -113,6 +113,9 @@ static int run_case(int vocab, int hidden, int n_cols, int items, bool norm) {
     for (int c = 0; c < n_cols; ++c) scale[c] = host_scale(std::vector<float>(parts.begin() + c * np, parts.begin() + (c + 1) * np), inv_n, eps);
 
   const mlops_lm_head_config c{vocab, hidden, n_cols, items, norm ? np : 0, inv_n, eps, 1.f};
+  int dev = 0, smem_max = 0;
+  CK(cudaGetDevice(&dev));
+  CK(cudaDeviceGetAttribute(&smem_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
   const int nv = mlops_lm_head_variants(&c, nullptr, 0);
   std::vector<mlops_lm_head_variant> vs(nv);
   mlops_lm_head_variants(&c, vs.data(), nv);
@@ -131,14 +134,16 @@ static int run_case(int vocab, int hidden, int n_cols, int items, bool norm) {
     CK(cudaMalloc(&darg, (size_t)n_cols * ni * 4));
     CK(cudaMalloc(&dhist, (size_t)n_cols * ni * 256 * 4));
     CK(cudaMemset(dlogits, 0xff, (size_t)n_cols * vocab * 4));
-    if (mlops_lm_head(&c, &v, dw_, dx_, dparts, dlogits, dmax, darg, dhist, 0)) {
+    // the counts take columns * 1 KiB of shared memory on top of the variant's: only where that fits a CTA
+    const bool counts = (size_t)v.smem_bytes + (size_t)v.columns * 256 * 4 <= (size_t)smem_max;
+    if (mlops_lm_head(&c, &v, dw_, dx_, dparts, dlogits, dmax, darg, counts ? dhist : nullptr, 0)) {
       fprintf(stderr, "%s\n", mlops_lm_head_last_error());
       return 1;
     }
     CK(cudaDeviceSynchronize());
     const auto logits = down(dlogits, (size_t)n_cols * vocab), smax = down(dmax, (size_t)n_cols * ni);
     const auto sarg = down(darg, (size_t)n_cols * ni);
-    {  // the key-byte counts of each element's rows, from the logits the call itself wrote
+    if (counts) {  // the key-byte counts of each element's rows, from the logits the call itself wrote
       const auto hist = down(dhist, (size_t)n_cols * ni * 256);
       const long long hunits = (vocab + v.rows_per_unit - 1) / v.rows_per_unit;
       for (int col = 0; col < n_cols; ++col)

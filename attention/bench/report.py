@@ -23,8 +23,19 @@ def read_env(path):
     return env
 
 
+# The prefill sections of bench_fbla's output, by the start of their title line: the columns of the report's table (the bench's own
+# header has multi-word columns, so it is not split).
+PREFILL_SECTIONS = (
+    ("prefill: a chunk appended", ["format", "KV heads", "GQA", "context", "chunk", "latency, ms", "Gpairs/s", "equiv. TFLOPS", "SM MHz"]),
+    ("prefill chunk at the device length", ["format", "KV heads", "GQA", "context", "chunk", "inputs, ms", "inputs GB/s", "DRAM peak",
+                                            "attention, head-major out, ms", "attention, token-major out, ms", "token- vs head-major"]),
+)
+
+
 def bench_rows(path):
-    rows, head = [], {}
+    """The decode rows, the prefill sections (title lines and rows as the bench prints them) and the header."""
+    rows, head, prefill = [], {}, []
+    section = None  # None: the decode table; else the prefill section the lines belong to
     for line in open(path):
         h = re.search(r"^(.*?) sm_(\d+), (\d+) SMs", line)
         if h:
@@ -32,13 +43,25 @@ def bench_rows(path):
         h = re.search(r"DRAM peak ([\d.]+) GB/s \((\d+)-bit bus\), D2D copy ([\d.]+) GB/s", line)
         if h:
             head.update(dram=float(h.group(1)), bus=h.group(2), copy=float(h.group(3)))
-        p = line.split()
-        if len(p) != 11 or p[0] not in ("3+3", "4+2"):
-            continue
-        rows.append(dict(fmt=p[0], kv=int(p[1]), gqa=int(p[2]), context=int(p[3]), us=float(p[4]),
-                         gbs=float(p[5]), peak=float(p[6].rstrip("%")), read=float(p[7]), bf16=float(p[8]),
-                         refined=float(p[9].rstrip("%")), mhz=float(p[10])))
-    return rows, head
+        for start, columns in PREFILL_SECTIONS:
+            if line.startswith(start):
+                section = dict(title=[line.strip()], columns=columns, rows=[])
+                prefill.append(section)
+                break
+        else:
+            p = line.split()
+            if section is not None:
+                if p and p[0] in ("3+3", "4+2") and len(p) == len(section["columns"]):
+                    section["rows"].append(p)
+                elif line.strip() and not line.startswith("format") and not section["rows"]:
+                    section["title"].append(line.strip())  # (a title that runs on)
+                continue
+            if len(p) != 11 or p[0] not in ("3+3", "4+2"):
+                continue
+            rows.append(dict(fmt=p[0], kv=int(p[1]), gqa=int(p[2]), context=int(p[3]), us=float(p[4]),
+                             gbs=float(p[5]), peak=float(p[6].rstrip("%")), read=float(p[7]), bf16=float(p[8]),
+                             refined=float(p[9].rstrip("%")), mhz=float(p[10])))
+    return rows, head, prefill
 
 
 def clocks(path):
@@ -74,7 +97,7 @@ def fmt_clock(c):
 
 def main(res, out_dir):
     env = read_env(os.path.join(res, "env.txt"))
-    rows, head = bench_rows(os.path.join(res, "bench_fbla.txt"))
+    rows, head, prefill = bench_rows(os.path.join(res, "bench_fbla.txt"))
     if not rows:
         raise SystemExit("no FBLA rows in bench_fbla.txt")
     gpu = env.get("name", head.get("gpu", "unknown GPU")); key = env.get("file") or slug(gpu)
@@ -104,6 +127,10 @@ def main(res, out_dir):
                  f"{r['refined']:.1f}% | {r['mhz']:.0f} |")
     L += ["", "`effective GB/s` is physical compressed traffic implied by the algorithm divided by latency; "
           "it is not BF16-equivalent bandwidth."]
+    for sec in prefill:
+        L += ["", " ".join(sec["title"]), "", "| " + " | ".join(sec["columns"]) + " |",
+              "|---|" + "---:|" * (len(sec["columns"]) - 1)]
+        L += ["| " + " | ".join(r) + " |" for r in sec["rows"]]
     os.makedirs(out_dir, exist_ok=True)
     open(os.path.join(out_dir, f"{key}.md"), "w").write("\n".join(L) + "\n")
 
@@ -121,7 +148,7 @@ def main(res, out_dir):
     tpath = os.path.join(out_dir, "table.md")
     table_head = ["# Results by GPU", "",
                   "One row per GPU, produced by `bench/run_bench.sh` (see [docs/performance.md](../docs/performance.md));",
-                  "the linked file contains all 36 rows and the run conditions. FBLA columns use the Qwen3-0.6B",
+                  "the linked file contains every row (decode and prefill) and the run conditions. FBLA columns use the Qwen3-0.6B",
                   "geometry: 8 KV heads, GQA 2, D = 128.", "",
                   "| GPU | CC | D2D copy | 3+3 16K | 4+2 16K | 3+3 1M | 4+2 1M | Date |",
                   "|---|---|---:|---:|---:|---:|---:|---|"]

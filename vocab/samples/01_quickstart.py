@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 """Quickstart: embedding rows, the LM head and a sampled token, against PyTorch.
-
-    python 01_quickstart.py
-"""
+Run: python 01_quickstart.py"""
 import torch
 
 from mlops.vocab import Sampler, embed, lm_head

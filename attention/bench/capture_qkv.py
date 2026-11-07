@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Capture the q / k / v every attention layer of a transformers model sees (after its norms and RoPE, k / v before
-the GQA repeat), on one text, for bench/fbla_vs_sdpa.py --qkv. The dump is an optional local benchmark input;
-it is intentionally ignored by git and is not part of the repository.
-
-    python bench/capture_qkv.py MODEL_DIR [TEXT_FILE ...] --tokens 2048 --out qkv.pt
-"""
+"""Capture the q / k / v every attention layer of a transformers model sees (after its norms and RoPE, k / v before the GQA repeat), on one text, for
+bench/fbla_vs_sdpa.py --qkv; the dump is an optional local benchmark input, ignored by git. Run: python bench/capture_qkv.py MODEL_DIR [TEXT_FILE ...] --tokens 2048 --out qkv.pt"""
 import argparse
 
 import torch

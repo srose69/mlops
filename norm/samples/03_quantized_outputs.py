@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 """INT8 and NVFP4 outputs: the normalized rows quantized in the same kernel, as NVFP4EffMA's quantizer makes them.
-
-    python 03_quantized_outputs.py
-"""
+Run: python 03_quantized_outputs.py"""
 import torch
 
 from mlops.norm import rms_norm

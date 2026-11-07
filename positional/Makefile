@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-# mlops-positional: positional encodings, RoPE (rope/).
-#   make lib        libmlops_positional.a for $(ARCHS) (default: every architecture sm_50..sm_90; SASS only)
-#   make test       mlops_rope against a double-precision reference and Hugging Face's arithmetic (GPU $(GPU))
-#   make install    headers, static library and pkg-config file under PREFIX (default /usr/local)
-# Toolchain, architectures and parallelism: ../build/arch.mk. No dependency besides the CUDA toolkit.
-# Python / PyTorch bindings: python/ (pip install, or ../setup.sh positional); benchmark: bench/bench_rope.py.
+# mlops-positional: positional encodings, RoPE (rope/); targets lib, test, bench, accuracy, install (described beside each).
+# Toolchain, architectures and parallelism: ../build/arch.mk; no dependency besides the CUDA toolkit.
+# Python / PyTorch bindings: python/ (pip install, or ../setup.sh positional).
 MLOPS_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
 include $(MLOPS_ROOT)/build/arch.mk
 
@@ -34,9 +31,10 @@ $(eval $(call LIBRARY,$(OBJDIR),$(GENCODE) --threads $(NVCC_THREADS)))
 $(eval $(call LIBRARY,out/native,-arch=sm_$(TEST_ARCH)))
 out/libmlops_positional.a: $(OBJDIR)/libmlops_positional.a
 	cp $< $@
+# libmlops_positional.a for $(ARCHS) (default: every architecture sm_50..sm_90; SASS only)
 lib: out/libmlops_positional.a
 
-# need mlops-positional (and, for bench, transformers) installed in $(PYTHON)
+# bench / accuracy need mlops-positional (and, for bench, transformers) installed in $(PYTHON)
 bench:
 	$(RUN) $(PYTHON) bench/bench_rope.py
 accuracy:
@@ -45,10 +43,12 @@ accuracy:
 out/test_rope: rope/tests/test_rope.cu out/native/libmlops_positional.a
 	$(NVCC) $(FLAGS) -arch=sm_$(TEST_ARCH) -o $@ $< out/native/libmlops_positional.a
 test-bin: out/test_rope
+# mlops_rope against a double-precision reference and Hugging Face's arithmetic (GPU $(GPU))
 test: out/test_rope
 	$(RUN) ./out/test_rope
 
 PREFIX ?= /usr/local
+# headers, static library and pkg-config file under PREFIX
 install: $(OBJDIR)/libmlops_positional.a
 	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib/pkgconfig
 	install -m 644 include/mlops_positional.h include/mlops_rope.h $(DESTDIR)$(PREFIX)/include/

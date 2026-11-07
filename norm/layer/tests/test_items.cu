@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// The work items of mlops-norm (include/mlops_norm_items.h) through NVRTC and an executor of the test's own: each item's
-// entry is compiled from its `entry` string and run on the described CTA; the outputs are the call's, bit for bit. The
-// declared writes are checked by running every item alone on poisoned outputs: only declared bytes change, and
-// together the items write every output byte.
+// The work items of mlops-norm (include/mlops_norm_items.h) through NVRTC and an executor of the test's own: each item's entry is compiled
+// from its `entry` string and run on the described CTA; outputs are the call's, bit for bit. Declared writes: every item alone on poisoned
+// outputs changes only declared bytes, and together the items write every output byte.
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <nvrtc.h>
@@ -142,6 +141,34 @@ static int test_case(const Case &k) {
     char what[220];
     snprintf(what, sizeof what, "items %s (%d warps, %d items): outputs of the call", k.name, v.warps, it.items);
     f += report(what, bad, 1);
+
+    // rows from the device: the first r rows are the call's, the others stay as they were
+    {
+      const int r = k.rows / 2 + 1;
+      int *dr_rows;
+      CK(cudaMalloc(&dr_rows, sizeof(int)));
+      CK(cudaMemcpy(dr_rows, &r, sizeof(int), cudaMemcpyHostToDevice));
+      mlops_norm_items part = it;
+      if (mlops_norm_items_rows_device(&part, dr_rows) != 1) return 1;
+      for (const auto &b : outs) CK(cudaMemset(b.ptr, 0xcd, b.bytes));
+      run(kern, part, 0, part.items);
+      const size_t yrow = ybytes / k.rows, rrow = hx.size() / k.rows;
+      // `used` bytes of each `stride`-byte row of an output: the call's below r, the poison from r on
+      auto differ = [&](const void *d, const std::vector<unsigned char> &want, size_t used, size_t stride) {
+        const auto now = download(d, want.size());
+        long diff = 0;
+        for (int row = 0; row < k.rows; ++row)
+          for (size_t i = 0; i < used; ++i) diff += now[row * stride + i] != (row < r ? want[row * stride + i] : 0xcd);
+        return diff;
+      };
+      const size_t ssz = k.out == MLOPS_NORM_OUT_INT8 ? 4 : 1;
+      long pbad = differ(dy, ry, yrow, yrow);
+      if (k.out != MLOPS_NORM_OUT_DTYPE) pbad += differ(dsc, rs, (size_t)k.hidden / 16 * ssz, (size_t)ld * ssz);
+      if (k.residual) pbad += differ(dro, rro, rrow, rrow);
+      CK(cudaFree(dr_rows));
+      snprintf(what, sizeof what, "items %s (%d warps): rows from the device (%d of %d)", k.name, v.warps, r, k.rows);
+      f += report(what, pbad, 1);
+    }
 
     // declared writes: each item alone on poisoned outputs
     long wbad = 0, wn = 0;

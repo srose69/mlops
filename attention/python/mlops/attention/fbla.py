@@ -1,16 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""FBLA cache encoding (the layout of include/mlops_fbla.h), prefill and decode.
-
-    cache = empty(batch, kv_heads, capacity, "4+2")   # or encode(k, v, "4+2", capacity) from dense K / V
-    out = prefill(q, k, v, cache)          # a chunk: q [B, Hq, n, 128], k / v [B, Hkv, n, 128] BF16; appends
-    append(cache, k_new, v_new)            # [B, Hkv, n, 128] without attention
-    out = decode(q, cache)                 # one query per head: q [B, Hq, 128], Hq a multiple of the KV heads
-
-``capacity`` lays the cache out for more tokens than it holds (one allocation for a growing context; the
-decode reads the first ``tokens``).  Every write of the cache (encode, append, prefill) runs on the GPU
-(mlops_fbla_prefill); ``_quantize`` here is the reference quantizer of the tests.
-"""
+"""FBLA cache encoding (the layout of include/mlops_fbla.h), prefill and decode: ``empty(batch, kv_heads, capacity, "4+2")`` or ``encode(k, v, "4+2", capacity)``,
+``prefill(q, k, v, cache)`` (a chunk: q [B, Hq, n, 128], k / v [B, Hkv, n, 128] BF16; appends), ``append(cache, k_new, v_new)``, ``decode(q, cache)`` (one query per head).
+``capacity`` lays the cache out for more tokens than it holds (one allocation for a growing context). Every cache write runs on the GPU; ``_quantize`` is the tests' reference."""
 from dataclasses import dataclass
 from typing import Optional
 
@@ -118,20 +110,16 @@ def encode(k: torch.Tensor, v: torch.Tensor, mode: str = "3+3", capacity: Option
 
 @torch.no_grad()
 def append(cache: FBLACache, k: torch.Tensor, v: torch.Tensor) -> FBLACache:
-    """Append ``[B, Hkv, n, 128]`` K / V to ``cache`` in place (a decode loop: n = 1 per step).
-
-    New tokens go to the open group (BF16); a full open group is quantized into its records and metadata when
-    the next token arrives, exactly as :func:`encode` would.  The first 128 tokens are also the sink group."""
+    """Append ``[B, Hkv, n, 128]`` K / V to ``cache`` in place (a decode loop: n = 1 per step). New tokens go to the open group (BF16); a full open group is
+    quantized into its records and metadata when the next token arrives, exactly as :func:`encode` would. The first 128 tokens are also the sink group."""
     _prefill(None, cache, k, v, 0.0)
     return cache
 
 
 @torch.no_grad()
 def prefill(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cache: FBLACache, *, scale: float = 0.0) -> torch.Tensor:
-    """Append a chunk ``k, v [B, Hkv, n, 128]`` to ``cache`` and return the attention of its queries
-    ``q [B, Hq, n, 128]`` (BF16): position ``cache.tokens + i`` attends to the tokens up to itself through the
-    full 6-bit codes, as :func:`decode` with ``tau`` -> 0 would after appending them (prefill is compute-bound:
-    refining every block costs nothing).  Chunked prefill of a long prompt: call it chunk by chunk."""
+    """Append a chunk ``k, v [B, Hkv, n, 128]`` to ``cache`` and return the attention of its queries ``q [B, Hq, n, 128]`` (BF16): position ``cache.tokens + i``
+    attends to the tokens up to itself through the full 6-bit codes, as :func:`decode` with ``tau`` -> 0 would after appending them. Long prompt: call it chunk by chunk."""
     if q.dtype != torch.bfloat16 or q.ndim != 4 or q.shape[0] != k.shape[0] or q.shape[2] != k.shape[2]:
         raise ValueError(f"q must be BF16 [B, Hq, n, 128] matching k {tuple(k.shape)}, got {q.dtype} {tuple(q.shape)}")
     return _prefill(q.contiguous(), cache, k, v, scale)

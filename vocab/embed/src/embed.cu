@@ -35,7 +35,10 @@ struct Instance {
 };
 const Instance kInstances[] = {{1, embed_kernel<1>}, {2, embed_kernel<2>}, {4, embed_kernel<4>}, {8, embed_kernel<8>}};
 
-bool valid(const mlops_embed_config *c) { return c && c->vocab > 0 && c->hidden > 0 && c->hidden % 256 == 0 && c->n >= 1 && c->items >= 0; }
+bool valid(const mlops_embed_config *c) {
+  return c && c->vocab > 0 && c->hidden > 0 && c->hidden % 256 == 0 && c->n >= 1 && c->items >= 0 && c->x_dtype >= MLOPS_EMBED_X_FP32 &&
+         c->x_dtype <= MLOPS_EMBED_X_FP16;
+}
 bool aligned(const void *p, uintptr_t bytes) { return reinterpret_cast<uintptr_t>(p) % bytes == 0; }
 const Instance *accepted(const mlops_embed_variant *v) {
   if (!v) return nullptr;
@@ -78,8 +81,8 @@ namespace {
 
 // Validates a call's arguments and builds its device arguments; shared by the call and its description.
 mlops_embed_status prepare(const mlops_embed_config *c, const mlops_embed_variant *v, const uint16_t *table, const int *ids,
-                           const uint16_t *norm_w, float *x, uint16_t *xw, float *parts, int *error, const Instance *&in, EmbedOp &op) {
-  if (!valid(c)) return fail(MLOPS_EMBED_INVALID_VALUE, "mlops_embed: vocab > 0, hidden a positive multiple of 256, n >= 1, items >= 0");
+                           const uint16_t *norm_w, void *x, uint16_t *xw, float *parts, int *error, const Instance *&in, EmbedOp &op) {
+  if (!valid(c)) return fail(MLOPS_EMBED_INVALID_VALUE, "mlops_embed: vocab > 0, hidden a positive multiple of 256, n >= 1, items >= 0, x_dtype FP32, BF16 or FP16");
   in = accepted(v);
   if (!in) return fail(MLOPS_EMBED_INVALID_VALUE, "mlops_embed: variant not among mlops_embed_variants");
   if (!table || !ids) return fail(MLOPS_EMBED_INVALID_VALUE, "mlops_embed: null table or ids");
@@ -93,6 +96,7 @@ mlops_embed_status prepare(const mlops_embed_config *c, const mlops_embed_varian
   op.ids = ids;
   op.w = norm_w;
   op.x = x;
+  op.x_dtype = c->x_dtype;
   op.xw = xw;
   op.parts = parts;
   op.error = error;
@@ -106,7 +110,7 @@ mlops_embed_status prepare(const mlops_embed_config *c, const mlops_embed_varian
 }  // namespace
 
 extern "C" mlops_embed_status mlops_embed(const mlops_embed_config *c, const mlops_embed_variant *v, const uint16_t *table, const int *ids,
-                                          const uint16_t *norm_w, float *x, uint16_t *xw, float *parts, int *error,
+                                          const uint16_t *norm_w, void *x, uint16_t *xw, float *parts, int *error,
                                           cudaStream_t stream) {
   const Instance *in;
   EmbedOp op;
@@ -117,7 +121,7 @@ extern "C" mlops_embed_status mlops_embed(const mlops_embed_config *c, const mlo
 }
 
 extern "C" int mlops_embed_items(const mlops_embed_config *c, const mlops_embed_variant *v, const uint16_t *table, const int *ids,
-                                 const uint16_t *norm_w, float *x, uint16_t *xw, float *parts, int *error, mlops_vocab_items *out) {
+                                 const uint16_t *norm_w, void *x, uint16_t *xw, float *parts, int *error, mlops_vocab_items *out) {
   const Instance *in;
   EmbedOp op;
   if (!out || prepare(c, v, table, ids, norm_w, x, xw, parts, error, in, op)) return -1;
@@ -132,9 +136,10 @@ extern "C" int mlops_embed_items(const mlops_embed_config *c, const mlops_embed_
   snprintf(out->entry, sizeof out->entry, "mlops_vocab_items::embed<%d>", in->warps);
   snprintf(out->args_type, sizeof out->args_type, "mlops_vocab_detail::EmbedOp");
   out->args_bytes = (int)sizeof op;
-  memcpy(out->args.bytes, &op, sizeof op);
+  mlops_vocab_detail::put_args(out->args.bytes, op);
   out->geom[0] = op.vocab; out->geom[1] = op.hidden; out->geom[2] = op.n; out->geom[3] = in->warps;
   out->geom[4] = norm_w && xw; out->geom[5] = x != nullptr; out->geom[6] = parts != nullptr; out->geom[7] = error != nullptr;
+  out->geom[8] = op.x_dtype;
   return 1;
 }
 
@@ -147,7 +152,8 @@ int mlops_vocab_detail::embed_access(const mlops_vocab_items &it, int item, mlop
   put_range(out, max, count, MLOPS_VOCAB_ARG_TABLE, 0, 0, vocab * hidden * 2);
   put_range(out, max, count, MLOPS_VOCAB_ARG_IDS, 0, (lo / per_col) * 4, ((hi - 1) / per_col - lo / per_col + 1) * 4);
   if (it.geom[4]) put_range(out, max, count, MLOPS_VOCAB_ARG_NORM_W, 0, 0, hidden * 2);
-  if (it.geom[5]) put_range(out, max, count, MLOPS_VOCAB_ARG_X, 1, lo * 256 * 4, (hi - lo) * 256 * 4);
+  const long long xb = it.geom[8] == MLOPS_EMBED_X_FP32 ? 4 : 2;  // bytes of an element of x
+  if (it.geom[5]) put_range(out, max, count, MLOPS_VOCAB_ARG_X, 1, lo * 256 * xb, (hi - lo) * 256 * xb);
   if (it.geom[4]) put_range(out, max, count, MLOPS_VOCAB_ARG_XW, 1, lo * 256 * 2, (hi - lo) * 256 * 2);
   if (it.geom[6]) put_range(out, max, count, MLOPS_VOCAB_ARG_PARTS, 1, lo * 4, (hi - lo) * 4);
   if (it.geom[7]) put_range(out, max, count, MLOPS_VOCAB_ARG_ERROR, 1, 0, 4);

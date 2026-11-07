@@ -77,8 +77,8 @@ Short runnable examples in [`samples/`](samples):
   are in `mlops_norm_args`.
 * **Variants.** `mlops_norm_variants` and `mlops_norm_item_count`: the instances for a shape and the resolved element count.
 * **Items.** [`mlops_norm_items.h`](include/mlops_norm_items.h) describes a call as work items for an executor (`mlops_norm_describe`):
-  the CTA geometry, the arguments, the entry compiled with NVRTC from [`mlops_norm_items.cuh`](include/mlops_norm_items.cuh), and the
-  byte ranges each item reads and writes (`mlops_norm_item_access`).
+  the CTA geometry, the arguments, the entry (in [`mlops_norm_items.cuh`](include/mlops_norm_items.cuh), compiled with nvcc ahead of
+  time or with NVRTC at run time), and the byte ranges each item reads and writes (`mlops_norm_item_access`).
 
 ## Build and test
 

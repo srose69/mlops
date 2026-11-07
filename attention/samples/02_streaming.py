@@ -1,23 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""One cache for a whole generation: allocate, prefill the prompt through it, then append + decode per token.
-
-    python 02_streaming.py [--mode 4+2 | 3+3]
-
-The cache is laid out for `capacity` tokens up front (fixed strides: nothing is reallocated or moved as the
-context grows).  Per layer:
-
-  cache = empty(batch, kv_heads, capacity, mode)   once; the quantization mode is fixed here
-  out = prefill(q, k, v, cache)    the prompt, chunk by chunk: q [batch, q_heads, n, 128], k / v [batch,
-                                   kv_heads, n, 128]; appends k / v and returns the causal attention of the
-                                   chunk's queries over everything so far (full 6-bit codes)
-  append(cache, k_t, v_t)          per decode step: the new token's K / V, [batch, kv_heads, 1, 128]
-  out = decode(q_t, cache)         its query, [batch, q_heads, 128], over all tokens including itself
-
-New tokens go to the open 128-token group (BF16); when it is full the group is quantized into the packed
-records.  Every write runs on the GPU.  The sample checks the prompt's attention and every decode step against
-exact attention, and that the streamed cache decodes bit-for-bit like one encoded from scratch.
-"""
+"""One cache for a whole generation: allocate, prefill the prompt through it, then append + decode per token. Run: python 02_streaming.py [--mode 4+2 | 3+3]
+The cache is laid out for `capacity` tokens up front (fixed strides: nothing is reallocated or moved as the context grows); new tokens go to the open 128-token
+group (BF16), a full group is quantized into the packed records. Checks: the prompt's attention and every decode step against exact attention, and that the streamed cache decodes bit-for-bit like one encoded from scratch."""
 import argparse
 import math
 import time
@@ -52,6 +37,9 @@ def exact(q, t):
 
 err = lambda x, ref: ((x.double() - ref).norm(dim=-1).mean() / v_rms).item()  # in units of |v|
 
+# per layer: empty(batch, kv_heads, capacity, mode) once (the quantization mode is fixed here); prefill(q, k, v, cache) the prompt chunk by chunk (q [batch, q_heads, n, 128],
+# k / v [batch, kv_heads, n, 128]): appends k / v and returns the causal attention of the chunk's queries over everything so far (full 6-bit codes); append(cache, k_t, v_t)
+# per decode step: the new token's K / V [batch, kv_heads, 1, 128]; decode(q_t, cache): its query [batch, q_heads, 128] over all tokens including itself
 cache = empty(B, Hkv, capacity, mode)
 torch.cuda.synchronize()
 t0 = time.perf_counter()

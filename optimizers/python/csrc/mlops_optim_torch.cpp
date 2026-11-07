@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// PyTorch bindings of mlops-optimizers (mlops.optim._C): mlops_adamw / mlops_adamw_qat (../../include). The
-// NVFP4 tensor is taken the way NVFP4EffMA's own bindings take operands: flat (data, scales, global, flags,
-// scale_max), which the Python layer unpacks from an nvfp4effma.NVFP4Tensor; the QAT state is one uint8
-// tensor. The initial quantization is nvfp4effma.quantize's (Python), so nothing here links NVFP4EffMA.
+// PyTorch bindings of mlops-optimizers (mlops.optim._C): mlops_adamw / mlops_adamw_qat (../../include). The NVFP4 tensor is taken as NVFP4EffMA's own
+// bindings take operands: flat (data, scales, global, flags, scale_max), unpacked by the Python layer from an nvfp4effma.NVFP4Tensor; the QAT state is
+// one uint8 tensor. The initial quantization is nvfp4effma.quantize's (Python), so nothing here links NVFP4EffMA.
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -135,7 +134,86 @@ void qat_step(Tensor grad, Tensor state, Tensor q_data, Tensor q_scales, OptT q_
                "mlops_adamw_qat");
 }
 
+void check_seg(const Tensor &seg, int64_t groups, const at::Device &dev) {
+  TORCH_CHECK_VALUE(seg.is_cuda() && seg.device() == dev, "seg must be a CUDA tensor on ", dev);
+  TORCH_CHECK_TYPE(seg.scalar_type() == at::kInt, "seg must be int32, got ", seg.scalar_type());
+  TORCH_CHECK_VALUE(seg.dim() == 1 && seg.size(0) == groups + 1 && seg.is_contiguous(), "seg must be a contiguous [", groups + 1, "] tensor");
+}
+
+// dx [rows, k] (gy's rows grouped by seg) = per group gy_g @ w_g, w the dequantized stacked weight [groups * n, k] float32; rows past seg[groups] are zero
+Tensor grouped_dgrad(const Tensor &gy, const Tensor &w, const Tensor &seg, int64_t groups, at::ScalarType out_dtype) {
+  const auto dev = gy.device();
+  contig_dense(gy, dev, "gy");
+  dense_dtype(out_dtype, "dx");
+  TORCH_CHECK_VALUE(gy.dim() == 2 && w.dim() == 2 && groups >= 1 && w.size(0) % groups == 0, "gy must be [rows, n] and w [groups * n, k]");
+  TORCH_CHECK_TYPE(w.scalar_type() == at::kFloat && w.is_cuda() && w.device() == dev && w.is_contiguous(), "w must be a contiguous float32 CUDA tensor on ", dev);
+  const int64_t rows = gy.size(0), n = w.size(0) / groups, k = w.size(1);
+  TORCH_CHECK_VALUE(gy.size(1) == n, "gy has ", gy.size(1), " columns, the weight's groups have n = ", n);
+  check_seg(seg, groups, dev);
+  Tensor dx = at::zeros({rows, k}, gy.options().dtype(out_dtype));
+  const c10::cuda::CUDAGuard guard(dev);
+  check_status(mlops_qat_grouped_dgrad((int)groups, (int)n, (int)k, (int)rows, gy.data_ptr(), dense_dtype(gy.scalar_type(), "gy"), (int)n,
+                                       w.data_ptr<float>(), (int)k, dx.data_ptr(), dense_dtype(out_dtype, "dx"), (int)k, seg.data_ptr<int>(),
+                                       at::cuda::getCurrentCUDAStream().stream()),
+               "mlops_qat_grouped_dgrad");
+  return dx;
+}
+
+// dw [groups * n, k] float32 = per group gy_g^T @ x_g (zeros for a group without rows)
+Tensor grouped_wgrad(const Tensor &gy, const Tensor &x, const Tensor &seg, int64_t groups) {
+  const auto dev = gy.device();
+  contig_dense(gy, dev, "gy");
+  contig_dense(x, dev, "x");
+  TORCH_CHECK_VALUE(gy.dim() == 2 && x.dim() == 2 && gy.size(0) == x.size(0) && groups >= 1, "gy must be [rows, n] and x [rows, k]");
+  const int64_t rows = gy.size(0), n = gy.size(1), k = x.size(1);
+  check_seg(seg, groups, dev);
+  Tensor dw = at::empty({groups * n, k}, gy.options().dtype(at::kFloat));
+  const c10::cuda::CUDAGuard guard(dev);
+  check_status(mlops_qat_grouped_wgrad((int)groups, (int)n, (int)k, (int)rows, gy.data_ptr(), dense_dtype(gy.scalar_type(), "gy"), (int)n, x.data_ptr(),
+                                       dense_dtype(x.scalar_type(), "x"), (int)k, dw.data_ptr<float>(), (int)k, seg.data_ptr<int>(),
+                                       at::cuda::getCurrentCUDAStream().stream()),
+               "mlops_qat_grouped_wgrad");
+  return dw;
+}
+
+Tensor grouped_dgrad_meta(const Tensor &gy, const Tensor &w, const Tensor &, int64_t groups, at::ScalarType out_dtype) {
+  TORCH_CHECK_VALUE(gy.dim() == 2 && w.dim() == 2 && groups >= 1, "gy must be [rows, n] and w [groups * n, k]");
+  return at::empty({gy.size(0), w.size(1)}, gy.options().dtype(out_dtype));
+}
+
+Tensor grouped_wgrad_meta(const Tensor &gy, const Tensor &x, const Tensor &, int64_t groups) {
+  TORCH_CHECK_VALUE(gy.dim() == 2 && x.dim() == 2 && groups >= 1, "gy must be [rows, n] and x [rows, k]");
+  return at::empty({groups * gy.size(1), x.size(1)}, gy.options().dtype(at::kFloat));
+}
+
 } // namespace
+
+// The operations as PyTorch operators (torch.ops.mlops_optim.*), with their schemas (what each one mutates) and shape-only Meta kernels: torch.compile
+// and CUDA graphs treat each call as one opaque node instead of breaking the graph at the extension's functions.  The calls enqueue on the current
+// stream and read nothing back, except what the optimizers take as host numbers (lr, step, grad_scale).
+TORCH_LIBRARY(mlops_optim, m) {
+  m.def("grouped_dgrad(Tensor gy, Tensor w, Tensor seg, int groups, ScalarType out_dtype) -> Tensor");
+  m.def("grouped_wgrad(Tensor gy, Tensor x, Tensor seg, int groups) -> Tensor");
+  m.def("adamw(Tensor(a!) param, Tensor grad, Tensor(b!) exp_avg, Tensor(c!) exp_avg_sq, float lr, float beta1, float beta2, float eps, "
+        "float weight_decay, int step, bool bias_correction, float grad_scale) -> ()");
+  m.def("qat_step(Tensor grad, Tensor(a!) state, Tensor(b!) q_data, Tensor(c!) q_scales, Tensor(d!)? q_global, int q_flags, int q_smax, float lr, "
+        "float beta1, float beta2, float eps, float weight_decay, int step, float grad_scale, float scale_z, int seed) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(mlops_optim, CUDA, m) {
+  m.impl("grouped_dgrad", &grouped_dgrad);
+  m.impl("grouped_wgrad", &grouped_wgrad);
+  m.impl("adamw", &adamw);
+  m.impl("qat_step", &qat_step);
+}
+
+TORCH_LIBRARY_IMPL(mlops_optim, Meta, m) {
+  m.impl("grouped_dgrad", &grouped_dgrad_meta);
+  m.impl("grouped_wgrad", &grouped_wgrad_meta);
+  m.impl("adamw", [](Tensor, Tensor, Tensor, Tensor, double, double, double, double, double, int64_t, bool, double) {});
+  m.impl("qat_step", [](Tensor, Tensor, Tensor, Tensor, OptT, int64_t, int64_t, double, double, double, double, double, int64_t, double, double,
+                        int64_t) {});
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "mlops-optimizers: AdamW / NVFP4 AdamW-QAT CUDA kernels";
@@ -146,6 +224,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("adamw", &adamw, py::arg("param"), py::arg("grad"), py::arg("exp_avg"), py::arg("exp_avg_sq"), py::arg("lr"),
         py::arg("beta1"), py::arg("beta2"), py::arg("eps"), py::arg("weight_decay"), py::arg("step"),
         py::arg("bias_correction"), py::arg("grad_scale"));
+  m.def("grouped_dgrad", &grouped_dgrad, py::arg("gy"), py::arg("w"), py::arg("seg"), py::arg("groups"), py::arg("out_dtype"));
+  m.def("grouped_wgrad", &grouped_wgrad, py::arg("gy"), py::arg("x"), py::arg("seg"), py::arg("groups"));
   m.def("qat_state_bytes", &qat_state_bytes, py::arg("rows"), py::arg("cols"));
   m.def("qat_init_quantized", &qat_init_quantized, py::arg("w"), py::arg("state"), py::arg("q_data"),
         py::arg("q_scales"), py::arg("q_global") = py::none(), py::arg("q_flags") = 0, py::arg("q_smax") = 0);

@@ -1,13 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-# mlops-attention: FBLA compressed-KV FlashAttention prefill and decode (fbla/).
-#   make lib        libmlops_attention.a for $(ARCHS) (default: every architecture sm_61..sm_90)
-#   make test       both formats against a float64 model; GQA 1/2/4, capacity, 384 .. 256K tokens (GPU $(GPU))
-#   make bench      local run: 3+3 / 4+2 at 16K .. 1M; KV heads 1/8, GQA 2/4, traffic and NVML clocks
-#                   (bench/run_bench.sh: controlled board run -> benches/<gpu>.md and benches/table.md)
-#   make install    headers, static library and pkg-config file under PREFIX (default /usr/local)
-# Toolchain, architectures and parallelism: ../build/arch.mk. No dependency besides the CUDA toolkit;
-# the benchmark additionally links NVML. Python / PyTorch bindings: python/ (../setup.sh attention).
+# mlops-attention: FBLA compressed-KV FlashAttention prefill and decode (fbla/); targets lib, test, bench, install (described beside each).
+# Toolchain, architectures and parallelism: ../build/arch.mk; no dependency besides the CUDA toolkit (the benchmark also links NVML).
+# Python / PyTorch bindings: python/ (../setup.sh attention).
 MLOPS_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
 include $(MLOPS_ROOT)/build/arch.mk
 
@@ -48,26 +43,40 @@ $(eval $(call LIBRARY,$(OBJDIR),$(GENCODE) --threads $(NVCC_THREADS)))
 $(eval $(call LIBRARY,out/native,-arch=sm_$(TEST_ARCH)))
 out/libmlops_attention.a: $(OBJDIR)/libmlops_attention.a
 	cp $< $@
+# libmlops_attention.a for $(ARCHS) (default: every architecture sm_61..sm_90)
 lib: out/libmlops_attention.a
 
 NATIVE_FLAGS = $(FLAGS) -arch=sm_$(TEST_ARCH)
 # ---- tests and benchmark (local architecture) ----------------------------------------------------
-out/test_fbla: fbla/tests/test_fbla.cu out/native/libmlops_attention.a
-	$(NVCC) $(NATIVE_FLAGS) -o $@ $< out/native/libmlops_attention.a
-out/test_items: fbla/tests/test_items.cu $(HDRS) out/native/libmlops_attention.a
-	$(NVCC) $(NATIVE_FLAGS) -DFBLA_ROOT='"$(CURDIR)"' -DFBLA_CUDA_INCLUDE='"$(CUDA_HOME)/include"' -o $@ $< out/native/libmlops_attention.a -lnvrtc -lcuda
-out/bench_fbla: fbla/bench/bench_fbla.cu fbla/bench/bench_util.h out/native/libmlops_attention.a
-	$(NVCC) $(NATIVE_FLAGS) -o $@ $< out/native/libmlops_attention.a -lnvidia-ml
+# A program's object compiles beside the library's (they do not depend on each other); the link waits for both.
+out/native/test_fbla.o: fbla/tests/test_fbla.cu $(HDRS) | out/native
+	$(NVCC) $(NATIVE_FLAGS) -c -o $@ $<
+out/native/test_items.o: fbla/tests/test_items.cu $(HDRS) | out/native
+	$(NVCC) $(NATIVE_FLAGS) -DFBLA_ROOT='"$(CURDIR)"' -DFBLA_CUDA_INCLUDE='"$(CUDA_HOME)/include"' -c -o $@ $<
+out/native/bench_fbla.o: fbla/bench/bench_fbla.cu fbla/bench/bench_util.h $(HDRS) | out/native
+	$(NVCC) $(NATIVE_FLAGS) -c -o $@ $<
+out/test_fbla: out/native/test_fbla.o out/native/libmlops_attention.a
+	$(NVCC) $(NATIVE_FLAGS) -o $@ $^
+out/test_items: out/native/test_items.o out/native/libmlops_attention.a
+	$(NVCC) $(NATIVE_FLAGS) -o $@ $^ -lnvrtc -lcuda
+out/bench_fbla: out/native/bench_fbla.o out/native/libmlops_attention.a
+	$(NVCC) $(NATIVE_FLAGS) -o $@ $^ -lnvidia-ml
 test-bin: out/test_fbla out/test_items
 bench-bin: out/bench_fbla
-test: out/test_fbla out/test_items
+# both formats against a float64 model; GQA 1/2/4, capacity, 384 .. 256K tokens (GPU $(GPU)); the two programs run together, each one's report printed whole
+MAKEFLAGS += -Otarget
+test: run-test_fbla run-test_items
+run-test_fbla: out/test_fbla
 	$(RUN) ./out/test_fbla
+run-test_items: out/test_items
 	$(RUN) ./out/test_items
+# local run: 3+3 / 4+2 at 16K .. 1M; KV heads 1/8, GQA 2/4, traffic and NVML clocks (bench/run_bench.sh: controlled board run -> benches/<gpu>.md, benches/table.md)
 bench: out/bench_fbla
 	$(RUN) ./out/bench_fbla
 
 # ---- install (C / C++ projects: pkg-config --cflags --libs mlops-attention) ----------------------
 PREFIX ?= /usr/local
+# headers, static library and pkg-config file under PREFIX
 install: $(OBJDIR)/libmlops_attention.a
 	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib/pkgconfig \
 	  $(DESTDIR)$(PREFIX)/include/mlops/attention/include $(DESTDIR)$(PREFIX)/include/mlops/attention/fbla/src/tensors \
@@ -87,4 +96,4 @@ install: $(OBJDIR)/libmlops_attention.a
 clean:
 	rm -rf out
 
-.PHONY: all lib test-bin bench-bin test bench install clean
+.PHONY: all lib test-bin bench-bin test run-test_fbla run-test_items bench install clean

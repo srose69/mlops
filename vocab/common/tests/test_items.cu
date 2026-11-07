@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// The work items of mlops-vocab (include/mlops_vocab_items.h) through NVRTC and an executor of the test's own: each
-// item's entry is compiled from its `entry` string and run on the described CTA; the outputs are the call's, bit for
-// bit. The declared writes are checked by running every item alone on poisoned outputs: only declared bytes change,
-// and together the items write every output byte.
+// The work items of mlops-vocab (include/mlops_vocab_items.h) through NVRTC and an executor of the test's own: each item's entry is compiled
+// from its `entry` string and run on the described CTA; outputs are the call's, bit for bit. Declared writes: every item alone on poisoned
+// outputs changes only declared bytes, and together the items write every output byte.
 #include <cuda.h>
 #include <nvrtc.h>
 
@@ -86,6 +85,7 @@ static void run(const Kernel &k, const mlops_vocab_items &it, int first, int cou
   CK(cudaMalloc(&d_args, it.args_bytes));
   CK(cudaMemcpy(d_args, it.args.bytes, it.args_bytes, cudaMemcpyHostToDevice));
   void *params[] = {&d_args, &first};
+  if (it.smem_bytes > 48 * 1024) CU(cuFuncSetAttribute(k.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, it.smem_bytes));  // (opt-in above 48 KiB)
   CU(cuLaunchKernel(k.fn, count, 1, 1, it.threads, 1, 1, it.smem_bytes, 0, params, nullptr));
   CK(cudaDeviceSynchronize());
   CK(cudaFree(d_args));
@@ -135,8 +135,8 @@ static int check_writes(const char *what, const Kernel &k, const mlops_vocab_ite
 }
 
 // ---- embed ------------------------------------------------------------------------------------------------------
-static int test_embed() {
-  const int vocab = 3000, hidden = 2560, n_tok = 3;
+static int test_embed(int x_dtype) {
+  const int vocab = 3000, hidden = 2560, n_tok = 3, xb = x_dtype == MLOPS_EMBED_X_FP32 ? 4 : 2;
   std::vector<uint16_t> table((size_t)vocab * hidden), w(hidden);
   std::normal_distribution<float> d(0.f, 1.f);
   for (auto &v : table) v = bf16(d(rng));
@@ -144,10 +144,11 @@ static int test_embed() {
   std::vector<int> ids = {5, 2999, 17};
   uint16_t *dt = up(table), *dw = up(w), *dxw;
   int *did = up(ids), *derr;
-  float *dx, *dp;
+  void *dx;
+  float *dp;
   const size_t nx = (size_t)n_tok * hidden, np = (size_t)n_tok * hidden / 256;
-  CK(cudaMalloc(&dx, nx * 4)); CK(cudaMalloc(&dxw, nx * 2)); CK(cudaMalloc(&dp, np * 4)); CK(cudaMalloc(&derr, 4));
-  const mlops_embed_config c{vocab, hidden, n_tok, 0};
+  CK(cudaMalloc(&dx, nx * xb)); CK(cudaMalloc(&dxw, nx * 2)); CK(cudaMalloc(&dp, np * 4)); CK(cudaMalloc(&derr, 4));
+  const mlops_embed_config c{vocab, hidden, n_tok, 0, x_dtype};
   mlops_embed_variant v[4];
   mlops_embed_variants(&c, v, 4);
   int f = 0;
@@ -155,20 +156,20 @@ static int test_embed() {
     CK(cudaMemset(derr, 0, 4));
     if (mlops_embed(&c, &v[vi], dt, did, dw, dx, dxw, dp, derr, 0)) return 1;
     CK(cudaDeviceSynchronize());
-    const auto rx = download(dx, nx * 4), rxw = download(dxw, nx * 2), rp = download(dp, np * 4);
+    const auto rx = download(dx, nx * xb), rxw = download(dxw, nx * 2), rp = download(dp, np * 4);
     mlops_vocab_items it;
     if (mlops_embed_items(&c, &v[vi], dt, did, dw, dx, dxw, dp, derr, &it) != 1) return 1;
     const Kernel k = compile(it);
-    const std::vector<Buffer> outs = {{MLOPS_VOCAB_ARG_X, dx, nx * 4}, {MLOPS_VOCAB_ARG_XW, dxw, nx * 2}, {MLOPS_VOCAB_ARG_PARTS, dp, np * 4}};
+    const std::vector<Buffer> outs = {{MLOPS_VOCAB_ARG_X, dx, nx * xb}, {MLOPS_VOCAB_ARG_XW, dxw, nx * 2}, {MLOPS_VOCAB_ARG_PARTS, dp, np * 4}};
     poison(outs);
     run(k, it, 0, it.items);
-    long bad = download(dx, nx * 4) != rx, n = 3;
+    long bad = download(dx, nx * xb) != rx, n = 3;
     bad += download(dxw, nx * 2) != rxw;
     bad += download(dp, np * 4) != rp;
     char what[160];
-    snprintf(what, sizeof what, "embed items (%d warps, %d items): outputs of the call", v[vi].warps, it.items);
+    snprintf(what, sizeof what, "embed items (x %s, %d warps, %d items): outputs of the call", x_dtype == 0 ? "FP32" : x_dtype == 1 ? "BF16" : "FP16", v[vi].warps, it.items);
     f += report(what, bad, n);
-    snprintf(what, sizeof what, "embed items (%d warps): declared writes", v[vi].warps);
+    snprintf(what, sizeof what, "embed items (x %s, %d warps): declared writes", x_dtype == 0 ? "FP32" : x_dtype == 1 ? "BF16" : "FP16", v[vi].warps);
     f += check_writes(what, k, it, outs);
   }
   return f;
@@ -193,7 +194,13 @@ static int test_head(int vocab, int hidden, int n_cols, bool norm) {
   const int ni = mlops_lm_head_item_count(&c, &vs[0]);
   CK(cudaMalloc(&dl, (size_t)n_cols * vocab * 4)); CK(cudaMalloc(&dmax, (size_t)n_cols * ni * 4)); CK(cudaMalloc(&darg, (size_t)n_cols * ni * 4));
   int f = 0;
+  int dev = 0, smem_max = 0;
+  CK(cudaGetDevice(&dev));
+  CK(cudaDeviceGetAttribute(&smem_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
   std::vector<int> picks = {0, nv / 2, nv - 1};
+  // the counts of the key bytes take columns * 1 KiB of shared memory on top of the variant's: a variant they do not fit is not picked
+  for (int &pi : picks)
+    while (pi > 0 && vs[pi].smem_bytes + vs[pi].columns * 256 * 4 > smem_max) --pi;
   for (int pi : picks) {
     const auto &v = vs[pi];
     const int items_n = mlops_lm_head_item_count(&c, &v);
@@ -219,6 +226,67 @@ static int test_head(int vocab, int hidden, int n_cols, bool norm) {
     snprintf(what, sizeof what, "head items (%s R%d S%d D%d, n %d): declared writes", v.tensor_cores == 3 ? "tc884" : v.tensor_cores == 2 ? "tc16" : v.tensor_cores ? "tc" : "cuda", v.rows_per_unit, v.k_pieces, v.depth, n_cols);
     f += check_writes(what, k, it, outs);
   }
+  return f;
+}
+
+// The head of one column that reads column *column of x [columns][hidden] and norm_parts: the call on that column's pointers.
+static int test_head_column(int vocab, int hidden, int columns, int pick, bool norm) {
+  std::normal_distribution<float> d(0.f, 0.05f);
+  std::vector<uint16_t> w((size_t)vocab * hidden), x((size_t)columns * hidden);
+  for (auto &v : w) v = bf16(d(rng));
+  for (auto &v : x) v = bf16(d(rng) * 10.f);
+  std::vector<float> parts;
+  if (norm) for (int i = 0; i < columns * 9; ++i) parts.push_back(1.f + (rng() % 100) / 50.f);
+  uint16_t *dw = up(w), *dx = up(x);
+  float *dparts = norm ? up(parts) : nullptr;
+  int *dcol;
+  CK(cudaMalloc(&dcol, 4));
+  CK(cudaMemcpy(dcol, &pick, 4, cudaMemcpyHostToDevice));
+  const mlops_lm_head_config c{vocab, hidden, 1, 11, norm ? 9 : 0, 1.f / hidden, 1e-6f, 0.8f};
+  const int nv = mlops_lm_head_variants(&c, nullptr, 0);
+  std::vector<mlops_lm_head_variant> vs(nv);
+  mlops_lm_head_variants(&c, vs.data(), nv);
+  int dev = 0, smem_max = 0, f = 0;
+  CK(cudaGetDevice(&dev));
+  CK(cudaDeviceGetAttribute(&smem_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+  std::vector<int> picks = {0, nv / 2, nv - 1};
+  for (int &pi : picks)
+    while (pi > 0 && vs[pi].smem_bytes + vs[pi].columns * 256 * 4 > smem_max) --pi;
+  for (int pi : picks) {
+    const auto &v = vs[pi];
+    const int items_n = mlops_lm_head_item_count(&c, &v);
+    float *dl, *dmax, *dl2, *dmax2;
+    int *darg, *darg2;
+    unsigned *dhist, *dhist2;
+    CK(cudaMalloc(&dl, (size_t)vocab * 4)); CK(cudaMalloc(&dl2, (size_t)vocab * 4));
+    CK(cudaMalloc(&dmax, (size_t)items_n * 4)); CK(cudaMalloc(&dmax2, (size_t)items_n * 4));
+    CK(cudaMalloc(&darg, (size_t)items_n * 4)); CK(cudaMalloc(&darg2, (size_t)items_n * 4));
+    CK(cudaMalloc(&dhist, (size_t)items_n * 256 * 4)); CK(cudaMalloc(&dhist2, (size_t)items_n * 256 * 4));
+    if (mlops_lm_head(&c, &v, dw, dx + (size_t)pick * hidden, norm ? dparts + (size_t)pick * 9 : nullptr, dl, dmax, darg, dhist, 0)) return 1;
+    CK(cudaDeviceSynchronize());
+    const auto rl = download(dl, (size_t)vocab * 4), rm = download(dmax, (size_t)items_n * 4), ra = download(darg, (size_t)items_n * 4),
+               rh = download(dhist, (size_t)items_n * 256 * 4);
+    mlops_vocab_items it;
+    if (mlops_lm_head_items(&c, &v, dw, dx, dparts, dl2, dmax2, darg2, dhist2, &it) != 1) return 1;
+    if (mlops_lm_head_items_column(&it, dcol, columns)) return 1;
+    const Kernel k = compile(it);
+    const std::vector<Buffer> outs = {{MLOPS_VOCAB_ARG_LOGITS, dl2, (size_t)vocab * 4}, {MLOPS_VOCAB_ARG_STATS_MAX, dmax2, (size_t)items_n * 4},
+                                      {MLOPS_VOCAB_ARG_STATS_ARG, darg2, (size_t)items_n * 4}, {MLOPS_VOCAB_ARG_STATS_HIST, dhist2, (size_t)items_n * 256 * 4}};
+    poison(outs);
+    run(k, it, 0, it.items);
+    long bad = download(dl2, (size_t)vocab * 4) != rl;
+    bad += download(dmax2, (size_t)items_n * 4) != rm;
+    bad += download(darg2, (size_t)items_n * 4) != ra;
+    bad += download(dhist2, (size_t)items_n * 256 * 4) != rh;
+    char what[170];
+    snprintf(what, sizeof what, "head items on column %d of %d (%s R%d S%d D%d%s, %d items): outputs of the call", pick, columns,
+             v.tensor_cores ? "tc" : "cuda", v.rows_per_unit, v.k_pieces, v.depth, norm ? ", norm" : "", it.items);
+    f += report(what, bad, 4);
+    snprintf(what, sizeof what, "head items on column %d of %d (R%d S%d D%d): declared writes", pick, columns, v.rows_per_unit, v.k_pieces, v.depth);
+    f += check_writes(what, k, it, outs);
+    for (void *p : {(void *)dl, (void *)dl2, (void *)dmax, (void *)dmax2, (void *)darg, (void *)darg2, (void *)dhist, (void *)dhist2}) cudaFree(p);
+  }
+  for (void *p : {(void *)dw, (void *)dx, (void *)dparts, (void *)dcol}) cudaFree(p);
   return f;
 }
 
@@ -289,11 +357,14 @@ static int test_sample(const char *name, mlops_sample_config c, bool with_stats)
 int main() {
   CK(cudaFree(0));
   int f = 0;
-  f += test_embed();
+  for (int x_dtype : {MLOPS_EMBED_X_FP32, MLOPS_EMBED_X_BF16, MLOPS_EMBED_X_FP16}) f += test_embed(x_dtype);
   f += test_head(1000, 1024, 1, false);
   f += test_head(2500, 2048, 1, true);
   f += test_head(3001, 2048, 8, true);
   f += test_head(1500, 1024, 3, false);
+  f += test_head_column(1000, 1024, 5, 3, false);
+  f += test_head_column(2500, 2048, 40, 39, true);
+  f += test_head_column(3001, 1024, 7, 0, true);
   f += test_sample("greedy", {151936, 0.f, 0, 1.f, 1.2f, 0}, false);
   f += test_sample("greedy", {151936, 0.f, 0, 1.f, 1.f, 0}, true);
   f += test_sample("top-k, top-p", {151936, 0.6f, 20, 0.95f, 1.1f, 0}, false);

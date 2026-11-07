@@ -8,13 +8,19 @@
 #include <nvrtc.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <future>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
@@ -36,7 +42,18 @@ struct Buffer {
   Bytes read() const { Bytes b(size + 128); CUDA(cudaMemcpy(b.data(), p, b.size(), cudaMemcpyDeviceToHost)); return b; }
   void set(const void *src, size_t n) { CHECK(n <= size); CUDA(cudaMemcpy(p, src, n, cudaMemcpyHostToDevice)); }
 };
-std::mt19937 rng(7301);
+thread_local std::mt19937 rng(7301);
+// A case's report goes to its own buffer while the cases run on several threads, and is printed in the cases' order.
+thread_local std::string *report_sink = nullptr;
+void say(const char *fmt, ...) {
+  char text[1024];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(text, sizeof text, fmt, args);
+  va_end(args);
+  if (report_sink) *report_sink += text;
+  else fputs(text, stdout);
+}
 void random_bf16(Buffer &b) {
   std::normal_distribution<float> n(0.f, 1.5f);
   std::vector<uint16_t> v(b.size / 2);
@@ -51,16 +68,14 @@ bool bad_count = false;
 bool benchmark = false;
 bool readonly_control = false;
 bool omit_count_range = false;
-std::map<std::string, Program> programs;
-Program executor(const mlops_fbla_items &p) {
-  const std::string key = std::string(p.entry) + ":" + std::to_string(p.arch);
-  auto old = programs.find(key);
-  if (old != programs.end()) return old->second;
+std::mutex programs_lock;
+std::map<std::string, std::shared_future<Program>> programs;  // one compile per distinct entry, shared by the threads asking
+Program build_program(const mlops_fbla_items &p) {
   std::string shared, call = std::string(p.entry) + "(a";
   using namespace mlops_fbla_detail;
   Args d{}; PrefillArgs a{};
   if (p.kind >= MLOPS_FBLA_ITEM_COARSE && p.kind <= MLOPS_FBLA_ITEM_MERGE) memcpy(&d, p.args.bytes, sizeof d);
-  else if (p.kind != MLOPS_FBLA_ITEM_QKV) memcpy(&a, p.args.bytes, sizeof a);
+  else if (p.kind != MLOPS_FBLA_ITEM_QKV && p.kind != MLOPS_FBLA_ITEM_QKV_CHUNK) memcpy(&a, p.args.bytes, sizeof a);
   const int qg = d.kv_heads ? d.q_heads / d.kv_heads / d.vg : 0;
   switch (p.kind) {
     case MLOPS_FBLA_ITEM_CLOSE: call += ", *reinterpret_cast<unsigned char (*)[2][128][128]>(sm)"; break;
@@ -87,9 +102,16 @@ Program executor(const mlops_fbla_items &p) {
               std::to_string(qg * 4) + ")"; break;
     case MLOPS_FBLA_ITEM_MERGE: call += ", *reinterpret_cast<mlops_fbla_detail::SmemMerge *>(sm)"; break;
     case MLOPS_FBLA_ITEM_QKV: call += ", mlops_fbla::Pos::x(), *reinterpret_cast<mlops_fbla_detail::QkvSmem *>(sm)"; break;
+    case MLOPS_FBLA_ITEM_QKV_CHUNK:
+      call += ", mlops_fbla::Pos::x(), mlops_fbla::Pos::y(), *reinterpret_cast<mlops_fbla_detail::QkvChunkSmem *>(sm)"; break;
     default: CHECK(false);
   }
   call += ");\n";
+  if (p.kind != MLOPS_FBLA_ITEM_TRANSCODE && p.kind != MLOPS_FBLA_ITEM_TC && p.kind != MLOPS_FBLA_ITEM_TC_MERGE) {
+    char library[1024];  // the library's own account of the call is this one
+    CHECK(mlops_fbla_item_call(&p, library, sizeof library) > 0);
+    CHECK(std::string(library).find(call.substr(0, call.size() - 1)) != std::string::npos);
+  }
   const std::string src = std::string(R"cuda(
 #include "mlops_fbla_items.cuh"
 namespace mlops_fbla {
@@ -174,8 +196,25 @@ extern "C" __global__ void run(const void *args, const long long *g, int first, 
   Program result;
   DRIVER(cuModuleLoadData(&result.module, ptx.data())); DRIVER(cuModuleGetFunction(&result.fn, result.module, "run"));
   if (p.smem_bytes > 48 * 1024) DRIVER(cuFuncSetAttribute(result.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, p.smem_bytes));
-  programs.emplace(key, result);
   return result;
+}
+Program executor(const mlops_fbla_items &p) {
+  const std::string key = std::string(p.entry) + ":" + std::to_string(p.arch);
+  std::promise<Program> promise;
+  std::shared_future<Program> future;
+  bool mine = false;
+  {
+    std::lock_guard<std::mutex> guard(programs_lock);
+    const auto at = programs.find(key);
+    if (at != programs.end()) future = at->second;
+    else {
+      future = promise.get_future().share();
+      programs.emplace(key, future);
+      mine = true;
+    }
+  }
+  if (mine) promise.set_value(build_program(p));
+  return future.get();
 }
 
 // Every argument has its own allocation, so a declared range cannot accidentally be justified by an adjacent tensor.
@@ -191,6 +230,10 @@ struct State {
     const int cb = c.format == MLOPS_FBLA_3P3 ? 3 : 4, fb = 6 - cb;
     add(MLOPS_FBLA_ARG_COARSE, units * 8 * cb * 512); add(MLOPS_FBLA_ARG_FINE, units * 8 * fb * 512);
     add(MLOPS_FBLA_ARG_META, units * 1024);
+    mlops_fbla_sizes sizes;  // the library's account of the same allocations
+    CHECK(mlops_fbla_cache_sizes(&c, &sizes) == 1);
+    CHECK(sizes.coarse == get(MLOPS_FBLA_ARG_COARSE).size && sizes.fine == get(MLOPS_FBLA_ARG_FINE).size && sizes.meta == units * 1024);
+    CHECK(sizes.exact == heads * G * D * 2 && sizes.images == (mlops_fbla_images_bytes(&c) ? units * mlops_fbla_detail::IMAGE_SLOT : 0));
     for (int i : {MLOPS_FBLA_ARG_SINK_K, MLOPS_FBLA_ARG_SINK_V, MLOPS_FBLA_ARG_OPEN_K, MLOPS_FBLA_ARG_OPEN_V}) add(i, heads * G * D * 2);
     if (mlops_fbla_images_bytes(&c)) add(MLOPS_FBLA_ARG_IMAGES, units * mlops_fbla_detail::IMAGE_SLOT);
     cache = {get(MLOPS_FBLA_ARG_COARSE).as<uint8_t>(), get(MLOPS_FBLA_ARG_FINE).as<uint8_t>(), get(MLOPS_FBLA_ARG_META).as<uint16_t>(),
@@ -199,9 +242,11 @@ struct State {
       buffers[MLOPS_FBLA_ARG_IMAGES] ? get(MLOPS_FBLA_ARG_IMAGES).as<uint8_t>() : nullptr};
     for (int i : {MLOPS_FBLA_ARG_Q, MLOPS_FBLA_ARG_OUT}) add(i, (size_t)c.batch * c.q_heads * ceiling * D * 2);
     for (int i : {MLOPS_FBLA_ARG_K, MLOPS_FBLA_ARG_V}) add(i, heads * ceiling * D * 2);
-    add(MLOPS_FBLA_ARG_LENGTH, 4); add(MLOPS_FBLA_ARG_COUNT, 4);
+    add(MLOPS_FBLA_ARG_LENGTH, 4 * (size_t)c.batch); add(MLOPS_FBLA_ARG_COUNT, 4);
     auto cap = c; cap.tokens = c.capacity;
     add(MLOPS_FBLA_ARG_SCRATCH, mlops_fbla_decode_scratch_bytes(&cap));
+    CHECK(mlops_fbla_decode_scratch_bytes_for(&c, 0) == get(MLOPS_FBLA_ARG_SCRATCH).size);
+    for (int per_head : {1, 2, 5, 16}) CHECK(mlops_fbla_decode_scratch_bytes_for(&c, per_head) == mlops_fbla_detail::decode_scratch_bytes(&c, per_head));
   }
   void copy_from(State &s) {
     for (int i = 0; i < ARGS; ++i) if (buffers[i]) { CHECK(s.buffers[i]); auto b = s.get(i).read(); get(i).set(b.data(), get(i).size); }
@@ -250,6 +295,8 @@ std::vector<mlops_fbla_item_range> ranges(State &s, const std::vector<mlops_fbla
     needs_count = a.dcount;
   } else if (pass_desc.kind == MLOPS_FBLA_ITEM_QKV) {
     mlops_fbla_detail::QkvArgs a; memcpy(&a, pass_desc.args.bytes, sizeof a); needs_length = a.p.length;
+  } else if (pass_desc.kind == MLOPS_FBLA_ITEM_QKV_CHUNK) {
+    needs_length = needs_count = true;
   } else {
     mlops_fbla_detail::Args a; memcpy(&a, pass_desc.args.bytes, sizeof a);
     needs_length = a.length && pass_desc.kind != MLOPS_FBLA_ITEM_MERGE;
@@ -353,12 +400,14 @@ void time_passes(const std::vector<mlops_fbla_items> &passes, int tokens) {
   }
 }
 
-enum Operation { Prefill, Append, Decode, Qkv, AppendChunk };
+enum Operation { Prefill, Append, Decode, Qkv, AppendChunk, QkvChunk };
+// rows: a length per batch row (cfg.length_stride 1; decode, append and qkv)
 void run(Operation op, int cb, int batch, int qg, int start, int count, int ceiling, bool strided, bool norm, int kh = 2,
-         int per_head = 0) {
+         int per_head = 0, bool rows = false) {
   const int capacity = start + ceiling + 173, heads = batch * kh;
   mlops_fbla_config cfg{batch, kh * qg, kh, 0, 0.f, 0.f, cb == 3 ? MLOPS_FBLA_3P3 : MLOPS_FBLA_4P2, capacity, 0, 0};
   if (strided) { cfg.head_stride = 1; cfg.group_stride = heads + 1; }
+  cfg.length_stride = rows;
   State ref(cfg, ceiling), test(cfg, ceiling);
   if (per_head) for (State *s : {&ref, &test})
     s->add(MLOPS_FBLA_ARG_SCRATCH, mlops_fbla_detail::decode_scratch_bytes(&cfg, per_head));
@@ -371,12 +420,14 @@ void run(Operation op, int cb, int batch, int qg, int start, int count, int ceil
   for (int i : {MLOPS_FBLA_ARG_Q, MLOPS_FBLA_ARG_K, MLOPS_FBLA_ARG_V}) random_bf16(ref.get(i));
   cfg.tokens = start >= 7 ? 7 : 0;
   const int length = start - cfg.tokens;
-  ref.get(MLOPS_FBLA_ARG_LENGTH).set(&length, 4); ref.get(MLOPS_FBLA_ARG_COUNT).set(&count, 4);
+  std::vector<int> lengths(batch, length);
+  if (rows) for (int b = 0; b < batch; ++b) lengths[b] = std::max(0, length - 41 * b);
+  ref.get(MLOPS_FBLA_ARG_LENGTH).set(lengths.data(), 4 * batch); ref.get(MLOPS_FBLA_ARG_COUNT).set(&count, 4);
   mlops_fbla_token tokens[2]{};
-  if (op == Qkv) {
+  if (op == Qkv || op == QkvChunk) {
     for (State *s : {&ref, &test}) {
       const size_t stride = (size_t)kh * (qg + 2) * D + 16;
-      for (int i : {MLOPS_FBLA_ARG_TQ, MLOPS_FBLA_ARG_TK, MLOPS_FBLA_ARG_TV}) s->add(i, batch * stride * 2);
+      for (int i : {MLOPS_FBLA_ARG_TQ, MLOPS_FBLA_ARG_TK, MLOPS_FBLA_ARG_TV}) s->add(i, (op == QkvChunk ? ceiling : batch) * stride * 2);
       for (int i : {MLOPS_FBLA_ARG_TQN, MLOPS_FBLA_ARG_TKN}) if (norm) s->add(i, D * 2);
       s->add(MLOPS_FBLA_ARG_TFREQ, D / 2 * sizeof(mlops_rope_detail::Freq));
       s->add(MLOPS_FBLA_ARG_TQ_OUT, (size_t)batch * cfg.q_heads * D * 2);
@@ -403,6 +454,7 @@ void run(Operation op, int cb, int batch, int qg, int start, int count, int ceil
                                                          op == Prefill ? q : nullptr, k, v, &test.cache, out, p, max);
       case Append: return mlops_fbla_append_at_items(&cfg, len, k, v, &test.cache, p, max);
       case Decode: return mlops_fbla_decode_at_items(&cfg, len, q, &test.cache, out, ws.p, ws.size, per_head, p, max);
+      case QkvChunk: return mlops_fbla_qkv_prefill_at_items(&cfg, len, test.get(MLOPS_FBLA_ARG_COUNT).as<int>(), ceiling, &tokens[1], q, k, v, p, max);
       default: return mlops_fbla_qkv_at_items(&cfg, len, &tokens[1], &test.cache, p, max);
     }
   };
@@ -430,11 +482,13 @@ void run(Operation op, int cb, int batch, int qg, int start, int count, int ceil
         CUDA((cb == 3 ? mlops_fbla_detail::launch<3, 3>(a, per_head, 0) : mlops_fbla_detail::launch<4, 2>(a, per_head, 0)));
       } else status = mlops_fbla_decode_at(&cfg, len, q, &ref.cache, out, ws.p, ws.size, 0);
       break;
+    case QkvChunk: status = mlops_fbla_qkv_prefill_at(&cfg, len, ref.get(MLOPS_FBLA_ARG_COUNT).as<int>(), ceiling, &tokens[0], q, k, v, 0); break;
     default: status = mlops_fbla_qkv_at(&cfg, len, &tokens[0], &ref.cache, 0); break;
   }
   CHECK(status == 0); CUDA(cudaDeviceSynchronize());
   execute(test, p, false);
   const auto expected = snapshot(ref), actual = snapshot(test);
+  for (int arg : {MLOPS_FBLA_ARG_Q, MLOPS_FBLA_ARG_K, MLOPS_FBLA_ARG_V}) CHECK(op != QkvChunk || expected[arg] == actual[arg]);
   for (int arg : {MLOPS_FBLA_ARG_OUT, MLOPS_FBLA_ARG_COARSE, MLOPS_FBLA_ARG_FINE, MLOPS_FBLA_ARG_META,
                  MLOPS_FBLA_ARG_SINK_K, MLOPS_FBLA_ARG_SINK_V, MLOPS_FBLA_ARG_OPEN_K, MLOPS_FBLA_ARG_OPEN_V,
                  MLOPS_FBLA_ARG_IMAGES, MLOPS_FBLA_ARG_TQ_OUT}) {
@@ -452,10 +506,32 @@ void run(Operation op, int cb, int batch, int qg, int start, int count, int ceil
     printf("BENCH config format %d qg %d per_head %d\n", cb, qg, per_head);
     time_passes(p, start);
   }
-  printf("PASS op %d format %d batch %d qg %d start %d count %d/%d%s%s (%d passes)\n", op, cb, batch, qg, start, count, ceiling,
-         strided ? " strided" : "", norm ? " norm" : "", n); fflush(stdout);
+  say("PASS op %d format %d batch %d qg %d start %d count %d/%d%s%s (%d passes)\n", op, cb, batch, qg, start, count, ceiling,
+      strided ? " strided" : "", norm ? " norm" : "", n);
 }
 }  // namespace
+
+// The sizing API refuses what the calls refuse and leaves its output alone.
+void check_sizing_errors() {
+  mlops_fbla_config c{1, 16, 8, 0, 0.f, 0.f, MLOPS_FBLA_3P3, 1024, 0, 0};
+  mlops_fbla_sizes sizes;
+  memset(&sizes, 0x5A, sizeof sizes);
+  mlops_fbla_sizes before = sizes;
+  CHECK(mlops_fbla_cache_sizes(nullptr, &sizes) == 0 && mlops_fbla_cache_sizes(&c, nullptr) == 0);
+  mlops_fbla_config bad = c; bad.q_heads = 12;  // not a multiple of kv_heads
+  CHECK(mlops_fbla_cache_sizes(&bad, &sizes) == 0);
+  bad = c; bad.format = static_cast<mlops_fbla_format>(7);
+  CHECK(mlops_fbla_cache_sizes(&bad, &sizes) == 0);
+  bad = c; bad.head_stride = 3;  // one stride alone
+  CHECK(mlops_fbla_cache_sizes(&bad, &sizes) == 0);
+  bad = c; bad.capacity = 0; bad.tokens = 0;
+  CHECK(mlops_fbla_cache_sizes(&bad, &sizes) == 0);
+  CHECK(memcmp(&sizes, &before, sizeof sizes) == 0);
+  CHECK(mlops_fbla_decode_scratch_bytes_for(nullptr, 1) == 0 && mlops_fbla_decode_scratch_bytes_for(&c, -1) == 0);
+  bad = c; bad.capacity = 0;
+  CHECK(mlops_fbla_decode_scratch_bytes_for(&bad, 1) == 0);
+  CHECK(mlops_fbla_decode_scratch_bytes_for(&c, 1) < mlops_fbla_decode_scratch_bytes_for(&c, 64));  // wider partials, more scratch
+}
 
 int main(int argc, char **argv) {
   if (argc == 2 && !strcmp(argv[1], "--publication")) publication = true;
@@ -465,34 +541,67 @@ int main(int argc, char **argv) {
   else if (argc == 2 && !strcmp(argv[1], "--bench")) benchmark = true;
   else CHECK(argc == 1);
   DRIVER(cuInit(0));
+  check_sizing_errors();
   int device; CUDA(cudaGetDevice(&device));
   cudaDeviceProp prop{}; CUDA(cudaGetDeviceProperties(&prop, device));
   printf("device: %s; sm_%d%d; %d SMs; %zu MiB VRAM\n", prop.name, prop.major, prop.minor,
          prop.multiProcessorCount, prop.totalGlobalMem >> 20); fflush(stdout);
+  std::vector<std::function<void()>> jobs;
+  const auto add = [&](std::function<void()> fn) { jobs.push_back(std::move(fn)); };
   for (int cb : {3, 4}) {
     if (benchmark) {
-      for (int tokens : {1, 16, 128, 300, 1024}) for (int qg : {1, 4}) run(Decode, cb, 1, qg, tokens, 1, 1, false, false);
-      for (int qg : {1, 4}) run(Decode, cb, 1, qg, 300, 1, 1, false, false, 2, 1);
+      for (int tokens : {1, 16, 128, 300, 1024}) for (int qg : {1, 4}) add([=] { run(Decode, cb, 1, qg, tokens, 1, 1, false, false); });
+      for (int qg : {1, 4}) add([=] { run(Decode, cb, 1, qg, 300, 1, 1, false, false, 2, 1); });
       continue;
     }
     for (int qg : {1, 2, 4, 5, 8}) {
-      run(Prefill, cb, 2, qg, 127, 3, 17, qg % 2, false);
-      run(Append, cb, 2, qg, 128, 1, 1, qg % 2, false);
-      run(Decode, cb, 2, qg, 301, 1, 1, qg % 2, false);
-      run(Qkv, cb, 2, qg, 128, 1, 1, qg % 2, false);
-      run(Qkv, cb, 2, qg, 0, 1, 1, false, true);
+      add([=] { run(Prefill, cb, 2, qg, 127, 3, 17, qg % 2, false); });
+      add([=] { run(Append, cb, 2, qg, 128, 1, 1, qg % 2, false); });
+      add([=] { run(Decode, cb, 2, qg, 301, 1, 1, qg % 2, false); });
+      add([=] { run(Qkv, cb, 2, qg, 128, 1, 1, qg % 2, false); });
+      add([=] { run(Qkv, cb, 2, qg, 0, 1, 1, false, true); });
     }
-    run(Prefill, cb, 1, 1, 1000, 300, 512, true, false);
-    run(AppendChunk, cb, 2, 2, 127, 3, 17, true, false);
-    run(Prefill, cb, 1, 1, 256, 2049, 4096, false, false, 1); // TC split partials, including empty pieces
-    run(Decode, cb, 1, 4, 128, 1, 1, false, false); // no closed groups: every refinement item is empty
-    run(Decode, cb, 1, 4, 256, 1, 1, true, false); // no closed groups: sink and full open BF16 groups
-    run(Decode, cb, 1, 2, 16210, 1, 1, false, false); // capacity 16384: last single-slice layout
-    run(Decode, cb, 1, 2, 16211, 1, 1, false, false); // capacity 16385: first multi-slice layout
-    run(Decode, cb, 1, 4, 20000, 1, 1, true, false); // multiple select slices
-    run(Decode, cb, 2, 4, 300, 1, 1, true, false, 2, 1); // explicit executor grid and scratch layout
+    add([=] { run(Prefill, cb, 1, 1, 1000, 300, 512, true, false); });
+    add([=] { run(AppendChunk, cb, 2, 2, 127, 3, 17, true, false); });
+    add([=] { run(Prefill, cb, 1, 1, 256, 2049, 4096, false, false, 1); }); // TC split partials, including empty pieces
+    add([=] { run(Decode, cb, 1, 4, 128, 1, 1, false, false); }); // no closed groups: every refinement item is empty
+    add([=] { run(Decode, cb, 1, 4, 256, 1, 1, true, false); }); // no closed groups: sink and full open BF16 groups
+    add([=] { run(Decode, cb, 1, 2, 16210, 1, 1, false, false); }); // capacity 16384: last single-slice layout
+    add([=] { run(Decode, cb, 1, 2, 16211, 1, 1, false, false); }); // capacity 16385: first multi-slice layout
+    add([=] { run(Decode, cb, 1, 4, 20000, 1, 1, true, false); }); // multiple select slices
+    add([=] { run(Decode, cb, 2, 4, 300, 1, 1, true, false, 2, 1); }); // explicit executor grid and scratch layout
+    // a length per batch row: the executor's reads of it (every pass), the declared ranges of the whole array
+    add([=] { run(Decode, cb, 3, 1, 301, 1, 1, false, false, 2, 0, true); });
+    add([=] { run(Decode, cb, 3, 4, 700, 1, 1, false, false, 2, 0, true); });
+    add([=] { run(Decode, cb, 3, 8, 300, 1, 1, false, false, 2, 0, true); });  // virtual KV heads
+    add([=] { run(Decode, cb, 2, 4, 300, 1, 1, false, false, 2, 2, true); });
+    add([=] { run(Append, cb, 3, 2, 128, 1, 1, false, false, 2, 0, true); });
+    add([=] { run(Qkv, cb, 3, 2, 170, 1, 1, false, true, 2, 0, true); });
+    add([=] { run(Qkv, cb, 3, 4, 170, 1, 1, true, false, 2, 0, true); });
+    // the prefill chunk's attention inputs: GQA 1 .. 8, from the start and across groups, norm or not, a count below the ceiling
+    for (int qg : {1, 4, 8}) add([=] { run(QkvChunk, cb, 1, qg, 0, 21, 40, qg % 2, qg == 4); });
+    add([=] { run(QkvChunk, cb, 1, 2, 127, 64, 64, false, true); });
+    add([=] { run(QkvChunk, cb, 1, 2, 5, 9, 17, false, true); });  // every item alone: the stores lie in the declared ranges
+    add([=] { run(QkvChunk, cb, 1, 4, 300, 1, 24, true, true); });
   }
-  for (auto &p : programs) DRIVER(cuModuleUnload(p.second.module));
+  // the cases on a pool of threads (the compiles and the launches overlap); a benchmark's timings need the GPU to itself
+  std::vector<std::string> reports(jobs.size());
+  std::atomic<size_t> next{0};
+  const auto worker = [&] {
+    CUDA(cudaFree(nullptr));
+    for (size_t i; (i = next++) < jobs.size();) {
+      rng.seed(7301u + 1000003u * static_cast<unsigned>(i));
+      report_sink = &reports[i];
+      jobs[i]();
+      report_sink = nullptr;
+    }
+  };
+  std::vector<std::thread> pool;
+  const size_t threads = benchmark ? 1 : std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), jobs.size());
+  for (size_t t = 0; t < threads; ++t) pool.emplace_back(worker);
+  for (std::thread &t : pool) t.join();
+  for (const std::string &r : reports) fputs(r.c_str(), stdout);
+  for (auto &p : programs) DRIVER(cuModuleUnload(p.second.get().module));
   if (readonly_control) {
     puts("READONLY CONTROL INCONCLUSIVE: no stale read observed on this run; readonly loads have no coherence guarantee.");
     return 77;

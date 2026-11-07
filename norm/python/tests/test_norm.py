@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 """mlops.norm against PyTorch: RMSNorm in Hugging Face's order of roundings, the single-rounding flavors (one plus, bias, gates,
-groups), LayerNorm; the quantized outputs against a dequantization within their grids; every variant; argument checks.
-
-    pytest tests/test_norm.py          (with mlops-norm installed)
-"""
+groups), LayerNorm; quantized outputs against a dequantization within their grids; every variant; argument checks.
+Run: pytest tests/test_norm.py (with mlops-norm installed)"""
 import pytest
 import torch
 import torch.nn.functional as F

@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// FBLA prefill attention on tensor cores (sm_75 .. sm_89), format-independent (the images carry full codes).
-//
-// CTA = one q head x the positions of one group (warp w: positions 16 w ..), 8 warps, two slots of shared memory.  The
-// BF16 blocks first (sink, own group; CTA barriers), then the closed groups in ascending order, group j in slot j & 1:
-// every CTA of a wave reads the same image at the same time, so the L2 needs only a few images whatever its size.
-//   sm_80+  slot = image (K, V, own VM, next group's KM).  Owner warp j & 7 copies group j (cp.async) a group ahead,
-//           waits right before it and arrives on the slot's 7 pairwise READY barriers (ready_id); after group j the
-//           slot's EMPTY barrier: the owner of j + 2 and of j sync (the latter is about to take over the id the new
-//           owner leaves), the others arrive.
-//   sm_75   no cp.async: a CTA barrier a group, every thread refills; KM / VM from global, prefetched into L1.
-// GQA = 0: the ratio at run time.  Split-K (gridDim.z > 1) for grids below a wave, merged by merge_kernel.
+// FBLA prefill attention on tensor cores (sm_75 .. sm_89), format-independent (the images carry full codes). CTA = one q head x the positions of one group (warp w: positions
+// 16 w ..), 8 warps, two slots of shared memory. The BF16 blocks first (sink, own group; CTA barriers), then the closed groups in ascending order, group j in slot j & 1: every CTA
+// of a wave reads the same image at the same time. GQA = 0: the ratio at run time. Split-K (gridDim.z > 1) for grids below a wave, merged by merge_kernel.
 #ifndef MLOPS_FBLA_TENSORS_PREFILL_TC_CUH
 #define MLOPS_FBLA_TENSORS_PREFILL_TC_CUH
 
@@ -32,6 +24,9 @@ constexpr int SLOT = KT + VT;  // (sm_75: 64 KiB a block)
 #endif
 // the dynamic shared memory of the specialization compiled for virtual architecture ptx (x 10)
 __host__ __device__ constexpr int smem_bytes(int ptx) { return 2 * (ptx >= 80 ? TGB : KT + VT); }
+// sm_80+: slot = image (K, V, own VM, next group's KM). Owner warp j & 7 copies group j (cp.async) a group ahead, waits right before it and arrives on the slot's 7 pairwise
+// READY barriers (ready_id); after group j the slot's EMPTY barrier: the owner of j + 2 and of j sync (the latter is about to take over the id the new owner leaves), the others
+// arrive. sm_75: no cp.async, a CTA barrier a group, every thread refills; KM / VM from global, prefetched into L1.
 constexpr uint32_t BAR_EMPTY = 14;  // + slot; READY: 0 .. 13
 static_assert(KT + VT == 2 * 64 * 256 && SLOT % 128 == 0, "a slot holds a BF16 block's K and V");
 
@@ -200,7 +195,7 @@ __device__ __forceinline__ void prefill_tc_item(const PrefillArgs &a, const uint
     const float inv = l[r] > 0.f ? 1.f / l[r] : 0.f;
     const int i = pos[r] - n0;
     if (nsplit == 1) {
-      uint32_t *dst = reinterpret_cast<uint32_t *>(a.out + ((size_t)bq * a.count + i) * D) + t;
+      uint32_t *dst = reinterpret_cast<uint32_t *>(a.out + (size_t)bq * a.out_hs + (size_t)i * a.out_ts) + t;
       unroll<16>([&](auto n) { dst[4 * n] = to_bf16(o[n][2 * r] * inv) | (uint32_t)to_bf16(o[n][2 * r + 1] * inv) << 16; });
     } else {
       const size_t pr = ((size_t)z * Pos::ny() + bq) * a.count + i;  // [piece][q head][position]
@@ -226,7 +221,7 @@ __device__ __forceinline__ void merge_item(const PrefillArgs &a, const float2 *p
   constexpr int MAXS = 8;
   const int heads = Pos::ny(), bq = Pos::y(), i = Pos::x() * 16 + (Pos::tid() >> 4), c = Pos::tid() & 15;
   if (i >= count_of<Pos>(a)) return;
-  const size_t hs = (size_t)heads * a.count, r0 = (size_t)bq * a.count + i;
+  const size_t hs = (size_t)heads * a.count, r0 = (size_t)bq * a.count + i, o0 = (size_t)bq * a.out_hs + (size_t)i * a.out_ts;
   float2 ml[MAXS];
   unroll<MAXS>([&](auto s) { ml[s] = s < nsplit ? InputLoad<Pos>::get(part_ml + r0 + s * hs) : make_float2(-INFINITY, 0.f); });
   float M = ml[0].x;
@@ -245,7 +240,7 @@ __device__ __forceinline__ void merge_item(const PrefillArgs &a, const float2 *p
   const float inv = L > 0.f ? 1.f / L : 0.f;
   uint32_t ow[4];
   unroll<4>([&](auto k) { ow[k] = to_bf16(acc[2 * k] * inv) | (uint32_t)to_bf16(acc[2 * k + 1] * inv) << 16; });
-  reinterpret_cast<uint4 *>(a.out + r0 * D)[c] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
+  reinterpret_cast<uint4 *>(a.out + o0)[c] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
 }
 template <int = 0>
 __global__ void __launch_bounds__(256) merge_kernel(const PrefillArgs a, const float2 *part_ml, const float *part_o, int nsplit) {

@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""RoPE of q and k: transformers' eager path (its rotary module's cos / sin + apply_rotary_pos_emb) against
-mlops.positional -- apply_rotary_pos_emb on the same tables (a drop-in, bit for bit) and RoPE from the positions
-(no tables). Llama-like heads (32 q / 8 kv, head_dim 128, BF16, transformers' [B, H, S, D] layout); prefill,
-decode (one token per sequence) and a training step (forward + backward). Median time over EFFMA_BENCH_REPS
-calls; DRAM throughput of q and k read and written once.
-
-    python bench/bench_rope.py          (with mlops-positional and transformers installed)
-"""
+"""RoPE of q and k: transformers' eager path (its rotary module's cos / sin + apply_rotary_pos_emb) against mlops.positional (apply_rotary_pos_emb on
+the same tables, bit for bit; RoPE from the positions) on Llama-like heads (32 q / 8 kv, head_dim 128, BF16, [B, H, S, D]); prefill, decode (one token
+per sequence), a training step. Median over EFFMA_BENCH_REPS calls; DRAM throughput of q, k read and written once. Run: python bench/bench_rope.py"""
 import os
 import statistics
 

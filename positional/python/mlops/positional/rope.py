@@ -1,17 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Rotary position embedding (RoPE) on the mlops_rope kernel: q and k of every head in one pass, forward and
-backward (the backward is the inverse rotation).
-
-* ``RoPE``                    the module: angles from positions, exact (phase reduced in turns, sincospi), with
-                              any frequency scaling -- YaRN, Llama 3, linear, dynamic NTK, LongRoPE (``scaling``,
-                              Hugging Face's ``rope_parameters`` / ``rope_scaling`` dicts) -- and its attention
-                              factor. ``RoPE.from_hf(config)`` reads a transformers config.
-* ``rope_frequencies``        the inverse frequencies and attention factor of a scaling, in float64.
-* ``apply_rotary_pos_emb``    Hugging Face's function of that name on the kernel, bit for bit (forward and autograd
-                              backward), from the cos / sin tables its rotary modules make.
-* ``patch_transformers``      puts it into transformers' modeling modules.
-"""
+"""Rotary position embedding (RoPE) on the mlops_rope kernel: q and k of every head in one pass, forward and backward (the inverse rotation).
+``RoPE``: the module, angles from positions (exact), any frequency scaling (``scaling``: Hugging Face's rope dicts), ``RoPE.from_hf(config)``;
+``rope_frequencies``, ``apply_rotary_pos_emb`` (HF's, bit for bit on the kernel), ``patch_transformers`` (installs it into modeling modules)."""
 import importlib
 import math
 from typing import Optional, Tuple
@@ -28,20 +19,9 @@ _SCALINGS = ("default", "linear", "dynamic", "yarn", "llama3", "longrope")
 def rope_frequencies(rotary_dim: int, base: float = 10000.0, scaling: Optional[dict] = None, *,
                      max_position_embeddings: Optional[int] = None,
                      seq_len: Optional[int] = None) -> Tuple[torch.Tensor, float]:
-    """(inverse frequencies, float64 CPU [rotary_dim / 2], attention factor) of RoPE with an optional frequency
-    scaling, as transformers computes them (``modeling_rope_utils``) but in float64:
-
-    * ``None`` / ``{"rope_type": "default"}``: ``base^(-2i / rotary_dim)``;
-    * ``"linear"`` (``factor``): position interpolation, every frequency / factor;
-    * ``"dynamic"`` (``factor``): NTK-aware base growth with ``seq_len`` beyond ``max_position_embeddings``;
-    * ``"yarn"`` (``factor``, ``original_max_position_embeddings``, optional ``beta_fast`` 32, ``beta_slow`` 1,
-      ``attention_factor`` or ``mscale`` / ``mscale_all_dim``, ``truncate``): interpolation of the low frequencies,
-      extrapolation of the high ones with a linear ramp between, attention factor 0.1 ln(factor) + 1;
-    * ``"llama3"`` (``factor``, ``low_freq_factor``, ``high_freq_factor``, ``original_max_position_embeddings``);
-    * ``"longrope"`` (``short_factor``, ``long_factor``, ``original_max_position_embeddings``, optional ``factor``,
-      ``attention_factor``): per-frequency factors, the long ones when ``seq_len`` exceeds the original length.
-
-    The attention factor multiplies cos and sin (so each of q, k), as in transformers."""
+    """(inverse frequencies, float64 CPU [rotary_dim / 2], attention factor) of RoPE with an optional frequency scaling, as
+    transformers computes them (``modeling_rope_utils``) but in float64; the attention factor multiplies cos and sin (so each of q, k).
+    The scalings and their keys are described beside their branches."""
     if rotary_dim < 2 or rotary_dim % 2:
         raise ValueError(f"rotary_dim must be even and >= 2, got {rotary_dim}")
     s = dict(scaling or {})
@@ -57,11 +37,11 @@ def rope_frequencies(rotary_dim: int, base: float = 10000.0, scaling: Optional[d
             raise ValueError(f"RoPE scaling {kind!r} needs {key!r}")
         return s[key]
 
-    if kind == "default":
+    if kind == "default":  # None / {"rope_type": "default"}: base^(-2i / rotary_dim)
         inv = base ** -expo
-    elif kind == "linear":
+    elif kind == "linear":  # factor: position interpolation, every frequency / factor
         inv = base ** -expo / float(need("factor"))
-    elif kind == "dynamic":
+    elif kind == "dynamic":  # factor: NTK-aware base growth with seq_len beyond max_position_embeddings
         factor = float(need("factor"))
         if max_position_embeddings is None:
             raise ValueError("dynamic RoPE needs max_position_embeddings")
@@ -69,6 +49,8 @@ def rope_frequencies(rotary_dim: int, base: float = 10000.0, scaling: Optional[d
         b = base * ((factor * n / max_position_embeddings) - (factor - 1)) ** (dim / (dim - 2))
         inv = b ** -expo
     elif kind == "yarn":
+        # factor, original_max_position_embeddings, optional beta_fast 32, beta_slow 1, attention_factor or mscale / mscale_all_dim, truncate:
+        # interpolation of the low frequencies, extrapolation of the high ones with a linear ramp between, attention factor 0.1 ln(factor) + 1
         orig = need("original_max_position_embeddings")
         factor = s.get("factor")
         if factor is None:
@@ -98,7 +80,7 @@ def rope_frequencies(rotary_dim: int, base: float = 10000.0, scaling: Optional[d
         extra = 1 - ramp
         pos_freqs = base ** expo
         inv = (1 / (factor * pos_freqs)) * (1 - extra) + (1 / pos_freqs) * extra
-    elif kind == "llama3":
+    elif kind == "llama3":  # factor, low_freq_factor, high_freq_factor, original_max_position_embeddings
         factor, lo, hi = float(need("factor")), float(need("low_freq_factor")), float(need("high_freq_factor"))
         old = need("original_max_position_embeddings")
         inv = base ** -expo
@@ -109,6 +91,8 @@ def rope_frequencies(rotary_dim: int, base: float = 10000.0, scaling: Optional[d
         medium = ~(wavelen < old / hi) & ~(wavelen > old / lo)
         inv = torch.where(medium, smoothed, scaled)
     else:  # longrope
+        # short_factor, long_factor, original_max_position_embeddings, optional factor, attention_factor: per-frequency factors,
+        # the long ones when seq_len exceeds the original length
         orig = need("original_max_position_embeddings")
         factor = s.get("factor")
         if factor is None:
@@ -175,30 +159,15 @@ def _shape_of(q: torch.Tensor, layout: str):
 
 
 class RoPE(torch.nn.Module):
-    """Rotary position embedding of q and k, angles from the token positions.
-
-    ``RoPE(head_dim, base=10000.0, *, rotary_dim=None, interleaved=False, scaling=None,
-    max_position_embeddings=None)``: ``rotary_dim`` (default head_dim) leading elements of every head rotate, the
-    rest pass through; pairs ``(i, i + rotary_dim / 2)`` (NeoX / Llama) or ``(2i, 2i + 1)`` with
-    ``interleaved=True`` (GPT-J); ``scaling``: a transformers rope-scaling dict (``rope_frequencies``).
-
-    ``rope(q, k=None, positions=None, *, layout="bshd", offset=0, inplace=False, seq_len=None)`` returns the rotated
-    (q, k). ``layout``: ``"bshd"`` [batch, seq, heads, head_dim], ``"bhsd"`` (transformers' [batch, heads, seq,
-    head_dim]) or ``"thd"`` [tokens, heads, head_dim]; k may have fewer heads (GQA). ``positions``: int32 / int64
-    [batch, seq] or [seq] (shared by the batch), or None for ``offset + s``. ``inplace=True`` overwrites q and k
-    (no autograd). ``seq_len`` selects the frequencies of the dynamic and LongRoPE scalings (default: from the
-    positions).
-
-    The phase is reduced exactly in turns and the sines come from sincospi in FP32, once per token and frequency
-    for all heads; each output is rounded once to the dtype. At any position below 2^31, BF16 / FP16 outputs are the
-    exact rotation rounded once (give or take the last bit), FP32 ones within a few FP32 ulps; transformers rounds
-    the angle to FP32, which costs up to half a radian at 10M positions. Differentiable: the backward is the
-    inverse rotation.
-    """
+    """Rotary position embedding of q and k, angles from the token positions; differentiable (the backward is the inverse rotation).
+    The phase is reduced exactly in turns, sines from sincospi in FP32 once per token and frequency for all heads, each output rounded once
+    to the dtype; below position 2^31 BF16 / FP16 are the exact rotation rounded once (give or take the last bit), FP32 within a few ulps."""
 
     def __init__(self, head_dim: int, base: float = 10000.0, *, rotary_dim: Optional[int] = None,
                  interleaved: bool = False, scaling: Optional[dict] = None, max_position_embeddings: Optional[int] = None):
         super().__init__()
+        # rotary_dim (default head_dim) leading elements of every head rotate, the rest pass through; pairs (i, i + rotary_dim / 2)
+        # (NeoX / Llama) or (2i, 2i + 1) with interleaved=True (GPT-J); scaling: a transformers rope-scaling dict (rope_frequencies)
         self.head_dim, self.base = int(head_dim), float(base)
         self.rotary_dim = int(rotary_dim or head_dim)
         if self.rotary_dim > self.head_dim:
@@ -240,12 +209,14 @@ class RoPE(torch.nn.Module):
 
     def forward(self, q: torch.Tensor, k: Optional[torch.Tensor] = None, positions: Optional[torch.Tensor] = None, *,
                 layout: str = "bshd", offset: int = 0, inplace: bool = False, seq_len: Optional[int] = None):
+        # returns the rotated (q, k). layout: "bshd" [batch, seq, heads, head_dim], "bhsd" (transformers' [batch, heads, seq, head_dim]) or
+        # "thd" [tokens, heads, head_dim]; k may have fewer heads (GQA)
         B, S, D = _shape_of(q, layout)
         if D != self.head_dim:
             raise ValueError(f"q has head_dim {D}, this RoPE was made for {self.head_dim}")
         if k is not None and (k.dim() != q.dim() or _shape_of(k, layout) != (B, S, D)):
             raise ValueError(f"k {tuple(k.shape)} does not match q {tuple(q.shape)} in layout {layout!r}")
-        pos = None
+        pos = None  # positions: int32 / int64 [batch, seq] or [seq] (shared by the batch), or None for offset + s
         if positions is not None:
             if positions.dtype not in (torch.int32, torch.int64):
                 raise TypeError(f"positions must be int32 or int64, got {positions.dtype}")
@@ -253,12 +224,13 @@ class RoPE(torch.nn.Module):
             if pos.dim() != 2 or pos.shape[-1] != S or pos.shape[0] not in (1, B):
                 raise ValueError(f"positions must be [{B}, {S}] or [{S}], got {tuple(positions.shape)}")
             pos = pos.expand(B, S)
+        # seq_len selects the frequencies of the dynamic and LongRoPE scalings (default: from the positions)
         if self.kind in ("dynamic", "longrope") and seq_len is None:
             seq_len = int(positions.max()) + 1 if positions is not None else offset + S
         freq, att = self._freq(q.device, seq_len)
         angles = dict(rotary_dim=self.rotary_dim, interleaved=self.interleaved, positions=pos, position_offset=int(offset),
                       freq=freq, attention_factor=att)
-        if inplace:
+        if inplace:  # overwrites q and k (no autograd)
             if torch.is_grad_enabled() and (q.requires_grad or (k is not None and k.requires_grad)):
                 raise RuntimeError("RoPE(inplace=True) is not differentiable: use it under torch.no_grad()")
             if q.stride(-1) != 1 or (k is not None and k.stride(-1) != 1):
@@ -286,11 +258,9 @@ def _hf_reference(q, k, cos, sin, unsqueeze_dim, interleaved):
 
 def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
                          position_ids: Optional[torch.Tensor] = None, unsqueeze_dim: int = 1, *, interleaved: bool = False):
-    """transformers' ``apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)`` on the kernel: one pass for q and k,
-    the same bits as ``q * cos + rotate_half(q) * sin`` in the forward and in the autograd backward. q, k:
-    [batch, heads, seq, head_dim] (``unsqueeze_dim=1``) or [batch, seq, heads, head_dim] (2); cos, sin: [batch or 1,
-    seq, head_dim] in q's dtype, as the rotary modules make them. Anything else (CPU, other dtypes, gradients
-    through cos / sin) runs the plain PyTorch formula."""
+    """transformers' ``apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)`` on the kernel, same bits as ``q * cos + rotate_half(q) * sin``
+    (forward and autograd backward). q, k: [batch, heads, seq, head_dim] (unsqueeze_dim 1) or [batch, seq, heads, head_dim] (2); cos, sin:
+    [batch or 1, seq, head_dim] in q's dtype. Anything else (CPU, other dtypes, grads through cos / sin) runs the plain PyTorch formula."""
     fast = (q.is_cuda and q.dim() == 4 and k.dim() == 4 and q.dtype in _DT and k.dtype == q.dtype and
             cos.dtype == q.dtype and sin.dtype == q.dtype and cos.dim() == 3 and cos.shape == sin.shape and
             unsqueeze_dim in (1, 2, -3) and not (cos.requires_grad or sin.requires_grad) and

@@ -60,14 +60,14 @@ std::tuple<Tensor, OptT, Tensor, Tensor> embed(Tensor table, Tensor ids, OptT no
 }
 
 // ---- lm_head ----------------------------------------------------------------------------------------------
-using HeadVariant = std::tuple<int, int, int, int, int, int, int, int, int, int>;  // R, S, D, NB, tc, J, threads, smem, regs, arch
+using HeadVariant = std::tuple<int, int, int, int, int, int, int, int, int, int, int>;  // R, S, D, NB, tc, J, threads, smem, regs, arch, x_staged
 std::vector<HeadVariant> lm_head_variants(int64_t vocab, int64_t hidden, int64_t n) {
   const mlops_lm_head_config c{(int)vocab, (int)hidden, (int)n, 0, 0, 0.f, 0.f, 1.f};
   std::vector<mlops_lm_head_variant> v(mlops_lm_head_variants(&c, nullptr, 0));
   mlops_lm_head_variants(&c, v.data(), (int)v.size());
   std::vector<HeadVariant> out;
   for (const auto &x : v)
-    out.emplace_back(x.rows_per_unit, x.k_pieces, x.depth, x.columns, x.tensor_cores, x.chunks, x.threads, x.smem_bytes, x.regs, x.arch);
+    out.emplace_back(x.rows_per_unit, x.k_pieces, x.depth, x.columns, x.tensor_cores, x.chunks, x.threads, x.smem_bytes, x.regs, x.arch, x.x_staged);
   return out;
 }
 

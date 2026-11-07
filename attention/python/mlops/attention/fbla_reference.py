@@ -1,31 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""FBLA (Flash-Block Attention): numerical model of the KV format and of the kernel's arithmetic, in PyTorch.
-
-Format (K and V alike, per KV head). Tokens form groups of G = 128; per group and channel two bf16, the base (the
-group's minimum) and the step, and per element one code c in 0 .. 2^(cb + fb) - 1 (cb = 4, fb = 2):
-
-    x[t, c] = base[c] + code[t, c] * step[c]
-
-stored as two planes: the coarse plane (the top cb bits of the code) and the refinement plane (the low fb bits).
-Without its refinement an element decodes to the middle of its coarse cell. The first group (attention sink) and
-the group still being filled (decode) are kept in bf16. Per element: cb + 32 / G bits always read, fb bits only
-where they matter.
-
-Kernel arithmetic, per 16-token sub-block j of KV group g, for every query (log2 domain):
-
-    z = q * step_K[g]  ->  int8 q_hat, sq = max|z| scale log2 e / 127   (once per query and group of 128)
-    s[t] = q . base_K[g]  +  sq * sum_c q_hat[c] * code[t, c]       coarse: code = (hi << fb) + (2^fb - 1) / 2
-    mb = max_t s;  m' = max(m, mb);  alpha = 2^(m - m');  p_blk = 2^(mb - m')
-    refine (load the fb plane of K and V) when p_blk > tau: the sub-block's weight relative to the running maximum
-    ("mass"), or, after a coarse pass over the whole cache ("norm"), when the sub-block's share of the softmax mass
-    W_j = 2^(lse_j - LSE) > tau (split-K decode: coarse pass per chunk, a reduction, then the refining pass)
-    p_hat = round(255 * 2^(s[t] - mb));  l = alpha l + p_blk / 255 * sum p_hat
-    o[c] = alpha o[c] + p_blk / 255 * (sum_t p_hat * base_V[c] + step_V[c] * sum_t p_hat[t] * code_V[t, c])
-
-Integer sums are float32 matmuls, exact below 2^24 (127 * 2 * 63 * D for QK^T, 255 * 63 * 16 for PV). The coarse
-code's half-cell offset is kept integral by doubling. o / l at the end (weights normalized by their quantized sum).
-"""
+"""FBLA (Flash-Block Attention): numerical model of the KV format and of the kernel's arithmetic, in PyTorch; the format is described at FBLAConfig, the
+kernel arithmetic at ``attention``. Integer sums are float32 matmuls, exact below 2^24 (127 * 2 * 63 * D for QK^T, 255 * 63 * 16 for PV); the coarse code's
+half-cell offset is kept integral by doubling; o / l at the end (weights normalized by their quantized sum)."""
 from dataclasses import dataclass
 import math
 
@@ -34,6 +11,9 @@ import torch
 LOG2E = 1.4426950408889634
 
 
+# Format (K and V alike, per KV head). Tokens form groups of G = 128; per group and channel two bf16, the base (the group's minimum) and the step; per element one code
+# c in 0 .. 2^(cb + fb) - 1 (cb = 4, fb = 2): x[t, c] = base[c] + code[t, c] * step[c], stored as the coarse plane (top cb bits) and the refinement plane (low fb bits).
+# Without its refinement an element decodes to the middle of its coarse cell; cb + 32 / G bits per element are always read, fb bits only where they matter.
 @dataclass(frozen=True)
 class FBLAConfig:
     group: int = 128                # tokens per (base, step) group
@@ -112,7 +92,11 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cfg: FBLAConfig
               scale: float = None, stats: dict = None) -> torch.Tensor:
     """Causal FBLA forward. q [..., M, D] at positions N - M .. N - 1, k / v [..., N, D] (N a multiple of G)
     -> o [..., M, D] float32. `stats` (a dict) accumulates the refined / quantized (query, sub-block) pairs."""
+    # kernel arithmetic, per 16-token sub-block j of KV group g, for every query (log2 domain): z = q * step_K[g] -> int8 q_hat, sq = max|z| scale log2 e / 127
+    # (once per query and group of 128); s[t] = q . base_K[g] + sq * sum_c q_hat[c] * code[t, c] (coarse: code = (hi << fb) + (2^fb - 1) / 2);
     *lead, M, D = q.shape
+    # mb = max_t s; m' = max(m, mb); alpha = 2^(m - m'); p_blk = 2^(mb - m'); p_hat = round(255 * 2^(s[t] - mb)); l = alpha l + p_blk / 255 * sum p_hat;
+    # o[c] = alpha o[c] + p_blk / 255 * (sum_t p_hat * base_V[c] + step_V[c] * sum_t p_hat[t] * code_V[t, c])
     N, G, S, fb = k.shape[-2], cfg.group, cfg.sub, cfg.fine_bits
     if N % G:
         raise ValueError(f"N = {N} must be a multiple of the group ({G})")
@@ -166,6 +150,8 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cfg: FBLAConfig
             # refinement decision on the coarse scores, against the running maximum
             mbc = s_c.amax(-1, keepdim=True)
             pre = torch.exp2(mbc - torch.maximum(m, mbc)).nan_to_num(0.0)
+            # refine (load the fb plane of K and V) when p_blk > tau: the sub-block's weight relative to the running maximum ("mass"), or, after a coarse pass
+            # over the whole cache ("norm"), when its share of the softmax mass W_j = 2^(lse_j - LSE) > tau (split-K decode: coarse pass per chunk, reduction, refining pass)
             if cfg.refine == "norm":
                 block_lse = torch.logsumexp(s_c * log2, -1, keepdim=True)
                 ref = torch.exp(block_lse - global_lse) > cfg.tau
@@ -201,13 +187,11 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cfg: FBLAConfig
 
 @torch.no_grad()
 def prefill_p128(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float = None, exact_block: int = 64) -> torch.Tensor:
-    """float64 model of the tensor-core prefill (mlops_fbla_prefill on sm_75 .. sm_89), causal, q [..., M, D] at
-    positions N - M .. N - 1, k / v [..., N, D] BF16 values (one KV head a q head: repeat_interleave for GQA).
-
-    Closed groups (0 < g < the row's group): every block refined, i.e. the full 6-bit codes, the group's q-hat,
-        s = sl q . base_K + sq q-hat . code,  P = rint(255 2^(s - m)) over ONE block of 128 tokens, V = base + step code.
-    Sink (g = 0) and the row's own group: BF16 q . k, blocks of `exact_block` tokens, P = bf16(255 2^(s - m)).
-    The softmax weight of a block is 2^(m - M); o = sum w P v / sum w sum P."""
+    """float64 model of the tensor-core prefill (mlops_fbla_prefill on sm_75 .. sm_89), causal, q [..., M, D] at positions N - M .. N - 1, k / v [..., N, D]
+    BF16 values (one KV head a q head: repeat_interleave for GQA). The softmax weight of a block is 2^(m - M); o = sum w P v / sum w sum P."""
+    # closed groups (0 < g < the row's group): every block refined, i.e. the full 6-bit codes, the group's q-hat, s = sl q . base_K + sq q-hat . code,
+    # P = rint(255 2^(s - m)) over ONE block of 128 tokens, V = base + step code; sink (g = 0) and the row's own group: BF16 q . k, blocks of `exact_block`
+    # tokens, P = bf16(255 2^(s - m))
     D, M, N, G = q.shape[-1], q.shape[-2], k.shape[-2], FBLAConfig().group
     scale = 1.0 / math.sqrt(D) if scale is None else scale
     dev, f32, f64 = q.device, torch.float32, torch.float64

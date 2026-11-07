@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-/* mlops_rope tests.
- *   1. positions + freq (exact): every output within half an ulp of the dtype (+ the FP32 rounding of the
- *      computation) of a long-double reference, for every dtype, both pair layouts, partial rotary, GQA, the
- *      [B, S, H, D] and [B, H, S, D] layouts, int32 / int64 / implicit positions, positions up to 2^31 - 1 and
- *      negative ones, an attention factor, every vector width (pairs % 4, unaligned tensors); out of place and in
- *      place agree; inverse undoes the rotation.
- *   2. cos / sin tables (Hugging Face): bit for bit the host emulation of apply_rotary_pos_emb's arithmetic and
- *      of its autograd backward (inverse), tables broadcast over the batch.
- *   3. argument checks.
- */
+/* mlops_rope tests: 1. positions + freq (exact), 2. cos / sin tables (Hugging Face), 3. argument checks. */
 #include "mlops_rope.h"
 #include <cuda_fp16.h>
 #include <cmath>
@@ -103,6 +94,8 @@ static std::vector<double> make_inv_freq(int R, double base) {
 }
 
 // ---- 1. exact mode ---------------------------------------------------------------------------------------
+// every output within half an ulp of the dtype (+ the FP32 rounding of the computation) of a long-double reference; out of place and in
+// place agree; inverse undoes the rotation (the cases in main cover dtypes, layouts, positions, vector widths)
 static void test_exact(const Case &c, std::mt19937 &rng) {
   const int P = c.R / 2;
   Tensor q(c.B, c.S, c.Hq, c.D, c.dt, c.bhsd, c.misalign), k(c.B, c.S, c.Hk, c.D, c.dt, c.bhsd, c.misalign);
@@ -198,6 +191,7 @@ static void test_exact(const Case &c, std::mt19937 &rng) {
 }
 
 // ---- 2. tables (Hugging Face arithmetic) -----------------------------------------------------------------
+// bit for bit the host emulation of apply_rotary_pos_emb's arithmetic and of its autograd backward (inverse), tables broadcast over the batch
 static void test_tables(int dt, bool inter, bool inverse, bool bhsd, int R, int D, std::mt19937 &rng) {
   const int B = 2, S = 37, Hq = 6, Hk = 2, P = R / 2;
   Tensor q(B, S, Hq, D, dt, bhsd, 0), k(B, S, Hk, D, dt, bhsd, 0), qo(B, S, Hq, D, dt, bhsd, 0), ko(B, S, Hk, D, dt, bhsd, 0);

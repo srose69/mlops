@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// FBLA flash decoding, sm_61+: coarse, select, refine and merge launches.
-//
-//   coarse_kernel  flash-decoding pass over the coarse records: per sub-block a DP4A QK^T chain, P quantized
-//                  to u8 against the sub-block maximum, a DP4A P V chain; writes the closed sub-blocks'
-//                  log2-mass and one (m, l, o) per CTA.  No barrier or atomic in the loop.
-//   select_kernel  R = log2 of the row's coarse mass, and the sub-blocks with W_j = 2^(lse_j - R) > tau
-//                  for some query of the KV head, in sub-block order per slice.
-//   refine_kernel  the list's items, strided over the warps: the correction exact - coarse of K and V,
-//                  weighted 2^(m_block - R), one correction partial per CTA.
-//   merge_kernel   coarse partials and corrections into the BF16 output.
-//
-// A masked code slot is the code times 2^n with n fixed per accumulator, so 2^-n folds into the FP32
-// epilogue.  Integer sums start at the bits of 1.5 * 2^23: the accumulator read as FP32 minus 1.5 * 2^23
+// FBLA flash decoding, sm_61+: coarse, select, refine and merge launches (each kernel is described at its definition). A masked code slot is the code times 2^n
+// with n fixed per accumulator, so 2^-n folds into the FP32 epilogue. Integer sums start at the bits of 1.5 * 2^23: the accumulator read as FP32 minus 1.5 * 2^23
 // is the exact sum (|sum| < 2^22) without an I2F.
 #ifndef MLOPS_FBLA_KERNELS_CUH
 #define MLOPS_FBLA_KERNELS_CUH
@@ -23,6 +12,7 @@
 #else
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #endif
 
 namespace mlops_fbla_detail {
@@ -119,9 +109,8 @@ __device__ __forceinline__ uint2 ldv64(const uint8_t *p) {
 }
 
 // ---- records (mlops_fbla.h) ---------------------------------------------------------------------
-// A lane's 2 * BITS words of K or V: fixed offsets from one per-lane base, warp-wide loads of 256 or 512 bytes.
-// V: p = record + 16 lane (128-bit words), p8 = record + 8 lane (3-bit low words).
-// K by token: p = record + 16 t serves both halves' high words (+0, +256) and low words (+1024).
+// A lane's 2 * BITS words of K or V: fixed offsets from one per-lane base, warp-wide loads of 256 or 512 bytes. V: p = record + 16 lane (128-bit words),
+// p8 = record + 8 lane (3-bit low words). K by token: p = record + 16 t serves both halves' high words (+0, +256) and low words (+1024).
 template <int BITS> struct Codes { uint32_t w[2 * BITS]; };
 template <int BITS> __host__ __device__ constexpr int record_bytes() { return 2 * BITS * 256; }
 struct Rec { const uint8_t *p, *p8; };
@@ -307,9 +296,8 @@ __device__ __forceinline__ void online(float mb, float &m, float &alpha, float &
 }
 
 // ---- per-group query quantization -------------------------------------------------------------
-// Lane channels 4 l .. + 3: z = q step_K, q-hat = rint(z fl(127 / max|z|)), sq = max|z| sl / 127, sl = fl(scale log2 e).
-// A coarse code c decodes to base + step (2^FB c + hoff): s = c0 + sq 2^FB (q-hat . c), c0 = sl q . base + sq hoff sum q-hat.
-// The group state lives in the warp's shared slots: q-hat words, per query (c0, sq 2^FB), per lane the V affine (vb, vs).
+// Lane channels 4 l .. + 3: z = q step_K, q-hat = rint(z fl(127 / max|z|)), sq = max|z| sl / 127, sl = fl(scale log2 e). A coarse code c decodes to
+// base + step (2^FB c + hoff): s = c0 + sq 2^FB (q-hat . c), c0 = sl q . base + sq hoff sum q-hat. The group state lives in the warp's shared slots.
 template <int QG> struct WarpSlots {
   alignas(16) uint32_t stage[QG][32];  // q-hat words of the group
   alignas(16) float4 vb[32], vs[32];   // the lanes' V affine of the group (coarse code -> value)
@@ -443,11 +431,10 @@ __device__ __forceinline__ void exact_block(const uint16_t *ek, const uint16_t *
 }
 
 // ---- coarse pass --------------------------------------------------------------------------------
-// Units of a (batch, KV head): the BF16 sub-blocks (sink, open), then closed groups 1 .. groups - 2.
-// Warp w of P W takes units w, w + P W, ...: all warps read one cache window and loads differ by at most
-// one unit.
-template <class Pos> __device__ __forceinline__ int units_of(const Args &a) {  // BF16 sub-blocks + closed groups of a head
-  const int tokens = tokens_of<Pos>(a), groups = (tokens + G - 1) / G;
+// Units of a (batch, KV head): the BF16 sub-blocks (sink, open), then closed groups 1 .. groups - 2. Warp w of P W takes units w, w + P W, ...: all warps
+// read one cache window and loads differ by at most one unit.
+template <class Pos> __device__ __forceinline__ int units_of(const Args &a, int bh) {  // BF16 sub-blocks + closed groups of a head
+  const int tokens = tokens_of<Pos>(a, bh), groups = (tokens + G - 1) / G;
   const int na = groups == 1 ? (tokens + S - 1) / S : SBG;
   const int no = groups >= 2 ? (tokens - G * (groups - 1) + S - 1) / S : 0;
   return na + no + (groups >= 3 ? groups - 2 : 0);
@@ -556,7 +543,7 @@ __device__ __forceinline__ void coarse_kernel_item(const Args &a, SmemCoarse<QG>
   auto cta = [&] { return Pos::kReread ? (int)Pos::x() : cta_; };
   auto P = [&] { return Pos::kReread ? (int)Pos::nx() : P_; };
   auto nw = [&] { return P() * W; };
-  const int tokens = tokens_of<Pos>(a), groups = (tokens + G - 1) / G;
+  const int tokens = tokens_of<Pos>(a, bh), groups = (tokens + G - 1) / G;
   const int na = groups == 1 ? (tokens + S - 1) / S : SBG;          // sink sub-blocks
   const int cnt_open = groups >= 2 ? tokens - G * (groups - 1) : 0;  // open group's tokens
   const int ne = na + (cnt_open + S - 1) / S;                          // BF16 units
@@ -615,7 +602,7 @@ __device__ __forceinline__ void coarse_kernel_item(const Args &a, SmemCoarse<QG>
     for (;;) {
       setup_group<CB, FB, QG>(lane, km, vm, qs, a.scale_log2, ws.stage, gs, ws.vb, ws.vs);
       u += nw();
-      const bool more = u < units_of<Pos>(a);
+      const bool more = u < units_of<Pos>(a, V ? a.vdiv.div(Pos::y()) : (int)Pos::y());  // (the head again: not kept live)
       // from the group's last pair: the warp's next group, or (after its last group) the following records,
       // which exist (at worst the open group's first two); the next group's metadata comes with them
       const size_t step = ((size_t)(more ? nw() : 1) * a.gs * SBG - (SBG - 2)) * RB;  // from pair 3 to the next group's pair 0
@@ -670,6 +657,8 @@ __device__ __forceinline__ void coarse_kernel_item(const Args &a, SmemCoarse<QG>
     if (!ch) { part[0] = mx; part[1] = ls; }
   }
 }
+// coarse_kernel: flash-decoding pass over the coarse records: per sub-block a DP4A QK^T chain, P quantized to u8 against the sub-block maximum, a DP4A P V chain;
+// writes the closed sub-blocks' log2-mass and one (m, l, o) per CTA. No barrier or atomic in the loop.
 template <int CB, int FB, int QG, bool V>
 __global__ void __launch_bounds__(32 * W, 2) coarse_kernel(const Args a) {
   __shared__ SmemCoarse<QG> sm;
@@ -758,10 +747,10 @@ __device__ __forceinline__ void coarse_kernel4_item(const Args &a, SmemCoarse4 &
   auto cta = [&] { return Pos::kReread ? (int)Pos::x() : cta_; };
   auto P = [&] { return Pos::kReread ? (int)Pos::nx() : P_; };
   auto nw = [&] { return P() * W; };
-  const int tokens = tokens_of<Pos>(a), groups = (tokens + G - 1) / G;
+  const int tokens = tokens_of<Pos>(a, bh), groups = (tokens + G - 1) / G;
   const int na = groups == 1 ? (tokens + S - 1) / S : SBG;
   const int cnt_open = groups >= 2 ? tokens - G * (groups - 1) : 0;
-  const int ne = na + (cnt_open + S - 1) / S, units = units_of<Pos>(a);
+  const int ne = na + (cnt_open + S - 1) / S, units = units_of<Pos>(a, bh);
   if (cta() * W >= units) {
     empty_partial<QG, Pos, true>(a);
     return;
@@ -823,7 +812,7 @@ __device__ __forceinline__ void coarse_kernel4_item(const Args &a, SmemCoarse4 &
         __syncwarp();
       }
       u += nw();
-      const bool more = u < units_of<Pos>(a);
+      const bool more = u < units;
       const size_t step = ((size_t)(more ? nw() : 1) * a.gs * SBG - (SBG - 2)) * RB;
 #pragma unroll 1
       for (int J = 0; J < 3; ++J) {
@@ -897,7 +886,7 @@ __device__ __forceinline__ void select_kernel_item(const Args &a, float (&R)[QG]
     const float r = row_r<QG, Pos>(a, row0 + warp, lane);
     if (!lane) { R[warp] = r; if (!slice) a.row_lse[row0 + warp] = r; }
   }
-  const int lo = SBG + slice * SLICE + warp * (SLICE / W), hi = SBG * ((tokens_of<Pos>(a) + G - 1) / G - 1);
+  const int lo = SBG + slice * SLICE + warp * (SLICE / W), hi = SBG * ((tokens_of<Pos>(a, a.vdiv.div(bh)) + G - 1) / G - 1);  // (bh: the virtual head)
   float x[QG][PER];  // all of the warp's loads in flight together
 #pragma unroll
   for (int i = 0; i < PER; ++i) {
@@ -929,6 +918,7 @@ __device__ __forceinline__ void select_kernel_item(const Args &a, float (&R)[QG]
   }
   if (!Pos::tid()) a.counts[(size_t)bh * a.nslices + slice] = total;
 }
+// select_kernel: R = log2 of the row's coarse mass, and the sub-blocks with W_j = 2^(lse_j - R) > tau for some query of the KV head, in sub-block order per slice
 template <int QG>
 __global__ void __launch_bounds__(32 * W) select_kernel(const Args a) {
   __shared__ float R[QG];
@@ -937,9 +927,8 @@ __global__ void __launch_bounds__(32 * W) select_kernel(const Args a) {
 }
 
 // ---- refinement pass --------------------------------------------------------------------------------
-// Item k of the head's list goes to warp k mod (gridDim.x W), balanced to +-1 item.  Per item: both records and
-// the group metadata, from which the coarse pass's q-hat is recomputed; corrections accumulate in registers.
-// One warp builds the prefix; a single-slice list is already contiguous.
+// Item k of the head's list goes to warp k mod (gridDim.x W), balanced to +-1 item. Per item: both records and the group metadata, from which the coarse
+// pass's q-hat is recomputed; corrections accumulate in registers. One warp builds the prefix; a single-slice list is already contiguous.
 template <class Pos, int Entries>
 __device__ __forceinline__ void refine_prefix(const Args &a, int vh, int (&pre)[Entries]) {
   const int lane = Pos::tid() & 31;
@@ -1102,6 +1091,7 @@ __device__ __forceinline__ void refine_kernel_item(const Args &a, SmemRefine<QG,
     if (!ch) dp[0] = ls;
   }
 }
+// refine_kernel: the list's items, strided over the warps: the correction exact - coarse of K and V, weighted 2^(m_block - R), one correction partial per CTA
 template <int CB, int FB, int QG, bool V, int Slices = MAX_SLICES>
 __global__ void __launch_bounds__(32 * W, 2) refine_kernel(const Args a) {
   __shared__ SmemRefine<QG, Slices> sm;
@@ -1262,9 +1252,8 @@ __global__ void __launch_bounds__(32 * W, 2) refine_kernel4(const Args a) {
 }
 
 // ---- final combine ----------------------------------------------------------------------------------
-// One CTA per (batch, KV head, query, slice of MC channels), splitting the row over SMs by channel.
+// One CTA per (batch, KV head, query, slice of MC channels), splitting the row over SMs by channel; the grid does not depend on the context.
 // Thread (g, ch) sums the partials of the CTAs g, g + MG, ...; the MU loads of a round are in flight together.
-// The grid does not depend on the context.
 constexpr int MC = 16, MG = 16, MU = 9, MSLICES = D / MC;
 struct SmemMerge {
   float o[MG][MC], l[MG];
@@ -1305,6 +1294,7 @@ __device__ __forceinline__ void merge_kernel_item(const Args &a, SmemMerge &sm) 
     a.out[(size_t)row * D + col] = to_bf16(__fdividef(s, n));  // (a reciprocal and a multiply: n is far from 2^126)
   }
 }
+// merge_kernel: coarse partials and corrections into the BF16 output
 template <int QG>
 __global__ void __launch_bounds__(MC * MG) merge_kernel(const Args a) {
   __shared__ SmemMerge sm;
@@ -1410,6 +1400,19 @@ template <class A> constexpr const char *item_args_type();
 template <> constexpr const char *item_args_type<Args>() { return "mlops_fbla_detail::Args"; }
 template <> constexpr const char *item_args_type<PrefillArgs>() { return "mlops_fbla_detail::PrefillArgs"; }
 template <> constexpr const char *item_args_type<QkvArgs>() { return "mlops_fbla_detail::QkvArgs"; }
+template <> constexpr const char *item_args_type<QkvChunkArgs>() { return "mlops_fbla_detail::QkvChunkArgs"; }
+
+// A device argument structure as bytes with its padding zeroed: equal calls give equal bytes.
+template <class T>
+inline void put_args(void *blob, const T &args) {
+  T copy = args;
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_clear_padding)
+  __builtin_clear_padding(&copy);
+#endif
+#endif
+  std::memcpy(blob, &copy, sizeof copy);
+}
 
 template <class K, class A>
 inline bool item_of(K kernel, int kind, int gx, int gy, int gz, int threads, int smem, const char *entry,
@@ -1431,7 +1434,7 @@ inline bool item_of(K kernel, int kind, int gx, int gy, int gz, int threads, int
   if (entry_chars < 0 || entry_chars >= (int)sizeof p.entry || type_chars < 0 || type_chars >= (int)sizeof p.args_type)
     return false;
   p.args_bytes = sizeof(A);
-  memcpy(p.args.bytes, &a, sizeof(A));
+  put_args(p.args.bytes, a);
   p.geom[0] = gx;
   p.geom[1] = gy;
   p.geom[2] = gz;

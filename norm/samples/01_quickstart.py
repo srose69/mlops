@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 """Quickstart: RMSNorm with a residual add, in Hugging Face's order of roundings, against PyTorch.
-
-    python 01_quickstart.py
-"""
+Run: python 01_quickstart.py"""
 import torch
 
 from mlops.norm import RMSNorm, rms_norm

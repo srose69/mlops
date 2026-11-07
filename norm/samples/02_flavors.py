@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 """The flavors of current models, each against PyTorch: Gemma's 1 + weight, LayerNorm with a bias, Mamba-2's gated norm over groups.
-
-    python 02_flavors.py
-"""
+Run: python 02_flavors.py"""
 import torch
 import torch.nn.functional as F
 

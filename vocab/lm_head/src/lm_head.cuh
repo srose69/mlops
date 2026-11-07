@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// The LM head element on CUDA cores (include/mlops_lm_head.h). A CTA of S warps takes a range of rows; a phase is
-// PR = 32 S / NB rows in units of R, every warp summing its k-range of 256-column passes for NB columns of x, then
-// the S partial sums of an (row, column) are added in warp order and scaled. The weights are read once (streaming
-// loads); x is written by the producer in the same launch and is read through L2.
+// The LM head element on CUDA cores (include/mlops_lm_head.h). A CTA of S warps takes a range of rows; a phase is PR = 32 S / NB rows in units
+// of R, every warp summing its k-range of 256-column passes for NB columns of x, then the S partial sums of a (row, column) are added in warp
+// order and scaled. The weights are read once (streaming loads).
 #pragma once
 #include "mlops_lm_head.h"
 
@@ -23,6 +22,7 @@ struct HeadOp {
   unsigned *hist;             // [n][items][256], or null
   int vocab, hidden, items, n, norm_parts_n;
   float inv_n, eps, logit_scale;
+  const int *column;          // work items only: null, or the device index of the column of x / norm_parts that column 0 is
 };
 
 // The top byte of a float's order key (a larger float, a larger key): the bucket of the sampler's first radix pass.
@@ -33,11 +33,30 @@ __device__ __forceinline__ unsigned key_byte(float x) {
 
 template <int S, int NB> struct HeadSmem {
   float part[S][NB][32 * S / NB];  // the warps' partial sums of the phase's (column, row)
-  unsigned hist[NB][256];          // counts of the key bytes of the element's rows
   float max[S][NB];
   int arg[S][NB];
   float scale[NB];
 };
+
+// Where an element's shared memory (dynamic) holds x and the counts (bytes from its start), and how much it takes: the tables of the kernel
+// (HeadSmem, MmaSmem), with XS x (n * hidden BF16), and the key-byte counts (columns * 256 words) only when the call asks for them.
+__host__ __device__ constexpr size_t smem_align(size_t bytes) { return (bytes + 15) & ~size_t(15); }
+__host__ __device__ constexpr size_t smem_x_offset(size_t tables) { return smem_align(tables); }
+__host__ __device__ constexpr size_t smem_x_bytes(int n, int hidden) { return smem_align(static_cast<size_t>(n) * hidden * sizeof(uint16_t)); }
+__host__ __device__ constexpr size_t smem_bytes(size_t tables, size_t x_bytes, int columns, bool hist) {
+  return smem_x_offset(tables) + x_bytes + (hist ? static_cast<size_t>(columns) * 256 * sizeof(unsigned) : 0);
+}
+
+// x, once: the n columns from L2 into shared memory, every thread of the CTA taking 16-byte pieces. The caller synchronizes. x is written by the
+// producer in the same launch, so it is read through L2: with XS (staged) every step takes it from shared memory; without XS every step reads it from
+// L2 again (the variant for shapes whose x does not fit the shared memory of a CTA).
+__device__ __forceinline__ void stage_x(const HeadOp &op, uint16_t *xs, unsigned tid, unsigned threads) {
+  const int pieces = op.hidden / 8;
+  for (int i = static_cast<int>(tid); i < op.n * pieces; i += static_cast<int>(threads)) {
+    const size_t at = static_cast<size_t>(i / pieces) * op.hidden + static_cast<size_t>(i % pieces) * 8;
+    *reinterpret_cast<uint4 *>(xs + at) = __ldcg(reinterpret_cast<const uint4 *>(op.x + at));
+  }
+}
 
 // 1 / sqrt(mean of a column's parts + eps): the lanes' strided sum, a butterfly, one correctly rounded rsqrt.
 __device__ __forceinline__ float norm_scale(const float *parts, int count, float inv_n, float eps, int lane) {
@@ -48,24 +67,26 @@ __device__ __forceinline__ float norm_scale(const float *parts, int count, float
   return __frsqrt_rn(__fadd_rn(__fmul_rn(s, inv_n), eps));
 }
 
-// One phase: the rows [r0, r0 + PR) in units of R rows over the warp's k-passes [p0, p1). The loads of a step (R
-// rows, and NB columns of x, one 256-column pass) are issued D steps ahead in a register ring, across unit
-// boundaries. Lane r < R ends a unit holding (row r, column c)'s sum (FMAs in (pass, column) order per lane, then
-// the xor butterfly). Rows past the vocabulary read row 0 and columns past n column n - 1; neither is stored.
-template <int R, int S, int D, int NB>
-__device__ __forceinline__ void head_phase(const HeadOp &op, int r0, int hi, int p0, int p1, int warp, int lane, HeadSmem<S, NB> &sm) {
+// One phase: the rows [r0, r0 + PR) in units of R rows over the warp's k-passes [p0, p1). The loads of a step (R rows of one 256-column pass, and
+// without XS the NB columns of x) are issued D steps ahead in a register ring, across unit boundaries; with XS the NB columns of x come from shared
+// memory (xs) when the step is consumed. Rows past the vocabulary read row 0 and columns past n column n - 1; neither is stored.
+template <int R, int S, int D, int NB, bool XS>
+__device__ __forceinline__ void head_phase(const HeadOp &op, int r0, int hi, int p0, int p1, int warp, int lane, HeadSmem<S, NB> &sm,
+                                           const uint16_t *xs) {
   static_assert(R >= 1 && D >= 1 && NB >= 1, "rows per unit, ring depth, columns");
   constexpr int PR = 32 * S / NB;
   static_assert(PR % R == 0, "units tile the phase");
   const int np = p1 - p0, units = min(PR / R, (hi - r0 + R - 1) / R), total = units * np;
-  uint4 wr[D][R], xr[D][NB];
+  uint4 wr[D][R], xr[D][XS ? 1 : NB];
   int iu = 0, ip = 0;  // the next step to issue: unit, pass
   auto issue = [&](int d) {
     const int row0 = r0 + iu * R, p = p0 + ip;
+    if constexpr (!XS) {
 #pragma unroll
-    for (int c = 0; c < NB; ++c) {
-      const int col = min(c, op.n - 1);
-      xr[d][c] = __ldcg(reinterpret_cast<const uint4 *>(op.x + (size_t)col * op.hidden + 256 * p + 8 * lane));
+      for (int c = 0; c < NB; ++c) {
+        const int col = min(c, op.n - 1);
+        xr[d][c] = __ldcg(reinterpret_cast<const uint4 *>(op.x + (size_t)col * op.hidden + 256 * p + 8 * lane));
+      }
     }
 #pragma unroll
     for (int r = 0; r < R; ++r) {
@@ -91,9 +112,12 @@ __device__ __forceinline__ void head_phase(const HeadOp &op, int r0, int hi, int
       float xf[NB][8];
 #pragma unroll
       for (int c = 0; c < NB; ++c) {
-        const unsigned xs[4] = {xr[d][c].x, xr[d][c].y, xr[d][c].z, xr[d][c].w};
+        uint4 xv;
+        if constexpr (XS) xv = *reinterpret_cast<const uint4 *>(xs + (size_t)min(c, op.n - 1) * op.hidden + 256 * (p0 + pi) + 8 * lane);
+        else xv = xr[d][c];
+        const unsigned xw[4] = {xv.x, xv.y, xv.z, xv.w};
 #pragma unroll
-        for (int e = 0; e < 8; ++e) xf[c][e] = bf16_to_f32((uint16_t)(xs[e / 2] >> (16 * (e & 1))));
+        for (int e = 0; e < 8; ++e) xf[c][e] = bf16_to_f32((uint16_t)(xw[e / 2] >> (16 * (e & 1))));
       }
 #pragma unroll
       for (int r = 0; r < R; ++r) {
@@ -110,7 +134,7 @@ __device__ __forceinline__ void head_phase(const HeadOp &op, int r0, int hi, int
         pi = 0;
 #pragma unroll
         for (int c = 0; c < NB; ++c) {
-          float mine = 0.f;
+          float mine = 0.f;  // lane r < R ends the unit holding (row r, column c)'s sum (FMAs in (pass, column) order per lane, then the xor butterfly)
 #pragma unroll
           for (int r = 0; r < R; ++r) {
             float v = acc[r][c];
@@ -128,17 +152,22 @@ __device__ __forceinline__ void head_phase(const HeadOp &op, int r0, int hi, int
 }
 
 // Element `item` of op.items: the rows of units [item U / items, (item + 1) U / items), U = ceil(vocab / R).
-// All 32 S threads call it; the CTA is synchronized on return.
-template <int R, int S, int D, int NB>
-__device__ __forceinline__ void head_item(const HeadOp &op, int item, unsigned tid, HeadSmem<S, NB> &sm) {
+// All 32 S threads call it, with shared memory of smem_bytes(sizeof(HeadSmem<S, NB>), XS ? smem_x_bytes(n, hidden) : 0,
+// NB, hist != null) bytes, 16-byte aligned; the CTA is synchronized on return.
+template <int R, int S, int D, int NB, bool XS>
+__device__ __forceinline__ void head_item(const HeadOp &op, int item, unsigned tid, void *smem) {
   constexpr int PR = 32 * S / NB;  // rows of a phase; PR * NB = the CTA's threads: one (column, row) each
+  HeadSmem<S, NB> &sm = *reinterpret_cast<HeadSmem<S, NB> *>(smem);
+  uint16_t *xs = reinterpret_cast<uint16_t *>(static_cast<char *>(smem) + smem_x_offset(sizeof(HeadSmem<S, NB>)));
+  unsigned *hist = reinterpret_cast<unsigned *>(reinterpret_cast<char *>(xs) + (XS ? smem_x_bytes(op.n, op.hidden) : 0));
   const int warp = tid >> 5, lane = tid & 31;
   const long long units = (op.vocab + R - 1) / R;
   const int lo = (int)(item * units / op.items) * R, hi = min((int)(((item + 1) * units / op.items) * R), op.vocab);
   const int passes = op.hidden / 256, p0 = warp * passes / S, p1 = (warp + 1) * passes / S;
 
+  if constexpr (XS) stage_x(op, xs, tid, 32 * S);
   if (op.hist)
-    for (unsigned i = tid; i < NB * 256; i += 32 * S) (&sm.hist[0][0])[i] = 0u;
+    for (unsigned i = tid; i < NB * 256; i += 32 * S) hist[i] = 0u;
   if (warp == 0) {
 #pragma unroll
     for (int c = 0; c < NB; ++c) {
@@ -153,7 +182,7 @@ __device__ __forceinline__ void head_item(const HeadOp &op, int item, unsigned t
   float best = __int_as_float(0xff800000);       // -inf
   int arg = 0x7fffffff;
   for (int r0 = lo; r0 < hi; r0 += PR) {
-    head_phase<R, S, D, NB>(op, r0, hi, p0, p1, warp, lane, sm);
+    head_phase<R, S, D, NB, XS>(op, r0, hi, p0, p1, warp, lane, sm, xs);
     __syncthreads();
     const int row = r0 + row_me;
     if (row < hi && c_me < op.n) {
@@ -162,14 +191,14 @@ __device__ __forceinline__ void head_item(const HeadOp &op, int item, unsigned t
       for (int w = 1; w < S; ++w) sum = __fadd_rn(sum, sm.part[w][c_me][row_me]);
       const float l = __fmul_rn(__fmul_rn(sum, sm.scale[c_me]), op.logit_scale);
       if (op.logits) __stcg(op.logits + (size_t)c_me * op.vocab + row, l);  // read by other SMs: L2 only, not L1
-      if (op.hist) atomicAdd(&sm.hist[c_me][key_byte(l)], 1u);
+      if (op.hist) atomicAdd(&hist[c_me * 256 + key_byte(l)], 1u);
       if (l > best) { best = l; arg = row; }  // ascending rows: the first of equals
     }
     __syncthreads();
   }
   if (op.hist)  // after the last phase's barrier: this element's counts, every column
     for (unsigned i = tid; i < NB * 256; i += 32 * S)
-      if (i / 256 < (unsigned)op.n) __stcg(op.hist + ((size_t)(i / 256) * op.items + item) * 256 + i % 256, (&sm.hist[0][0])[i]);
+      if (i / 256 < (unsigned)op.n) __stcg(op.hist + ((size_t)(i / 256) * op.items + item) * 256 + i % 256, hist[i]);
   if (op.stats_max) {
     // The warps' lanes may hold several columns: reduce each column over the lanes that carry it.
 #pragma unroll

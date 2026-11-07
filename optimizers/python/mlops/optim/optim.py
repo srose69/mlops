@@ -1,23 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""torch.optim front ends of the two kernels, and the NVFP4 layer AdamWQAT trains.
-
-* ``AdamW``       dense CUDA parameters (bfloat16 / float16 / float32, FP32 moments): mlops_adamw.
-* ``AdamWQAT``    NVFP4 weights of ``QATLinear`` layers only (``QATParameter``): mlops_adamw_qat. Dense
-                  parameters are refused -- they belong to ``AdamW``.
-* ``QATLinear``   linear layer whose weight is an NVFP4 tensor trained in place; forward is NVFP4EffMA's
-                  GEMM (activations exact, int8 or NVFP4: ``act``), backward exact for it. Its NVFP4 tensor
-                  and optimizer state are module buffers (``state_dict`` saves them). ``grad_dtype=torch.float8_e5m2`` hands the optimizer FP8
-                  gradients (``weight.grad_fp8``) instead of float32 ``weight.grad``.
-* ``split_params(model)``  -> (dense parameters, QAT parameters), for the two optimizers.
-* ``to_e4m3(q)``  an NVFP4 tensor with UE5M3 block scales as the same values with E4M3 ones (export).
-
-    from mlops.optim import AdamW, AdamWQAT, split_params
-    dense, qat = split_params(model)
-    opt = AdamW(dense, lr=1e-3)
-    opt_qat = AdamWQAT(qat, lr=1e-3, weight_decay=0.1)
-    loss.backward(); opt.step(); opt_qat.step(); opt.zero_grad(); opt_qat.zero_grad()
-"""
+"""torch.optim front ends of the two kernels (``AdamW``: mlops_adamw; ``AdamWQAT``: mlops_adamw_qat, QATLinear's NVFP4 weights only), the NVFP4 layer
+``QATLinear``, ``split_params(model)`` -> (dense parameters, QAT parameters) and ``to_e4m3(q)`` (export); each class is described at its definition.
+Use: ``dense, qat = split_params(model); opt = AdamW(dense, lr=1e-3); opt_qat = AdamWQAT(qat, lr=1e-3, weight_decay=0.1)``, then step both after backward()."""
 import warnings
 from typing import Iterable, List, Optional, Tuple
 
@@ -32,10 +17,11 @@ _FP8_MAX = {torch.float8_e5m2: 57344.0, torch.float8_e4m3fn: 448.0}
 _SCALE_DTYPES = ("e4m3", "ue5m3")
 
 
-def _fp8_encode(grad: torch.Tensor, dtype: torch.dtype) -> Tuple[torch.Tensor, float]:
-    """(grad * s rounded to ``dtype``, 1 / s), s mapping the tensor's amax to the format's maximum."""
-    amax = float(grad.abs().max())
-    s = _FP8_MAX[dtype] / amax if amax > 0 else 1.0
+def _fp8_encode(grad: torch.Tensor, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+    """(grad * s rounded to ``dtype``, 1 / s as a float32 scalar tensor on grad's device), s mapping the tensor's amax to the format's maximum. The
+    scale stays on the device: nothing is read back, so the backward that calls this can be captured in a CUDA graph."""
+    amax = grad.abs().amax()
+    s = torch.where(amax > 0, _FP8_MAX[dtype] / amax, torch.ones_like(amax))
     return (grad * s).to(dtype), 1.0 / s
 
 
@@ -45,13 +31,12 @@ def _flat(q):
 
 
 def to_e4m3(q):
-    """``q``, an nvfp4effma.NVFP4Tensor with UE5M3 block scales, as the same values bit for bit with E4M3 scales:
-    the NVFP4 of Transformer Engine, cuBLASLt's FP4 GEMM and ModelOpt. The formats share their 3 mantissa bits,
-    so dividing a row's scales and multiplying its global by one power of two -- the one putting the row's
-    largest scale (the tensor's, for a per-tensor global) in E4M3's top binade -- is exact for every scale it
-    leaves at 2^-6 or above, and for smaller ones on E4M3's subnormal grid. When a value would change (a row's
-    scales grew apart in training by more than E4M3 spans, about 16 binades), ``q`` is returned unchanged, still
-    UE5M3, with a warning: check ``.ue5m3`` on the result. E4M3 tensors are returned as they are."""
+    """``q``, an nvfp4effma.NVFP4Tensor with UE5M3 block scales, as the same values bit for bit with E4M3 scales: the NVFP4 of Transformer Engine,
+    cuBLASLt's FP4 GEMM and ModelOpt. If a value would change, ``q`` is returned unchanged, still UE5M3, with a warning: check ``.ue5m3`` on the result.
+    E4M3 tensors are returned as they are."""
+    # the formats share their 3 mantissa bits, so dividing a row's scales and multiplying its global by one power of two -- the one putting the row's largest
+    # scale (the tensor's, for a per-tensor global) in E4M3's top binade -- is exact for every scale it leaves at 2^-6 or above, and for smaller ones on
+    # E4M3's subnormal grid; a value changes when a row's scales grew apart in training by more than E4M3 spans (about 16 binades)
     if not q.ue5m3:
         return q
     import nvfp4effma
@@ -107,34 +92,34 @@ def _init_qat(w: torch.Tensor, state: torch.Tensor, four_over_six: Optional[str]
     return q
 
 
-class QATParameter(nn.Parameter):
-    """Handle of an NVFP4 weight for autograd and torch.optim: shape [out, in], float32, one element of
-    storage (zero strides) -- the weight itself is ``.layer``'s NVFP4 tensor. dL/dq for the dequantized
-    weight is ``.grad`` (float32) or, for a layer with an FP8 ``grad_dtype``, ``.grad_fp8`` = (FP8 bytes,
-    grad_scale): torch refuses an FP8 ``.grad`` on a float32 tensor."""
+class _QATParameterType(type):
+    def __instancecheck__(cls, obj):
+        return isinstance(obj, nn.Parameter) and getattr(obj, "_mlops_qat", False)
 
-    @classmethod
-    def placeholder(cls, rows: int, cols: int, device) -> "QATParameter":
-        p = cls(torch.zeros(1, device=device).expand(rows, cols), requires_grad=True)
-        p.grad_fp8 = None
+
+class QATParameter(metaclass=_QATParameterType):
+    """Handle of an NVFP4 weight for autograd and torch.optim: a plain ``nn.Parameter`` (not a subclass, so torch.compile traces it as the tensor it is)
+    of shape [out, in], float32, one element of storage (zero strides), marked as a handle (``isinstance(p, QATParameter)`` tells); the weight itself is
+    ``.layer``'s NVFP4 tensor. dL/dq for the dequantized weight is ``.grad`` (float32) or, for an FP8 ``grad_dtype``, ``.grad_fp8`` = (FP8 bytes,
+    grad_scale: a float32 scalar tensor on the device): torch refuses an FP8 ``.grad`` on a float32 tensor."""
+
+    @staticmethod
+    def placeholder(rows: int, cols: int, device) -> nn.Parameter:
+        p = nn.Parameter(torch.zeros(1, device=device).expand(rows, cols), requires_grad=True)
+        p._mlops_qat, p.grad_fp8 = True, None
         return p
-
-    def __repr__(self):
-        return f"QATParameter({list(self.shape)}, NVFP4)"
 
 
 def _act_mode(act: str, rows: int) -> str:
-    """The activation format nvfp4effma.linear uses for ``act`` on ``rows`` rows ("auto": exact for up to
-    AUTO_EXACT_MAX_ROWS rows, where both run at memory speed, int8 beyond)."""
+    """The activation format nvfp4effma.linear uses for ``act`` on ``rows`` rows ("auto": exact for up to AUTO_EXACT_MAX_ROWS rows, int8 beyond)."""
     import nvfp4effma
     return ("exact" if rows <= nvfp4effma.AUTO_EXACT_MAX_ROWS else "int8") if act == "auto" else act
 
 
 class _NVFP4LinearFn(torch.autograd.Function):
-    """y = A(x) @ q.T, q the NVFP4 weight, A(x) the activations as the GEMM reads them: x itself ("exact",
-    W4A16, in x's dtype), int8 with an FP32 scale per 16 values ("int8", W4A8) or NVFP4 ("nvfp4", W4A4).
-    Backward exact for that product: grad_q = gy.T @ A(x); grad_x = gy @ q, straight through A. A(x) is
-    what is kept for the backward (4 / 2 / 1.25 / 0.5625 B per value)."""
+    """y = A(x) @ q.T, q the NVFP4 weight, A(x) the activations as the GEMM reads them: x itself ("exact", W4A16, in x's dtype), int8 with an FP32
+    scale per 16 values ("int8", W4A8) or NVFP4 ("nvfp4", W4A4). Backward exact for that product: grad_q = gy.T @ A(x); grad_x = gy @ q, straight
+    through A. A(x) is what is kept for the backward (4 / 2 / 1.25 / 0.5625 B per value)."""
 
     @staticmethod
     def forward(ctx, x, handle, layer):
@@ -171,32 +156,14 @@ class _NVFP4LinearFn(torch.autograd.Function):
             del ctx.xq
         q = layer.nvfp4_weight().dequantize(torch.float32)
         gy2 = gy.reshape(-1, n).float()
-        grad_q = gy2.t() @ xa
-        if layer.grad_dtype is not None:
-            h = layer.weight
-            if h.grad_fp8 is not None:  # accumulation over several backwards: sum, then encode once
-                g8, gs = h.grad_fp8
-                grad_q += g8.float() * gs
-            h.grad_fp8 = _fp8_encode(grad_q, layer.grad_dtype)
-            grad_q = None
+        grad_q = _deliver_grad(layer, gy2.t() @ xa)
         return (gy2 @ q).reshape(ctx.x_shape).to(ctx.x_dtype), grad_q, None
 
 
 class QATLinear(nn.Module):
-    """Bias-free linear layer with an NVFP4 weight [out_features, in_features] trained by AdamWQAT.
-
-    in_features must be a multiple of 64 (NVFP4EffMA's GEMM). The weight is initialized from ``weight``
-    if given (any dense dtype, not kept), else from N(0, init_std^2). ``four_over_six``: None / "mae" /
-    "mse", Transformer Engine's 4over6 scale selection for the initial quantization. ``scale_dtype``: the
-    block scales, "ue5m3" (unsigned, 2^-17 .. 114688: every block scale can grow 256x during training) or
-    "e4m3" (NVFP4 as Transformer Engine stores it: 8x, then the block's largest weights saturate); None is
-    "ue5m3", or "e4m3" with ``four_over_six`` (an E4M3 recipe). The two
-    train bit-identically until an E4M3 scale would leave its range; ``to_e4m3`` converts for export. The
-    format is saved with ``state_dict`` (checkpoints without it are E4M3). ``grad_dtype``: None
-    (float32 ``weight.grad``) or torch.float8_e5m2 / torch.float8_e4m3fn (``weight.grad_fp8``, amax-scaled).
-    ``act``: how the activations enter the GEMM, as in nvfp4effma.linear -- "exact" (W4A16, x in its own
-    bfloat16 / float16 / float32), "int8" (W4A8, about 2x faster from sm_61 on: DP4A), "nvfp4" (W4A4) or
-    "auto" (exact up to 2 rows, int8 beyond); the output always has x's dtype."""
+    """Bias-free linear layer with an NVFP4 weight [out_features, in_features] trained by AdamWQAT; in_features a multiple of 64 (NVFP4EffMA's GEMM).
+    The weight is initialized from ``weight`` if given (any dense dtype, not kept), else from N(0, init_std^2); the output has x's dtype. Forward is
+    NVFP4EffMA's GEMM, backward exact for it; the NVFP4 tensor and optimizer state are module buffers (``state_dict`` saves them)."""
 
     def __init__(self, in_features: int, out_features: int, weight: Optional[torch.Tensor] = None,
                  init_std: float = 0.02, four_over_six: Optional[str] = None, scale_dtype: Optional[str] = None,
@@ -204,15 +171,23 @@ class QATLinear(nn.Module):
         super().__init__()
         if in_features % 64:
             raise ValueError(f"in_features ({in_features}) must be a multiple of 64 (NVFP4EffMA's GEMM)")
+        # act: how the activations enter the GEMM, as in nvfp4effma.linear -- "exact" (W4A16, x in its own bfloat16 / float16 / float32), "int8"
+        # (W4A8, DP4A from sm_61), "nvfp4" (W4A4) or "auto" (exact up to 2 rows, int8 beyond)
         if act not in _ACTS:
             raise ValueError(f"act must be one of {_ACTS}, got {act!r}")
         self.act = act
+        # grad_dtype: None (float32 weight.grad) or torch.float8_e5m2 / torch.float8_e4m3fn (weight.grad_fp8, amax-scaled)
         if grad_dtype is not None and grad_dtype not in _FP8_MAX:
             raise ValueError(f"grad_dtype must be None, torch.float8_e5m2 or torch.float8_e4m3fn, got {grad_dtype}")
+        # four_over_six: None / "mae" / "mse", Transformer Engine's 4over6 scale selection for the initial quantization
         if four_over_six not in (None, "mae", "mse"):
             raise ValueError(f"four_over_six must be None, 'mae' or 'mse', got {four_over_six!r}")
         self.in_features, self.out_features, self.grad_dtype = in_features, out_features, grad_dtype
+        # scale_dtype: the block scales, "ue5m3" (unsigned, 2^-17 .. 114688: every block scale can grow 256x during training) or "e4m3" (NVFP4 as
+        # Transformer Engine stores it: 8x, then the block's largest weights saturate); None is "ue5m3", or "e4m3" with four_over_six (an E4M3 recipe).
         scale_dtype = _scale_dtype(scale_dtype, four_over_six)
+        # the two train bit-identically until an E4M3 scale would leave its range; to_e4m3 converts for export; the format is saved with state_dict
+        # (the nvfp4_format buffer; checkpoints without it are E4M3)
         dev = torch.device(device)
         if weight is None:
             weight = torch.empty(out_features, in_features, device=dev).normal_(std=init_std)
@@ -240,7 +215,7 @@ class QATLinear(nn.Module):
         self.weight.data = torch.zeros(1, device=self.nvfp4_data.device).expand(self.out_features, self.in_features)
         if self.weight.grad_fp8 is not None:
             g8, gs = self.weight.grad_fp8
-            self.weight.grad_fp8 = (g8.to(self.nvfp4_data.device), gs)
+            self.weight.grad_fp8 = (g8.to(self.nvfp4_data.device), gs.to(self.nvfp4_data.device) if torch.is_tensor(gs) else gs)
         return self
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
@@ -266,6 +241,11 @@ class QATLinear(nn.Module):
         return nvfp4effma.NVFP4Tensor(self.nvfp4_data, self.nvfp4_scales, amax=self.nvfp4_amax.view(torch.float32),
                                       scale_max=self._scale_max, ue5m3=self.scale_dtype == "ue5m3")
 
+    def dequantized(self, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        """The weight as a dense ``[out_features, in_features]`` tensor of ``dtype`` (the NVFP4 values, rounded once), for a layer whose weight a
+        dense computation uses (e.g. an elementwise function of it): its gradient goes to the NVFP4 weight like ``forward``'s (``AdamWQAT``)."""
+        return _DequantizeFn.apply(self.weight, self, dtype)
+
     def _flat(self):
         return _flat(self.nvfp4_weight())
 
@@ -276,6 +256,108 @@ class QATLinear(nn.Module):
         g = "" if self.grad_dtype is None else f", grad_dtype={self.grad_dtype}"
         s = ", UE5M3 scales" if self.scale_dtype == "ue5m3" else ""
         return f"in_features={self.in_features}, out_features={self.out_features}, NVFP4{s}, act={self.act}{g}"
+
+
+class _DequantizeFn(torch.autograd.Function):
+    """w = the dequantized NVFP4 weight; the gradient of w is the gradient of the NVFP4 weight, as for ``QATLinear.forward``."""
+
+    @staticmethod
+    def forward(ctx, handle, layer, dtype):
+        ctx.layer = layer
+        return layer.nvfp4_weight().dequantize(dtype)
+
+    @staticmethod
+    def backward(ctx, gw):
+        return _deliver_grad(ctx.layer, gw.float().contiguous()), None, None
+
+
+class _GroupedNVFP4LinearFn(torch.autograd.Function):
+    """y_g = A(x)_g @ q_g.T for every group g (the rows seg[g]:seg[g + 1]) in one launch of nvfp4effma.grouped_linear, q_g the NVFP4 weight of group g,
+    A(x) the activations as the GEMM reads them (as in ``_NVFP4LinearFn``: x itself, int8 or NVFP4). Backward exact for that product, group by group,
+    on the device (mlops_qat_grouped_dgrad / _wgrad): grad_q_g = gy_g.T @ A(x)_g, grad_x_g = gy_g @ q_g, straight through A. The row counts stay on the
+    device in both directions: no host synchronization, so forward and backward can be captured in a CUDA graph."""
+
+    @staticmethod
+    def forward(ctx, x, handle, layer, seg):
+        import nvfp4effma
+        w = layer.nvfp4_weight()
+        x2 = x.reshape(-1, layer.in_features).contiguous()
+        mode = "int8" if layer.act == "auto" else layer.act  # the groups' row counts are not known on the host
+        if mode == "exact":
+            y = nvfp4effma.grouped_linear(x2, w, seg, layer.groups, act="exact")
+            ctx.save_for_backward(x2, seg)
+        elif mode == "int8":
+            xq = nvfp4effma.quantize_int8(x2)
+            y = nvfp4effma.grouped_linear(xq, w, seg, layer.groups)
+            ctx.save_for_backward(xq.data, xq.scales, seg)
+        else:
+            ctx.xq = nvfp4effma.quantize(x2)
+            y = nvfp4effma.grouped_linear(ctx.xq, w, seg, layer.groups, out_dtype=x.dtype)
+            ctx.save_for_backward(seg)
+        ctx.mode, ctx.layer, ctx.x_shape, ctx.x_dtype = mode, layer, x.shape, x.dtype
+        return y.reshape(*x.shape[:-1], layer.group_out_features)
+
+    @staticmethod
+    def backward(ctx, gy):
+        layer = ctx.layer
+        g, n, k = layer.groups, layer.group_out_features, layer.in_features
+        if ctx.mode == "exact":
+            xa, seg = ctx.saved_tensors
+        elif ctx.mode == "int8":
+            xq, xs, seg = ctx.saved_tensors
+            xa = (xq.float().view(-1, k // 16, 16) * xs.view(-1, k // 16, 1)).view(-1, k)
+        else:
+            (seg,) = ctx.saved_tensors
+            xa = ctx.xq.dequantize(torch.float32)
+            del ctx.xq
+        q = layer.nvfp4_weight().dequantize(torch.float32)
+        gy2 = gy.reshape(-1, n).contiguous()
+        gx = torch.ops.mlops_optim.grouped_dgrad(gy2, q, seg, g, ctx.x_dtype)
+        grad_q = _deliver_grad(layer, torch.ops.mlops_optim.grouped_wgrad(gy2, xa, seg, g))
+        return gx.reshape(ctx.x_shape), grad_q, None, None
+
+
+def _deliver_grad(layer, grad_q):
+    """grad_q as the layer's optimizer takes it: float32 as it is, or encoded into FP8 (``weight.grad_fp8``, summed over backwards)."""
+    if layer.grad_dtype is None:
+        return grad_q
+    h = layer.weight
+    if h.grad_fp8 is not None:
+        g8, gs = h.grad_fp8
+        grad_q += g8.float() * gs
+    h.grad_fp8 = _fp8_encode(grad_q, layer.grad_dtype)
+    return None
+
+
+class QATGroupedLinear(QATLinear):
+    """``groups`` bias-free NVFP4 linear layers (mixture-of-experts weights) in one: the weights ``[groups, out_features, in_features]`` are
+    stored stacked as one NVFP4 tensor ``[groups * out_features, in_features]`` with one amax and one AdamWQAT state, trained in place like
+    ``QATLinear`` (same buffers, ``state_dict``, ``AdamWQAT``). ``forward(x, seg)``: ``x`` ``[rows, in_features]`` grouped by layer, the rows of
+    layer ``g`` being ``seg[g]:seg[g + 1]`` (``seg``: int32 ``[groups + 1]`` on the device, ``seg[0] = 0``, ``seg[groups] == rows``); the forward is
+    one launch of nvfp4effma.grouped_linear and the backward two launches of mlops_qat_grouped_dgrad / _wgrad, none reading the counts on the host (no
+    synchronization: the layer can be captured in a CUDA graph). ``act`` as for ``QATLinear`` (``"auto"`` is ``"int8"``: the groups' row counts are not
+    known on the host). ``weight`` (optional): ``[groups, out_features, in_features]`` or stacked, any dense dtype. in_features a multiple of 64."""
+
+    def __init__(self, groups: int, in_features: int, out_features: int, weight: Optional[torch.Tensor] = None,
+                 init_std: float = 0.02, four_over_six: Optional[str] = None, scale_dtype: Optional[str] = None,
+                 grad_dtype: Optional[torch.dtype] = None, act: str = "int8", device="cuda"):
+        if groups < 1:
+            raise ValueError(f"groups must be positive, got {groups}")
+        if weight is not None:
+            if weight.numel() != groups * out_features * in_features:
+                raise ValueError(f"weight must hold {groups} x [{out_features}, {in_features}], got {tuple(weight.shape)}")
+            weight = weight.reshape(groups * out_features, in_features)
+        super().__init__(in_features, groups * out_features, weight=weight, init_std=init_std, four_over_six=four_over_six,
+                         scale_dtype=scale_dtype, grad_dtype=grad_dtype, act=act, device=device)
+        self.groups, self.group_out_features = groups, out_features
+
+    def forward(self, x: torch.Tensor, seg: torch.Tensor) -> torch.Tensor:
+        if seg.dtype != torch.int32 or seg.shape != (self.groups + 1,):
+            raise ValueError(f"seg must be an int32 tensor [{self.groups + 1}], got {seg.dtype} {tuple(seg.shape)}")
+        return _GroupedNVFP4LinearFn.apply(x, self.weight, self, seg)
+
+    def extra_repr(self):
+        return f"groups={self.groups}, " + super().extra_repr().replace(f"out_features={self.out_features}", f"out_features={self.group_out_features}")
 
 
 def split_params(model: nn.Module) -> Tuple[List[nn.Parameter], List[QATParameter]]:
@@ -340,20 +422,15 @@ class AdamW(torch.optim.Optimizer):
                     st["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32, memory_format=torch.contiguous_format)
                 st["step"] += 1
                 grad = p.grad if p.grad.dtype in _DENSE else p.grad.float()
-                _C.adamw(p, grad.contiguous(), st["exp_avg"], st["exp_avg_sq"], g["lr"], b1, b2, g["eps"],
+                torch.ops.mlops_optim.adamw(p, grad.contiguous(), st["exp_avg"], st["exp_avg_sq"], g["lr"], b1, b2, g["eps"],
                          g["weight_decay"], st["step"], True, 1.0)
         return loss
 
 
 class AdamWQAT(torch.optim.Optimizer):
-    """mlops_adamw_qat on the NVFP4 weights of QATLinear layers (QATParameter): no master copy, 5 B of
-    state per weight + 8 per 16-weight block, kept in the layer's buffers. Dense parameters are refused:
-    they belong to AdamW.
-
-    Gradients: ``p.grad`` (float32), or ``p.grad_fp8`` = (float8_e5m2 / float8_e4m3fn bytes, grad_scale) from
-    a QATLinear with an FP8 ``grad_dtype``. ``scale_z``: significance and CUSUM threshold of the block-scale
-    moves, in null standard deviations; ``seed``: the stochastic-rounding stream. Everything else AdamW
-    does (dense, CPU, sparse or non-NVFP4 parameters, amsgrad, maximize, foreach) is refused."""
+    """mlops_adamw_qat on the NVFP4 weights of QATLinear layers (QATParameter): no master copy, 5 B of state per weight + 8 per 16-weight block, kept in
+    the layer's buffers. Gradients: ``p.grad`` (float32) or ``p.grad_fp8`` = (float8_e5m2 / float8_e4m3fn bytes, grad_scale) from an FP8 ``grad_dtype``.
+    ``scale_z``: significance and CUSUM threshold of the block-scale moves, in null std devs; ``seed``: the stochastic-rounding stream. Dense, CPU, sparse or non-NVFP4 parameters, amsgrad, maximize, foreach are refused."""
 
     def __init__(self, params: Iterable, lr: float = 1e-3, betas: Tuple[float, float] = (0.9, 0.999),
                  eps: float = 1e-12, weight_decay: float = 1e-2, scale_z: float = 3.0, seed: int = 0):
@@ -402,7 +479,7 @@ class AdamWQAT(torch.optim.Optimizer):
                 st = self.state[p]
                 st["step"] = st.get("step", 0) + 1
                 layer = p.layer
-                _C.qat_step(grad.contiguous(), layer.qat_state, *layer._flat(), lr=g["lr"], beta1=b1, beta2=b2,
+                torch.ops.mlops_optim.qat_step(grad.contiguous(), layer.qat_state, *layer._flat(), lr=g["lr"], beta1=b1, beta2=b2,
                             eps=g["eps"], weight_decay=g["weight_decay"], step=st["step"],
                             grad_scale=float(grad_scale), scale_z=g["scale_z"],
                             seed=(self.seed + 0x9E3779B9 * k) & 0xFFFFFFFF)

@@ -41,7 +41,9 @@ struct Args {
   float *row_lse;  // [rows]: log2 sum of the row's coarse mass, written by the select pass
   int *items;      // [batch * kv_heads * vg, nslices * SLICE]: refined sub-blocks (sub-block << 4 | query mask)
   int *counts;     // [batch * kv_heads * vg, nslices]: items of every slice
-  const int *length;  // null, or the cache length in device memory: the length is *length + tokens
+  const int *length;  // null, or the cache length in device memory: the length is length[row * lstride] + tokens
+  int lstride;        // 0: one length for every batch row, 1: one per row
+  FastDiv bdiv;       // / kv_heads: the batch row of a KV head
   int batch, q_heads, kv_heads, tokens, nblocks, nslices;  // nblocks, nslices: the scratch's layout
   int hs, gs;      // units (a group's records, metadata) between consecutive KV heads and groups
   int ctas, rctas; // coarse and refine CTAs per (batch, KV head)
@@ -58,20 +60,28 @@ struct PrefillArgs {
   mlops_fbla_cache c;
   const uint16_t *q;      // [batch, q_heads, count, 128] BF16, or null (append only)
   const uint16_t *k, *v;  // [batch, kv_heads, count, 128] BF16: the chunk's tokens
-  uint16_t *out;          // [batch, q_heads, count, 128] BF16
-  const int *length;  // null, or a length in device memory: the chunk starts at *length + n0
+  uint16_t *out;          // [batch, q_heads, count, 128] BF16, or as out_hs / out_ts place it
+  int64_t out_hs;         // elements between q heads of out (count * 128 by default)
+  const int *length;  // null, or a length in device memory: the chunk starts at length[row * lstride] + n0
+  int lstride;        // as Args (1 only for the one-token append and the QKV pass)
   int batch, q_heads, kv_heads, qg, n0, count;  // count: the chunk's tokens, or its ceiling when dcount is set
                                                 // (the buffers' stride between heads and rows)
   int hs, gs;  // units between consecutive KV heads and groups, as Args
   float scale_log2;
+  int out_ts;         // elements between positions of out (128 by default)
   const int *dcount;  // null, or the chunk's token count in device memory (mlops_fbla_prefill_at: the launches
                       // sized by count, the ceiling, the extra CTAs exiting on *dcount)
 };
 
 // The cache length, read where it is used (a parameter, or one load of the device length through Pos::ro -- the
 // position policy's, fbla_kernels.cuh): not kept live through the kernels' loops.
-template <class Pos> __device__ __forceinline__ int tokens_of(const Args &a) { return a.length ? Pos::ro(a.length) + a.tokens : a.tokens; }
-template <class Pos> __device__ __forceinline__ int n0_of(const PrefillArgs &a) { return a.length ? Pos::ro(a.length) + a.n0 : a.n0; }
+// (kv_head: the linear index batch row * kv_heads + KV head)
+template <class Pos> __device__ __forceinline__ int tokens_of(const Args &a, int kv_head) {
+  return a.length ? Pos::ro(a.length + (a.lstride ? a.bdiv.div(kv_head) : 0)) + a.tokens : a.tokens;
+}
+template <class Pos> __device__ __forceinline__ int n0_of(const PrefillArgs &a, int kv_head = 0) {
+  return a.length ? Pos::ro(a.length + (a.lstride ? kv_head / a.kv_heads : 0)) + a.n0 : a.n0;
+}
 template <class Pos> __device__ __forceinline__ int count_of(const PrefillArgs &a) { return a.dcount ? Pos::ro(a.dcount) : a.count; }
 
 // instantiated per format in fbla_inst.cu (one object each); fbla.cu sees only these declarations
@@ -81,6 +91,11 @@ template <int CB, int FB> cudaError_t launch_prefill_at(const PrefillArgs &, cud
 template <int CB, int FB> cudaError_t launch_append(const PrefillArgs &, cudaStream_t);
 struct QkvArgs;
 template <int CB, int FB> cudaError_t launch_qkv(const QkvArgs &, cudaStream_t);
+struct QkvChunkArgs;  // format-independent (fbla_qkv.cuh)
+#ifndef __CUDACC_RTC__
+cudaError_t launch_qkv_chunk(const QkvChunkArgs &, cudaStream_t);
+bool qkv_chunk_pass(const QkvChunkArgs &, mlops_fbla_items &);
+#endif
 bool prefill_tc_device();
 // For a program that runs the items itself: Args of a decode and QkvArgs of a step, prepared as
 // mlops_fbla_decode_at / mlops_fbla_qkv_at do (capacity layout, length *length + cfg->tokens or cfg->tokens).

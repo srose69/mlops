@@ -62,6 +62,16 @@ Geometry geometry(const mlops_fbla_config *c, int per_head = 0) {
 bool valid_strides(const mlops_fbla_config *c) {
   return (c->head_stride == 0 && c->group_stride == 0) || (c->head_stride > 0 && c->group_stride > 0);
 }
+// the output layout: both strides given (positive, whole 16-byte rows, one batch) or neither
+bool valid_out_layout(const mlops_fbla_config *c) {
+  if (c->out_head_stride == 0 && c->out_token_stride == 0) return true;
+  return c->out_head_stride > 0 && c->out_token_stride > 0 && c->out_token_stride < (1ll << 30) && c->out_head_stride % 8 == 0 &&
+         c->out_token_stride % 8 == 0 && c->batch == 1;
+}
+void set_out_layout(const mlops_fbla_config *c, int count, mlops_fbla_detail::PrefillArgs &a) {
+  a.out_hs = c->out_head_stride ? c->out_head_stride : (int64_t)count * MLOPS_FBLA_HEAD_DIM;
+  a.out_ts = c->out_token_stride ? (int)c->out_token_stride : MLOPS_FBLA_HEAD_DIM;
+}
 bool valid_shape(const mlops_fbla_config *c) {
   if (!c || c->batch <= 0 || c->q_heads <= 0 || c->kv_heads <= 0 || c->tokens <= 0 || !valid_strides(c)) return false;
   if (c->q_heads % c->kv_heads) return false;
@@ -96,11 +106,15 @@ mlops_fbla_status prepare_decode(const char *fn, const mlops_fbla_config *c, boo
   for (const void *p : ptrs)
     if (!aligned(p, 16)) return fail(MLOPS_FBLA_INVALID_VALUE, "%s: pointers must be 16-byte aligned", fn);
   if (!aligned(length, 4)) return fail(MLOPS_FBLA_INVALID_VALUE, "%s: length must be 4-byte aligned", fn);
+  if ((c->length_stride != 0 && c->length_stride != 1) || (c->length_stride && !length))
+    return fail(MLOPS_FBLA_INVALID_VALUE, "%s: length_stride is 0, or 1 with a device length", fn);
   const Geometry g = geometry(&lc, per_head);
   if (scratch_bytes < g.bytes) return fail(MLOPS_FBLA_INVALID_VALUE, "%s: scratch has %zu bytes, need %zu", fn, scratch_bytes, g.bytes);
 
   a = Args{};
   a.c = *k; a.q = q; a.out = out; a.length = length;
+  a.lstride = c->length_stride;
+  a.bdiv = FastDiv::of(c->kv_heads);
   char *base = static_cast<char *>(scratch);
   a.lse = reinterpret_cast<float *>(base + g.lse);
   a.part = reinterpret_cast<float *>(base + g.part);
@@ -138,6 +152,13 @@ mlops_fbla_status decode(const char *fn, const mlops_fbla_config *c, const int *
 
 size_t mlops_fbla_detail::decode_scratch_bytes(const mlops_fbla_config *c, int per_head) {
   if (!c || c->capacity <= 0 || per_head < 1) return 0;
+  mlops_fbla_config lc = *c;
+  lc.tokens = c->capacity;
+  return valid_shape(&lc) ? geometry(&lc, per_head).bytes : 0;
+}
+
+extern "C" size_t mlops_fbla_decode_scratch_bytes_for(const mlops_fbla_config *c, int per_head) {
+  if (!c || c->capacity <= 0 || per_head < 0) return 0;
   mlops_fbla_config lc = *c;
   lc.tokens = c->capacity;
   return valid_shape(&lc) ? geometry(&lc, per_head).bytes : 0;
@@ -186,6 +207,7 @@ extern "C" mlops_fbla_status mlops_fbla_prefill(const mlops_fbla_config *c, int 
     return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: batch, heads and count must be positive, tokens >= 0, "
                 "q_heads a multiple of kv_heads, tokens + count <= capacity "
                 "(0: tokens + count) and <= 2^26, strides both 0 or both positive");
+  if (!valid_out_layout(c)) return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: out_head_stride and out_token_stride both positive multiples of 8 (batch 1) or both 0");
   if (c->format != MLOPS_FBLA_3P3 && c->format != MLOPS_FBLA_4P2)
     return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: invalid format");
   if (!(c->scale >= 0.f)) return fail(MLOPS_FBLA_INVALID_VALUE, "mlops_fbla_prefill: scale must be nonnegative");
@@ -203,6 +225,7 @@ extern "C" mlops_fbla_status mlops_fbla_prefill(const mlops_fbla_config *c, int 
   if (!c->capacity && !c->head_stride) a.c.tc_images = nullptr;  // (with neither, the heads' stride moves with tokens)
   a.batch = c->batch; a.q_heads = c->q_heads; a.kv_heads = c->kv_heads; a.qg = c->q_heads / c->kv_heads;
   a.n0 = c->tokens; a.count = count;
+  set_out_layout(c, count, a);
   const int capacity = c->capacity ? c->capacity : c->tokens + count;
   a.hs = c->head_stride ? c->head_stride : (capacity + MLOPS_FBLA_GROUP - 1) / MLOPS_FBLA_GROUP;
   a.gs = c->group_stride ? c->group_stride : 1;
@@ -228,6 +251,9 @@ mlops_fbla_status prefill_at_args(const char *fn, const mlops_fbla_config *c, co
                 "tokens + max_count <= capacity and <= 2^26, q_heads a multiple of kv_heads, strides both 0 or both positive", fn);
   if (c->format != MLOPS_FBLA_3P3 && c->format != MLOPS_FBLA_4P2) return fail(MLOPS_FBLA_INVALID_VALUE, "%s: invalid format", fn);
   if (!(c->scale >= 0.f)) return fail(MLOPS_FBLA_INVALID_VALUE, "%s: scale must be nonnegative", fn);
+  if (!valid_out_layout(c)) return fail(MLOPS_FBLA_INVALID_VALUE, "%s: out_head_stride and out_token_stride both positive multiples of 8 (batch 1) or both 0", fn);
+  if ((c->length_stride != 0 && c->length_stride != 1) || (c->length_stride && (q || dcount)))
+    return fail(MLOPS_FBLA_INVALID_VALUE, "%s: length_stride is 0 (1 only for the one-token append)", fn);
   const mlops_fbla_cache *x = cache;
   if (!x->coarse || !x->fine || !x->meta || !x->exact_sink_k || !x->exact_sink_v || !x->exact_open_k || !x->exact_open_v)
     return fail(MLOPS_FBLA_INVALID_VALUE, "%s: every cache pointer is required", fn);
@@ -243,8 +269,10 @@ mlops_fbla_status prefill_at_args(const char *fn, const mlops_fbla_config *c, co
 
   a.c = *cache; a.q = q; a.k = k; a.v = v; a.out = out;
   a.length = length; a.dcount = dcount;
+  a.lstride = c->length_stride;
   a.batch = c->batch; a.q_heads = c->q_heads; a.kv_heads = c->kv_heads; a.qg = c->q_heads / c->kv_heads;
   a.n0 = c->tokens; a.count = max_count;
+  set_out_layout(c, max_count, a);
   a.hs = c->head_stride ? c->head_stride : (c->capacity + MLOPS_FBLA_GROUP - 1) / MLOPS_FBLA_GROUP;
   a.gs = c->group_stride ? c->group_stride : 1;
   const float scale = c->scale == 0.f ? 1.f / sqrtf((float)MLOPS_FBLA_HEAD_DIM) : c->scale;
@@ -298,10 +326,14 @@ mlops_fbla_status mlops_fbla_detail::qkv_args(const mlops_fbla_config *c, const 
     if (!aligned(p, 4)) return fail(MLOPS_FBLA_INVALID_VALUE, "%s: length and the token's pointers must be 4-byte aligned", fn);
   if (t->batch_stride % 2 || t->q_group_stride % 2 || t->kv_group_stride % 2)
     return fail(MLOPS_FBLA_INVALID_VALUE, "%s: strides must be even (4-byte rows)", fn);
+  if (t->batch_stride < 0 || t->q_group_stride < 0 || t->kv_group_stride < 0 || t->batch_stride > INT32_MAX || t->q_group_stride > INT32_MAX || t->kv_group_stride > INT32_MAX)
+    return fail(MLOPS_FBLA_INVALID_VALUE, "%s: strides are nonnegative and below 2^31", fn);
   if (!aligned(x->tc_images, 128)) return fail(MLOPS_FBLA_INVALID_VALUE, "%s: tc_images must be 128-byte aligned", fn);
+  if (c->length_stride != 0 && c->length_stride != 1) return fail(MLOPS_FBLA_INVALID_VALUE, "%s: length_stride is 0 or 1", fn);
 
   a = QkvArgs{};
   a.p.c = *cache; a.p.length = length;
+  a.p.lstride = c->length_stride;
   a.p.batch = c->batch; a.p.q_heads = c->q_heads; a.p.kv_heads = c->kv_heads; a.p.qg = c->q_heads / c->kv_heads;
   a.p.n0 = c->tokens; a.p.count = 1;
   a.p.hs = c->head_stride ? c->head_stride : (c->capacity + MLOPS_FBLA_GROUP - 1) / MLOPS_FBLA_GROUP;
@@ -327,6 +359,68 @@ extern "C" mlops_fbla_status mlops_fbla_qkv_at(const mlops_fbla_config *c, const
                                                      : mlops_fbla_detail::launch_qkv<4, 2>(a, stream);
   if (e != cudaSuccess) return fail(MLOPS_FBLA_CUDA_ERROR, "%s: %s", fn, cudaGetErrorString(e));
   return ok();
+}
+
+namespace {
+mlops_fbla_status qkv_chunk_args(const char *fn, const mlops_fbla_config *c, const int *length, const int *count, int max_count,
+                                 const mlops_fbla_token *t, uint16_t *q_out, uint16_t *k_out, uint16_t *v_out,
+                                 mlops_fbla_detail::QkvChunkArgs &a) {
+  if (!c || !length || !count || !t || !t->q || !t->k || !t->v || !t->freq || !q_out || !k_out || !v_out)
+    return fail(MLOPS_FBLA_INVALID_VALUE, "%s: null argument", fn);
+  if (c->batch != 1 || c->kv_heads <= 0 || c->q_heads <= 0 || c->q_heads % c->kv_heads || c->tokens < 0 || max_count <= 0 ||
+      c->capacity <= 0 || (long long)c->tokens + max_count > c->capacity)
+    return fail(MLOPS_FBLA_INVALID_VALUE, "%s: batch 1, positive heads (q_heads a multiple of kv_heads), tokens >= 0, max_count > 0, "
+                "tokens + max_count <= capacity", fn);
+  if (!t->q_norm != !t->k_norm) return fail(MLOPS_FBLA_INVALID_VALUE, "%s: q_norm and k_norm both or neither", fn);
+  if (!(t->eps >= 0.f) || !(t->attention_factor >= 0.f)) return fail(MLOPS_FBLA_INVALID_VALUE, "%s: eps and attention_factor nonnegative", fn);
+  if (t->batch_stride < MLOPS_FBLA_HEAD_DIM || t->batch_stride % 2 || t->q_group_stride % 2 || t->kv_group_stride % 2 || t->q_group_stride < 0 || t->kv_group_stride < 0)
+    return fail(MLOPS_FBLA_INVALID_VALUE, "%s: the row stride (batch_stride) and the group strides must be even, the row at least 128", fn);
+  for (const void *p : {(const void *)q_out, (const void *)k_out, (const void *)v_out, (const void *)t->freq})
+    if (!aligned(p, 16)) return fail(MLOPS_FBLA_INVALID_VALUE, "%s: outputs and freq must be 16-byte aligned", fn);
+  for (const void *p : {(const void *)length, (const void *)count, (const void *)t->q, (const void *)t->k, (const void *)t->v,
+                        (const void *)t->q_norm, (const void *)t->k_norm})
+    if (!aligned(p, 4)) return fail(MLOPS_FBLA_INVALID_VALUE, "%s: length, count and the projection's pointers must be 4-byte aligned", fn);
+  a = mlops_fbla_detail::QkvChunkArgs{};
+  a.length = length; a.dcount = count;
+  a.n0 = c->tokens; a.count = max_count; a.q_heads = c->q_heads; a.kv_heads = c->kv_heads; a.qg = c->q_heads / c->kv_heads;
+  a.q = t->q; a.k = t->k; a.v = t->v;
+  a.row_stride = t->batch_stride; a.q_group_stride = t->q_group_stride; a.kv_group_stride = t->kv_group_stride;
+  a.q_norm = t->q_norm; a.k_norm = t->k_norm; a.eps = t->eps;
+  a.att = t->attention_factor == 0.f ? 1.f : t->attention_factor;
+  a.freq = reinterpret_cast<const mlops_rope_detail::Freq *>(t->freq);
+  a.q_out = q_out; a.k_out = k_out; a.v_out = v_out;
+  return ok();
+}
+}  // namespace
+
+extern "C" mlops_fbla_status mlops_fbla_qkv_prefill_at(const mlops_fbla_config *c, const int *length, const int *count, int max_count,
+                                                        const mlops_fbla_token *t, uint16_t *q_out, uint16_t *k_out, uint16_t *v_out,
+                                                        cudaStream_t stream) {
+  constexpr const char *fn = "mlops_fbla_qkv_prefill_at";
+  mlops_fbla_detail::QkvChunkArgs a;
+  const mlops_fbla_status st = qkv_chunk_args(fn, c, length, count, max_count, t, q_out, k_out, v_out, a);
+  if (st != MLOPS_FBLA_OK) return st;
+  const cudaError_t e = mlops_fbla_detail::launch_qkv_chunk(a, stream);
+  if (e != cudaSuccess) return fail(MLOPS_FBLA_CUDA_ERROR, "%s: %s", fn, cudaGetErrorString(e));
+  return ok();
+}
+
+extern "C" int mlops_fbla_cache_sizes(const mlops_fbla_config *c, mlops_fbla_sizes *out) {
+  if (!c || !out || c->batch <= 0 || c->q_heads <= 0 || c->kv_heads <= 0 || c->q_heads % c->kv_heads || !valid_strides(c)) return 0;
+  if (c->format != MLOPS_FBLA_3P3 && c->format != MLOPS_FBLA_4P2) return 0;
+  const long long tokens = c->capacity ? c->capacity : c->tokens;
+  if (tokens <= 0 || (c->capacity && c->capacity < c->tokens)) return 0;
+  const size_t heads = (size_t)c->batch * c->kv_heads, groups = (size_t)((tokens + MLOPS_FBLA_GROUP - 1) / MLOPS_FBLA_GROUP);
+  const size_t hs = c->head_stride ? (size_t)c->head_stride : groups, gs = c->group_stride ? (size_t)c->group_stride : 1;
+  const size_t units = (heads - 1) * hs + (groups - 1) * gs + 1;
+  const bool coarse3 = c->format == MLOPS_FBLA_3P3;
+  const size_t sub = MLOPS_FBLA_GROUP / MLOPS_FBLA_SUBBLOCK;  // the records of a group
+  out->coarse = units * sub * (coarse3 ? mlops_fbla_detail::record_bytes<3>() : mlops_fbla_detail::record_bytes<4>());
+  out->fine = units * sub * (coarse3 ? mlops_fbla_detail::record_bytes<3>() : mlops_fbla_detail::record_bytes<2>());
+  out->meta = units * 1024;
+  out->exact = heads * MLOPS_FBLA_GROUP * MLOPS_FBLA_HEAD_DIM * sizeof(uint16_t);
+  out->images = mlops_fbla_detail::prefill_tc_device() ? units * mlops_fbla_detail::IMAGE_SLOT : 0;
+  return 1;
 }
 
 extern "C" size_t mlops_fbla_images_bytes(const mlops_fbla_config *c) {
@@ -426,6 +520,67 @@ extern "C" int mlops_fbla_qkv_at_items(const mlops_fbla_config *c, const int *le
   return copy_plan(passes, max, p, n, c);
 }
 
+extern "C" int mlops_fbla_qkv_prefill_at_items(const mlops_fbla_config *c, const int *length, const int *count, int max_count,
+                                               const mlops_fbla_token *token, uint16_t *q_out, uint16_t *k_out, uint16_t *v_out,
+                                               mlops_fbla_items *passes, int max) {
+  if (!valid_plan_output(passes, max)) return -1;
+  mlops_fbla_detail::QkvChunkArgs a;
+  if (qkv_chunk_args("mlops_fbla_qkv_prefill_at_items", c, length, count, max_count, token, q_out, k_out, v_out, a) != MLOPS_FBLA_OK) return -1;
+  mlops_fbla_items p[1]{};
+  return copy_plan(passes, max, p, mlops_fbla_detail::qkv_chunk_pass(a, p[0]) ? 1 : -1, c);
+}
+
+// The statements that run one item of pass `p` on a CTA (mlops_fbla_items.h): the entry's arguments after the args blob are the kind's
+// (shared-memory objects, the geometry words), the position is set first. Names used: args, item, sm, words; the executor supplies them.
+extern "C" int mlops_fbla_item_call(const mlops_fbla_items *p, char *out, size_t capacity) {
+  using namespace mlops_fbla_detail;
+  if (!p || (capacity && !out) || p->geom[0] <= 0 || p->geom[1] <= 0 || p->geom[2] <= 0) return -1;
+  Args d{};
+  const bool decode = p->kind >= MLOPS_FBLA_ITEM_COARSE && p->kind <= MLOPS_FBLA_ITEM_MERGE;
+  if (decode) std::memcpy(&d, p->args.bytes, sizeof d);
+  const int qg = decode && d.kv_heads ? d.q_heads / d.kv_heads / d.vg : 0;
+  char tail[512];
+  const long long *geom = p->geom;
+  switch (p->kind) {
+    case MLOPS_FBLA_ITEM_CLOSE: std::snprintf(tail, sizeof tail, ", *reinterpret_cast<unsigned char (*)[2][128][128]>(sm)"); break;
+    case MLOPS_FBLA_ITEM_FINISH: tail[0] = 0; break;
+    case MLOPS_FBLA_ITEM_STREAM:
+      std::snprintf(tail, sizeof tail, ", *reinterpret_cast<mlops_fbla_detail::StreamSmem<mlops_fbla_detail::Warps<%d>::PROWS> *>(sm)",
+                    geom[23] == record_bytes<3>() ? 3 : 4);
+      break;
+    case MLOPS_FBLA_ITEM_COARSE:
+      if (qg == 4) std::snprintf(tail, sizeof tail, ", *reinterpret_cast<mlops_fbla_detail::SmemCoarse4 *>(sm)");
+      else std::snprintf(tail, sizeof tail, ", *reinterpret_cast<mlops_fbla_detail::SmemCoarse<%d> *>(sm)", qg);
+      break;
+    case MLOPS_FBLA_ITEM_REFINE: {
+      const char *slices = d.nslices == 1 ? "1" : "mlops_fbla_detail::MAX_SLICES";
+      if (qg == 4) std::snprintf(tail, sizeof tail, ", *reinterpret_cast<mlops_fbla_detail::SmemRefine4Storage<%s> *>(sm)", slices);
+      else std::snprintf(tail, sizeof tail, ", *reinterpret_cast<mlops_fbla_detail::SmemRefine<%d, %s> *>(sm)", qg, slices);
+      break;
+    }
+    case MLOPS_FBLA_ITEM_SELECT:
+      std::snprintf(tail, sizeof tail, ", *reinterpret_cast<float (*)[%d]>(sm), *reinterpret_cast<int (*)[mlops_fbla_detail::W]>(sm + %d)", qg, qg * 4);
+      break;
+    case MLOPS_FBLA_ITEM_MERGE: std::snprintf(tail, sizeof tail, ", *reinterpret_cast<mlops_fbla_detail::SmemMerge *>(sm)"); break;
+    case MLOPS_FBLA_ITEM_QKV: std::snprintf(tail, sizeof tail, ", mlops_fbla::Pos::x(), *reinterpret_cast<mlops_fbla_detail::QkvSmem *>(sm)"); break;
+    case MLOPS_FBLA_ITEM_QKV_CHUNK:
+      std::snprintf(tail, sizeof tail, ", mlops_fbla::Pos::x(), mlops_fbla::Pos::y(), *reinterpret_cast<mlops_fbla_detail::QkvChunkSmem *>(sm)");
+      break;
+    case MLOPS_FBLA_ITEM_TRANSCODE:  // the images are the cache's (a.c.tc_images); the steps, the offset and the flag are constants of the call
+      std::snprintf(tail, sizeof tail, ", (unsigned char *)a.c.tc_images, (size_t)%lldull, (size_t)%lldull, (int)%lld, (bool)%lld, sm", geom[4], geom[5], geom[6], geom[7]);
+      break;
+    case MLOPS_FBLA_ITEM_TC:  // the split's partials are the executor's: words[0], words[1]
+      std::snprintf(tail, sizeof tail, ", (const unsigned char *)a.c.tc_images, (size_t)%lldull, (size_t)%lldull, (int)%lld, (float2 *)words[0], (float *)words[1], sm", geom[4],
+                    geom[5], geom[6]);
+      break;
+    case MLOPS_FBLA_ITEM_TC_MERGE: std::snprintf(tail, sizeof tail, ", (const float2 *)words[0], (const float *)words[1], (int)%lld", geom[5]); break;
+    default: return -1;
+  }
+  const int n = std::snprintf(out, capacity, "{ const auto &a = *static_cast<const %s *>(args); mlops_fbla::position(item, %lld, %lld, %lld); %s(a%s); }", p->args_type, geom[0], geom[1],
+                              geom[2], p->entry, tail);
+  return n < 0 || (size_t)n >= capacity ? -1 : n;
+}
+
 // The ranges of one item of one pass (mlops_fbla_items.h).  Length and count live in device memory, so ranges
 // are the envelope over every count up to the ceiling and every start the capacity allows.
 // geom[20..]: hs, gs, groups, coarse/fine record bytes; decode 25..30: scratch lse/part/dpart/row_lse/items/counts.
@@ -456,8 +611,16 @@ extern "C" int mlops_fbla_item_access(const mlops_fbla_items *passes, int npasse
     memcpy(&a, p.args.bytes, sizeof a);
     const long long cnt = a.count;
     auto position = [&] {
-      if (a.length) put(MLOPS_FBLA_ARG_LENGTH, 0, 0, 4, 0, 1);
+      if (a.length) put(MLOPS_FBLA_ARG_LENGTH, 0, 0, 4LL * (a.lstride ? a.batch : 1), 0, 1);
       if (a.dcount) put(MLOPS_FBLA_ARG_COUNT, 0, 0, 4, 0, 1);
+    };
+    // q heads y0 .. y0 + nh - 1 of the output, every position up to the ceiling
+    auto put_out = [&](long long y0, long long nh) {
+      const long long hs_b = a.out_hs * 2, ts_b = a.out_ts * 2;
+      if (hs_b == cnt * row && ts_b == row) put(MLOPS_FBLA_ARG_OUT, 1, y0 * cnt * row, row, row, (int)(nh * cnt));
+      else if (hs_b == row) put(MLOPS_FBLA_ARG_OUT, 1, y0 * row, nh * row, ts_b, (int)cnt);
+      else
+        for (long long h = 0; h < nh; ++h) put(MLOPS_FBLA_ARG_OUT, 1, (y0 + h) * hs_b, row, ts_b, (int)cnt);
     };
     switch (p.kind) {
       case MLOPS_FBLA_ITEM_CLOSE:
@@ -496,7 +659,7 @@ extern "C" int mlops_fbla_item_access(const mlops_fbla_items *passes, int npasse
         cache_units(y, 0, MLOPS_FBLA_ARG_COARSE, SBG * RC);
         cache_units(y, 0, MLOPS_FBLA_ARG_FINE, SBG * RF);
         cache_units(y, 0, MLOPS_FBLA_ARG_META, 512 * 2);
-        put(MLOPS_FBLA_ARG_OUT, 1, (long long)(y * a.qg) * cnt * row, row, row, rows);
+        put_out((long long)y * a.qg, a.qg);
         position();
         break;
       }
@@ -511,7 +674,7 @@ extern "C" int mlops_fbla_item_access(const mlops_fbla_items *passes, int npasse
         put(MLOPS_FBLA_ARG_OPEN_K, 0, (long long)kh * G * row, row, row, G);
         put(MLOPS_FBLA_ARG_OPEN_V, 0, (long long)kh * G * row, row, row, G);
         cache_units(kh, 0, MLOPS_FBLA_ARG_IMAGES, mlops_fbla_detail::IMAGE_SLOT);
-        if (p.geom[11] <= 1) put(MLOPS_FBLA_ARG_OUT, 1, (long long)y * cnt * row, row, row, (int)cnt);
+        if (p.geom[11] <= 1) put_out(y, 1);
         else {
           const long long pr = ((long long)z * a.batch * a.q_heads + y) * cnt;
           put(MLOPS_FBLA_ARG_PART_ML, 1, pr * 8, 8, 8, (int)cnt);
@@ -525,7 +688,7 @@ extern "C" int mlops_fbla_item_access(const mlops_fbla_items *passes, int npasse
             (long long)a.batch * a.q_heads * cnt * 8, (int)p.geom[5]);
         put(MLOPS_FBLA_ARG_PART_O, 0, (long long)y * cnt * D * 4, cnt * D * 4,
             (long long)a.batch * a.q_heads * cnt * D * 4, (int)p.geom[5]);
-        put(MLOPS_FBLA_ARG_OUT, 1, (long long)y * cnt * row, row, row, (int)cnt);
+        put_out(y, 1);
         if (a.dcount) put(MLOPS_FBLA_ARG_COUNT, 0, 0, 4, 0, 1);
         break;
       case MLOPS_FBLA_ITEM_FINISH:
@@ -568,7 +731,24 @@ extern "C" int mlops_fbla_item_access(const mlops_fbla_items *passes, int npasse
     if (q.p.c.tc_images)
       put(MLOPS_FBLA_ARG_IMAGES, 1, (y * hs) * mlops_fbla_detail::IMAGE_SLOT + mlops_fbla_detail::IMAGE_BYTES, 4,
           gs * mlops_fbla_detail::IMAGE_SLOT, cgu);
+    put(MLOPS_FBLA_ARG_LENGTH, 0, 0, 4LL * (q.p.lstride ? q.p.batch : 1), 0, 1);
+  } else if (p.kind == MLOPS_FBLA_ITEM_QKV_CHUNK) {  // KV head y, positions 8 x .. 8 x + 7 (up to the ceiling)
+    mlops_fbla_detail::QkvChunkArgs q{};
+    memcpy(&q, p.args.bytes, sizeof q);
+    const long long i0 = (long long)x * mlops_fbla_detail::QKV_TOK, rows = std::min<long long>(mlops_fbla_detail::QKV_TOK, q.count - i0);
+    put(MLOPS_FBLA_ARG_TQ, 0, (i0 * q.row_stride + y * q.q_group_stride) * 2, q.qg * row, q.row_stride * 2, (int)rows);
+    put(MLOPS_FBLA_ARG_TK, 0, (i0 * q.row_stride + y * q.kv_group_stride) * 2, row, q.row_stride * 2, (int)rows);
+    put(MLOPS_FBLA_ARG_TV, 0, (i0 * q.row_stride + y * q.kv_group_stride) * 2, row, q.row_stride * 2, (int)rows);
+    if (q.q_norm) {
+      put(MLOPS_FBLA_ARG_TQN, 0, 0, row, 0, 1);
+      put(MLOPS_FBLA_ARG_TKN, 0, 0, row, 0, 1);
+    }
+    put(MLOPS_FBLA_ARG_TFREQ, 0, 0, (D / 2) * sizeof(mlops_rope_detail::Freq), 0, 1);
+    put(MLOPS_FBLA_ARG_Q, 1, ((long long)y * q.qg * q.count + i0) * row, rows * row, (long long)q.count * row, q.qg);
+    put(MLOPS_FBLA_ARG_K, 1, ((long long)y * q.count + i0) * row, rows * row, 0, 1);
+    put(MLOPS_FBLA_ARG_V, 1, ((long long)y * q.count + i0) * row, rows * row, 0, 1);
     put(MLOPS_FBLA_ARG_LENGTH, 0, 0, 4, 0, 1);
+    put(MLOPS_FBLA_ARG_COUNT, 0, 0, 4, 0, 1);
   } else {  // the decode's passes (the args an Args)
     mlops_fbla_detail::Args d{};
     memcpy(&d, p.args.bytes, sizeof d);
@@ -591,7 +771,7 @@ extern "C" int mlops_fbla_item_access(const mlops_fbla_items *passes, int npasse
           put(arg, 0, (long long)kh * G * row, row, row, G);
         put(MLOPS_FBLA_ARG_SCRATCH, 1, o_lse + (long long)row0 * d.nblocks * 4, 4, 4, qg * d.nblocks);
         put(MLOPS_FBLA_ARG_SCRATCH, 1, o_part + (long long)row0 * d.ctas * (2 + D) * 4, (2 + D) * 4, (2 + D) * 4, qg * d.ctas);
-        put(MLOPS_FBLA_ARG_LENGTH, 0, 0, 4, 0, 1);
+        put(MLOPS_FBLA_ARG_LENGTH, 0, 0, 4LL * (d.lstride ? d.batch : 1), 0, 1);
         break;
       case MLOPS_FBLA_ITEM_SELECT:
         put(MLOPS_FBLA_ARG_SCRATCH, 0, o_lse + (long long)row0 * d.nblocks * 4, 4, 4, qg * d.nblocks);
@@ -600,7 +780,7 @@ extern "C" int mlops_fbla_item_access(const mlops_fbla_items *passes, int npasse
         if (!x) put(MLOPS_FBLA_ARG_SCRATCH, 1, o_row + (long long)row0 * 4, 4, 4, qg);
         put(MLOPS_FBLA_ARG_SCRATCH, 1, o_items + (long long)(y * d.nslices + x) * SLICE * 4, SLICE * 4, 0, 1);
         put(MLOPS_FBLA_ARG_SCRATCH, 1, o_counts + (long long)(y * d.nslices + x) * 4, 4, 0, 1);
-        if (d.length) put(MLOPS_FBLA_ARG_LENGTH, 0, 0, 4, 0, 1);
+        if (d.length) put(MLOPS_FBLA_ARG_LENGTH, 0, 0, 4LL * (d.lstride ? d.batch : 1), 0, 1);
         break;
       case MLOPS_FBLA_ITEM_REFINE:
         put(MLOPS_FBLA_ARG_Q, 0, (long long)row0 * row, row, row, qg);
@@ -612,7 +792,7 @@ extern "C" int mlops_fbla_item_access(const mlops_fbla_items *passes, int npasse
         put(MLOPS_FBLA_ARG_SCRATCH, 0, o_part + (long long)row0 * d.ctas * (2 + D) * 4, (2 + D) * 4, (2 + D) * 4, qg * d.ctas);
         put(MLOPS_FBLA_ARG_SCRATCH, 0, o_row + (long long)row0 * 4, 4, 4, qg);
         put(MLOPS_FBLA_ARG_SCRATCH, 1, o_dpart + (long long)row0 * d.rctas * (1 + D) * 4, (1 + D) * 4, (1 + D) * 4, qg * d.rctas);
-        put(MLOPS_FBLA_ARG_LENGTH, 0, 0, 4, 0, 1);
+        put(MLOPS_FBLA_ARG_LENGTH, 0, 0, 4LL * (d.lstride ? d.batch : 1), 0, 1);
         break;
       case MLOPS_FBLA_ITEM_MERGE: {
         const int row_m = row0 + x / (D / 16);  // (MC = 16: merge_kernel's column blocks)

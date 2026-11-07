@@ -1,19 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""KV-cache quantization as runtimes do it, against FBLA formats: K logit error per layer (bench/capture_qkv.py
-tensors) and the model's LM loss with every attention layer reading the quantized cache.
-
-* vLLM fp8        float8_e4m3fn, one scale per tensor (amax / 448), K and V
-* llama.cpp q8_0  blocks of 32 values along head_dim (within a token), d = amax / 127, int8
-* llama.cpp q4_0  blocks of 32 along head_dim, d = (value of largest |x|) / -8, codes 0..15 - 8
-* llama.cpp q4_1  blocks of 32 along head_dim, min + d = (max - min) / 15, codes 0..15
-* KIVI 4 / 2 bit  K per channel (groups of 32 tokens), V per token (groups of 32 channels), min + step; the
-                  fp16 window of recent tokens is left out (every token quantized)
-* FBLA            mu + step per channel per block of 16 tokens (two bf16 per channel per block), 4-bit codes
-
-    python bench/kv_native.py QKV_FILE MODEL_DIR TEXT_FILE [TEXT_FILE ...]
-"""
+"""KV-cache quantization as runtimes do it, against FBLA formats: K logit error per layer (bench/capture_qkv.py tensors) and the model's LM loss with every
+attention layer reading the quantized cache (the schemes are described beside their code). Run: python bench/kv_native.py QKV_FILE MODEL_DIR TEXT_FILE [TEXT_FILE ...]"""
 import argparse
 import os
 import sys
@@ -28,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 torch.backends.cuda.matmul.allow_tf32 = False
 
 
+# vLLM fp8: float8_e4m3fn, one scale per tensor (amax / 448), K and V
 def fp8_tensor(x):
     s = x.float().abs().amax() / 448.0
     return (x.float() / s).to(torch.float8_e4m3fn).float() * s
@@ -37,11 +27,13 @@ def _blocks_hd(x, n=32):  # [..., D] -> [..., D/n, n]
     return x.float().reshape(*x.shape[:-1], x.shape[-1] // n, n)
 
 
+# llama.cpp q8_0: blocks of 32 values along head_dim (within a token), d = amax / 127, int8
 def q8_0(x):
     b = _blocks_hd(x); d = (b.abs().amax(-1, keepdim=True) / 127).half().float()
     return (torch.round(b / d.clamp_min(1e-30)).clamp(-127, 127) * d).reshape(x.shape)
 
 
+# llama.cpp q4_0: blocks of 32 along head_dim, d = (value of largest |x|) / -8, codes 0..15 - 8
 def q4_0(x):
     b = _blocks_hd(x)
     i = b.abs().argmax(-1, keepdim=True)
@@ -50,6 +42,7 @@ def q4_0(x):
     return ((q - 8) * d).reshape(x.shape)
 
 
+# llama.cpp q4_1: blocks of 32 along head_dim, min + d = (max - min) / 15, codes 0..15
 def q4_1(x):
     b = _blocks_hd(x)
     lo, hi = b.amin(-1, keepdim=True), b.amax(-1, keepdim=True)
@@ -65,6 +58,8 @@ def _asym(x, dim, bits):  # min + step along dim (groups already arranged on tha
     return torch.round((x - m) / d.clamp_min(1e-30)).clamp(0, L) * d + m
 
 
+# KIVI 4 / 2 bit: K per channel (groups of 32 tokens), V per token (groups of 32 channels), min + step; the fp16 window of recent tokens is left out
+# (every token quantized)
 def kivi_k(bits, g=32):  # x [..., N, D]: per channel over groups of g tokens
     def f(x):
         *lead, N, D = x.shape
@@ -79,6 +74,7 @@ def kivi_v(bits, g=32):  # per token over groups of g channels
     return f
 
 
+# FBLA: mu + step per channel per block of 16 tokens (two bf16 per channel per block), 4-bit codes
 def fbla_k(x):  # mu + step per channel per block of 16 tokens
     *lead, N, D = x.shape
     xb = x.float().reshape(*lead, N // 16, 16, D)

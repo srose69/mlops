@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// The tensor-core prefill's per-warp arithmetic over a group image (tensors/transcode.cuh).  A warp owns 16 query rows;
-// lane = 4 g + t holds rows g and g + 8.  q stays in 32 registers: q[r][c] = the BF16 pair of channels 8 c + 2 t, + 1
-// of row g + 8 r, the A fragments of the BF16 mma as they are and the source of every closed group's q-hat.
-//
-// Closed group (128 tokens, one P block): q-hat (the format's: z = q step exact, r = fl(127 / max|z|), q-hat = rint(z r),
-// sq = max|z| sl / 127, qb = sl q . base), QK by s8 x u8 mma, one maximum, P = rint(255 2^(s - m)) in bytes, PV by
-// u8 x u8 mma, the fold o += w (step X + base sum P) in FP32.  Integer accumulators carry MAGIC (FP32 bits of 1.5 2^23).
-//
-// Scheduling: ptxas hoists independent loads and products and front-loads mma; dependencies through a hidden zero
-// (zero_of: an integer 0 the compilers cannot see through) keep each step's live range short.  Every such gate below is
-// measured (nvdisasm -plr, L40S cycles).
+// The tensor-core prefill's per-warp arithmetic over a group image (tensors/transcode.cuh). A warp owns 16 query rows; lane = 4 g + t holds rows g and g + 8. q stays in
+// 32 registers: q[r][c] = the BF16 pair of channels 8 c + 2 t, + 1 of row g + 8 r, the A fragments of the BF16 mma as they are and the source of every closed group's q-hat.
+// Scheduling: ptxas hoists independent loads and products and front-loads mma; dependencies through a hidden zero (zero_of) keep each step's live range short.
 #ifndef MLOPS_FBLA_TENSORS_FN_CUH
 #define MLOPS_FBLA_TENSORS_FN_CUH
 
@@ -48,9 +40,8 @@ __device__ __forceinline__ void q_load(uint32_t (&q)[2][16], const uint16_t *row
 }
 
 // ---- q-hat: quant_p1<0 .. 3>, quant_scale, quant_p2<0 .. 3> in this order -----------------------------------------
-// km = KM + 48 t (record (KS, t) at + 192 KS: 8 FP32 steps, 8 BF16 bases).  Each step's loads and q unpacks wait for the
-// previous step through zk (else LICM hoists the unpacks out of the group loop and ptxas merges pass 2's loads into
-// pass 1's).  Pass 1: max|z| (am) and q . base (qp, two chains a row).
+// km = KM + 48 t (record (KS, t) at + 192 KS: 8 FP32 steps, 8 BF16 bases). Each step's loads and q unpacks wait for the previous step through zk (else LICM hoists the
+// unpacks out of the group loop and ptxas merges pass 2's loads into pass 1's). Pass 1: max|z| (am) and q . base (qp, two chains a row).
 template <int KS, class Pos, bool Shared>
 __device__ __forceinline__ void quant_p1(const uint32_t (&q)[2][16], const uint8_t *&km, int &zk, float (&am)[2], float (&qp)[2][2]) {
   km += zk;
@@ -127,10 +118,8 @@ __device__ __forceinline__ void quantize(const uint32_t (&q)[2][16], const uint8
 }
 
 // ---- QK -------------------------------------------------------------------------------------------------------
-// A half group (64 tokens, kt: its K rows; ko = k_lane_off): acc[n] = n-tile n, c0 c1 row g, c2 c3 row g + 8, MAGIC +
-// the score.  Two row blocks at a time (four independent IMMA chains); a pair's maxima go into mx (biased integers are
-// monotonic) and gate the next pair's loads (else all 16 ldmatrix start at once: 82 against 62 live registers).  RED:
-// the quad's reduction of mx.
+// A half group (64 tokens, kt: its K rows; ko = k_lane_off): acc[n] = n-tile n, c0 c1 row g, c2 c3 row g + 8, MAGIC + the score. Two row blocks at a time (four independent IMMA
+// chains); a pair's maxima go into mx (biased integers are monotonic) and gate the next pair's loads (else all 16 ldmatrix start at once). RED: the quad's reduction of mx.
 template <bool RED>
 __device__ __forceinline__ void qk_half(uint32_t (&acc)[8][4], const uint32_t (&qa)[4][4], uint32_t kt, uint32_t ko, uint32_t (&mx)[2]) {
   unroll<2>([&](auto gi) {
@@ -280,8 +269,9 @@ __device__ __forceinline__ void pv_group(float (&o)[16][4], const uint32_t (&pa)
     step(cb);
   });
 }
-// One closed group for the warp's rows (kt, vt: the slot's K and V; vm = VM + 16 t; on[r]: the group is row r's), the
-// next group's q-hat (kmn = its KM + 48 t) under the PV: qa, sq, qb in this group's, out the next one's.
+// One closed group (128 tokens, one P block) for the warp's rows (kt, vt: the slot's K and V; vm = VM + 16 t; on[r]: the group is row r's), the next group's q-hat (kmn = its
+// KM + 48 t) under the PV: qa, sq, qb in this group's, out the next one's. q-hat is the format's (z = q step exact, r = fl(127 / max|z|), q-hat = rint(z r), sq = max|z| sl / 127,
+// qb = sl q . base); QK by s8 x u8 mma, one maximum, P = rint(255 2^(s - m)) in bytes, PV by u8 x u8 mma, the fold o += w (step X + base sum P) in FP32; accumulators carry MAGIC.
 template <class Pos>
 __device__ __forceinline__ void closed_group(float (&o)[16][4], float (&m)[2], float (&l)[2], const uint32_t (&q)[2][16], float sl,
                                              const uint8_t *kmn, const uint8_t *vm, uint32_t kt, uint32_t vt, uint32_t ko, uint32_t vo,
@@ -315,10 +305,8 @@ __device__ __forceinline__ void closed_group(float (&o)[16][4], float (&m)[2], f
 }
 
 // ---- BF16 blocks (the sink, the rows' own group): 64 tokens a P block -------------------------------------------------
-// K at kx, V at kx + KT, [64 tokens][256 B], chunk c of row r at c ^ (r & 7).  s[j][e]: row g + 8 (e >> 1), token
-// 8 j + 2 t + (e & 1).  P = 255 2^(s - mb) rounded to BF16, not to an integer: the sink's block carries the row's
-// largest weight, and integer P rounds the block's other tokens to 0 / 1 of it (3x the error against exact attention,
-// Qwen3-0.6B).
+// K at kx, V at kx + KT, [64 tokens][256 B], chunk c of row r at c ^ (r & 7). s[j][e]: row g + 8 (e >> 1), token 8 j + 2 t + (e & 1). P = 255 2^(s - mb) rounded to BF16,
+// not to an integer: the sink's block carries the row's largest weight, and integer P rounds the block's other tokens to 0 / 1 of it.
 __host__ __device__ constexpr uint32_t bf_off(int row, int chunk) { return row * 256 + ((chunk ^ (row & 7)) << 4); }
 
 // P in place of s (tokens > tlim[r] masked, tlim < 0: none), the block's maximum mb and sum sp

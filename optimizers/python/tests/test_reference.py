@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""CUDA mlops_adamw_qat vs the PyTorch reference (mlops/optim/reference.py), one step at a time from a
-shared state: both copies of the state step once, every array is compared, then the CUDA state goes on.
-FMA is float64-emulated in the reference, so a last-bit difference may flip a stochastic rounding: the
-test wants >= 99.9% of every byte array identical and all u within one Q3.12 quantum.
-
-    python tests/test_reference.py          (with mlops-optimizers and nvfp4effma installed)
-"""
+"""CUDA mlops_adamw_qat vs the PyTorch reference (mlops/optim/reference.py), one step at a time from a shared state: both copies step once, every array
+is compared, then the CUDA state goes on. FMA is float64-emulated in the reference, so a last-bit difference may flip a stochastic rounding: the test wants
+>= 99.9% of every byte array identical and all u within one Q3.12 quantum. Run: python tests/test_reference.py (with mlops-optimizers and nvfp4effma installed)"""
 import sys
 
 import nvfp4effma

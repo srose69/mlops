@@ -209,10 +209,9 @@ def test_append_matches_encode(mode):
 
 @pytest.mark.parametrize("mode", ["3+3", "4+2"])
 def test_prefill_matches_model(mode):
-    """Chunked prefill from an empty cache: every position's output against the model of the path that ran.
-    Tensor cores (the cache carries images): fbla_reference.prefill_p128 (P blocks of 128 tokens in the closed
-    groups, BF16 P in the BF16 ones).  DP4A: append + decode of that position with every block refined.  Within
-    BF16 output rounding; and the cache the prefill leaves against encode's."""
+    """Chunked prefill from an empty cache: every position's output against the model of the path that ran, within BF16 output rounding; the cache left against
+    encode's. Tensor cores (the cache carries images): fbla_reference.prefill_p128 (P blocks of 128 tokens in the closed groups, BF16 P in the BF16 ones).
+    DP4A: append + decode of that position with every block refined."""
     from mlops.attention import append, decode, empty, encode, prefill
     from mlops.attention.fbla_reference import prefill_p128
     _, k, v = _case(900, seed=11)

@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// Warp-level instructions of the tensor-core prefill: ldmatrix, integer mma, barriers (sm_75+); BF16 mma, cp.async
-// (sm_80+).  A wrapper an architecture lacks is not declared in its device pass.
-//
-// Fragments (PTX ISA, mma.m16n8k32 / m16n8k16), g = lane / 4, t = lane % 4:
-//   s8 / u8 m16n8k32  A0 (row g, k 4t ..), A1 (row g + 8), A2 / A3 at k 16 + 4t; B0 (k 4t .., col g), B1 (k 16 + 4t);
-//                     C c0, c1 (row g, cols 2t, 2t + 1), c2, c3 (row g + 8).  sm_75: four m8n8k16 on the same registers.
-//   bf16 m16n8k16     A0 (row g, k 2t, 2t + 1), A1 (row g + 8), A2 / A3 at k 8 + 2t; B0 (k 2t, col g), B1 (k 8 + 2t)
-// mma accumulate in place, or start from c in all four accumulators (_c).  ldmatrix carries a memory clobber, the
-// barrier wrappers are compiler fences.
+// Warp-level instructions of the tensor-core prefill: ldmatrix, integer mma, barriers (sm_75+); BF16 mma, cp.async (sm_80+). A wrapper an architecture lacks is not
+// declared in its device pass. ldmatrix carries a memory clobber, the barrier wrappers are compiler fences; fragments are described beside the mma wrappers.
 #ifndef MLOPS_FBLA_TENSORS_MMA_CUH
 #define MLOPS_FBLA_TENSORS_MMA_CUH
 
@@ -74,6 +67,8 @@ template <int OFF = 0> __device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4
       : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1))
 #define TC_IMMA_C(AT) { d[0] = d[1] = d[2] = d[3] = c; TC_IMMA(AT); }  // (no early-clobber output: nvcc 12.0)
 #endif
+// Fragments (PTX ISA, mma.m16n8k32), g = lane / 4, t = lane % 4: A0 (row g, k 4t ..), A1 (row g + 8), A2 / A3 at k 16 + 4t; B0 (k 4t .., col g), B1 (k 16 + 4t); C c0, c1 (row g,
+// cols 2t, 2t + 1), c2, c3 (row g + 8). sm_75: four m8n8k16 on the same registers. The mma accumulate in place, or start from c in all four accumulators (_c).
 __device__ __forceinline__ void mma_s8u8(uint32_t (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) { TC_IMMA("s8"); }
 __device__ __forceinline__ void mma_u8u8(uint32_t (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) { TC_IMMA("u8"); }
 __device__ __forceinline__ void mma_s8u8_c(uint32_t (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1, uint32_t c) {
@@ -121,6 +116,7 @@ __host__ __device__ __forceinline__ uint32_t ready_id(uint32_t w, uint32_t j) {
 #endif  // MLOPS_FBLA_TC75
 
 #ifdef MLOPS_FBLA_TC80
+// bf16 m16n8k16: A0 (row g, k 2t, 2t + 1), A1 (row g + 8), A2 / A3 at k 8 + 2t; B0 (k 2t, col g), B1 (k 8 + 2t)
 __device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
   asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
       "{%0, %1, %2, %3};"

@@ -1,31 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Text generation end to end: a dense decoder (Qwen3, Qwen2, Llama) written out over the mlops ops.
-
-    python 04_generate.py MODEL_DIR [--prompt TEXT] [--file DOC ...] [--mode 4+2] [--tokens 256]
-                          [--nvfp4 mlp|all|none] [--attn fbla|sdpa] [--temperature 0] [--chunk 2048]
-
-No transformers model: the weights come from the safetensors files, the layers are below.  Per layer
-
-  x -> RMSNorm -> QKV (one GEMM) -> q / k RMSNorm (Qwen3) -> RoPE (mlops.positional, in place)
-    -> attention: prefill(q, k, v, cache) for the prompt, chunk by chunk; append + decode per new token
-    -> O projection -> + x -> RMSNorm -> gate / up (one GEMM) -> SiLU * -> down -> + x
-
-The KV cache is FBLA's compressed one (mlops.attention): 6.25 bits per element.  It is allocated once for
-prompt + new tokens, and the BF16 K / V never stay in memory.  Linear layers run on NVFP4EffMA: NVFP4 weights,
-int8 activations by DP4A beyond 2 rows (prefill), the exact ones below (decode).  A BF16 checkpoint is quantized
-at load time by `--nvfp4`: `mlp` only the MLP weights, `all` every projection and the LM head, `none` nothing
-(PyTorch matmuls).  An NVFP4 checkpoint from ModelOpt (e.g. nvidia/Qwen3-8B-NVFP4) is used as it is (its
-input_scale / k_scale / v_scale are not: activations stay int8 / exact, the cache is FBLA), and `--nvfp4 all`
-also quantizes its BF16 LM head (on Qwen3-8B: +0.047 loss, so keep it BF16 when it fits).
-
-Memory: the embedding table stays in host memory (a lookup moves only its rows); the KV cache is allocated
-first, then as many layers as fit beside it go to the GPU and the rest, spread evenly through the depth, are
-streamed from pinned host memory with their copies running ahead of the compute.  Qwen3-8B-NVFP4 runs on an 8 GB GTX 1080 with a desktop on it.  `--attn sdpa` swaps the attention
-for PyTorch SDPA over a dense BF16 cache, as the baseline.
-
-The tokenizer (and its chat template) is the model's, loaded through transformers' AutoTokenizer.
-"""
+"""Text generation end to end: a dense decoder (Qwen3, Qwen2, Llama) over the mlops ops, weights from the safetensors files, tokenizer via AutoTokenizer. Run: python 04_generate.py
+MODEL_DIR [--prompt TEXT] [--file DOC ...] [--mode 4+2] [--tokens 256] [--nvfp4 mlp|all|none] [--attn fbla|sdpa] [--temperature 0] [--chunk 2048]. Per layer: x -> RMSNorm -> QKV (one GEMM)
+-> q / k RMSNorm (Qwen3) -> RoPE (in place) -> attention (prefill for the prompt, chunk by chunk; append + decode per token) -> O projection -> + x -> RMSNorm -> gate / up -> SiLU * -> down -> + x"""
 import argparse
 import collections
 import json
@@ -42,6 +19,9 @@ from mlops.attention import append, decode, empty, prefill
 from mlops.positional import RoPE
 
 
+# KV cache: FBLA's compressed one (mlops.attention), allocated once for prompt + new tokens, BF16 K / V never stay in memory. Linear layers run on NVFP4EffMA: NVFP4 weights, int8
+# activations by DP4A beyond 2 rows (prefill), the exact ones below (decode). A BF16 checkpoint is quantized at load time by `--nvfp4` (`mlp`: MLP weights only, `all`: every projection
+# and the LM head, `none`: PyTorch matmuls); a ModelOpt NVFP4 checkpoint is used as it is (its input_scale / k_scale / v_scale are not), `--nvfp4 all` also quantizes its BF16 LM head
 def load_weights(path):
     """Every tensor of the checkpoint (one file or an index of shards), by name, in host memory; floating-point
     weights as BF16 (NVFP4 data, block scales and FP32 global factors as they are)."""
@@ -101,8 +81,7 @@ def rms_norm(x, w, eps):
 
 class Decoder:
     LINEARS = ("qkv", "o", "gate_up", "down")
-    NBUF = 3  # streamed layers on the GPU at a time: the one computing and two copies ahead (keeps the copy
-    #           engine busy; with two, the copies hid about 85 % behind compute, with three 96 %)
+    NBUF = 3  # streamed layers on the GPU at a time: the one computing and two copies ahead (keeps the copy engine busy)
 
     def __init__(self, path, nvfp4="mlp", attn="fbla", mode="4+2"):
         cfg = json.load(open(os.path.join(path, "config.json")))
@@ -142,11 +121,9 @@ class Decoder:
         self.graphs = None  # the decode step's CUDA graphs (step())
 
     def place(self, capacity, chunk, gpu_layers=None, tc=None):
-        """The KV cache first, then as many layers' weights on the GPU as fit beside it and the activations of a
-        prefill chunk; the rest in pinned host memory, streamed in per forward pass (NBUF - 1 layers ahead).  Can be
-        called again (another capacity): the cache is replaced and the layers re-placed.  tc ("exact" / "int8"):
-        the resident NVFP4 layers also get tensor-core images (nvfp4effma.TCWeight, as large as the weights; not in the
-        budget) and run on the tensor-core GEMV / GEMM, W4A16 or W4A8."""
+        """The KV cache first, then as many layers' weights on the GPU as fit beside it and the activations of a prefill chunk; the rest in pinned host memory,
+        streamed in per forward pass (NBUF - 1 layers ahead); the embedding table stays in host memory (a lookup moves only its rows). Can be called again (another
+        capacity). tc ("exact" / "int8"): resident NVFP4 layers also get tensor-core images (nvfp4effma.TCWeight, as large as the weights; not in the budget)."""
         self.cache, self.streamed, self.graphs, self.gout = None, [], None, None  # (graphs: the weights' old places)
         for L in self.layers:
             for n in self.LINEARS:
@@ -162,11 +139,9 @@ class Decoder:
         budget = torch.cuda.mem_get_info()[0] - reserve
         resident = n if n * b <= budget else max(0, min(n, (budget - self.NBUF * b) // b))  # + copy buffers
         resident = resident if gpu_layers is None else min(resident, gpu_layers)
-        # Streaming plan.  A layer's copy takes c = b / (host -> GPU bandwidth); the Z streamed layers cost Z c of
-        # copying per pass, the bound of a pass when it exceeds the compute.  Spread evenly, a copy runs while the
-        # resident layers before its layer compute and the copy engine never waits for a slot: a pass takes
-        # max(compute, Z c).  Packed together, the copies of a block could only overlap each other's (short)
-        # compute and a pass would take about compute + (Z - NBUF + 1) c.
+        # Streaming plan. A layer's copy takes c = b / (host -> GPU bandwidth); the Z streamed layers cost Z c of copying per pass, the bound when it exceeds the
+        # compute. Spread evenly, a copy runs while the resident layers before its layer compute and the copy engine never waits for a slot: a pass takes max(compute, Z c);
+        # packed together, the copies of a block could only overlap each other's (short) compute: about compute + (Z - NBUF + 1) c.
         streamed = {int((k + 0.5) * n / (n - resident)) for k in range(n - resident)} if resident < n else set()
         self.plan = dict(layer_mb=b / 2**20, bandwidth=self.bandwidth() if streamed else 0.0)
         self.plan["copy_ms"] = len(streamed) * b / self.plan["bandwidth"] * 1e3 if streamed else 0.0
@@ -281,17 +256,15 @@ class Decoder:
         return self.lm_head(rms_norm(x[-1:], self.norm, self.eps))[0].float()
 
     # ---- decode step on CUDA graphs --------------------------------------------------------------------------
-    # A token's pass is some 46 kernels a layer; launched one by one from Python they take longer than they run.
-    # Everything but the attention is position-free given the position as a device tensor (RoPE reads it), so a
-    # step replays one graph per span between attentions -- layer 0's attention inputs, then the rest of layer i - 1
-    # with layer i's attention inputs, then the last layer's rest and the LM head -- and runs FBLA's append / decode
-    # (their launches depend on the cache's length) between them.  Captured on the first step after place(); the
-    # inputs live in static buffers (the token's embedding staged through pinned memory, no synchronization).
+    # Launched one by one from Python, a token's kernels take longer than they run. Everything but the attention is position-free given the position as a device tensor (RoPE
+    # reads it), so a step replays one graph per span between attentions (layer 0's attention inputs; the rest of layer i - 1 with layer i's; the last layer's rest and the LM head).
 
     def graphable(self):
         return self.attn == "fbla" and not self.streamed and self.rope.kind not in ("dynamic", "longrope")
 
     def capture(self):
+        # captured on the first step after place(); FBLA's append / decode (launches depend on the cache's length) run between the graphs; the inputs live in static
+        # buffers (the token's embedding staged through pinned memory, no synchronization)
         n, dev = len(self.layers), "cuda"
         self.gx = torch.zeros(1, self.H, device=dev, dtype=torch.bfloat16)        # the residual stream
         self.go = torch.zeros(1, self.Hq * self.D, device=dev, dtype=torch.bfloat16)  # an attention's output

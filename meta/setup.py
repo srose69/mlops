@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""The meta distribution "mlops": no code of its own, it depends on every mlops package.
-
-    pip install --no-index -f <directory with the wheels> mlops        (or ../setup.sh all)
-
-It must not contain an mlops/__init__.py: mlops is a namespace package the others share (mlops.optim, ...).
-"""
+"""The meta distribution "mlops": no code of its own, it depends on every mlops package (``pip install --no-index -f <wheels directory> mlops``, or ../setup.sh all).
+It must not contain an mlops/__init__.py: mlops is a namespace package the others share (mlops.optim, ...)."""
 import os
 import sys
 
@@ -15,8 +11,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "build"))
 import torch_ext  # noqa: E402
 
-VERSION = "0.7.0"
-PACKAGES = ["mlops-optimizers~=0.2.0", "mlops-positional~=0.1.0", "mlops-attention~=0.4.0", "mlops-vocab~=0.1.0", "mlops-norm~=0.1.0"]  # one entry per package, at the minor version this release was made with
+VERSION = "0.8.0"
+PACKAGES = ["mlops-optimizers~=0.3.0", "mlops-positional~=0.1.0", "mlops-attention~=0.4.0", "mlops-vocab~=0.1.0", "mlops-norm~=0.1.0"]  # one entry per package, at the minor version this release was made with
 
 setup(
     name="mlops",

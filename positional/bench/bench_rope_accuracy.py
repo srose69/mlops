@@ -1,36 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Accuracy of RoPE at long positions (128K .. 10M): transformers, torchtune and mlops.positional against the exact
-rotation (float64 angles from the exact frequencies, float64 products).
-
-The script stands alone: it computes transformers' and torchtune's results with their own arithmetic, written out
-here, so it needs neither library and runs at any position (torchtune caches cos / sin for every position up to
-max_seq_len: 5 GB at 10M). When the libraries are installed, it first checks that these copies give their bits:
-transformers' LlamaRotaryEmbedding + apply_rotary_pos_emb at every position measured, torchtune's
-RotaryPositionalEmbeddings up to TORCHTUNE_CHECK_MAX (default 1M) positions.
-
-* transformers   angle = float32(position) * float32(inv_freq), cos / sin in FP32, rounded to the dtype, then
-                 q * cos + rotate_half(q) * sin in the dtype (half-split pairs). inv_freq as computed on the CPU (a
-                 model built there and moved); a rotary module built on a CUDA device gets it from the GPU's powf,
-                 one float32 ulp off for some frequencies -- the same error class
-* torchtune      the same FP32 angle, cos / sin in FP32 (its cache, built on the CPU), the rotation in FP32,
-                 rounded to the dtype once (interleaved pairs)
-* mlops          the phase reduced exactly in turns, sincospi, FP32 rotation, rounded once (both pair layouts)
-
-Errors per pair, relative to the pair's magnitude: RMS and maximum over 64 consecutive positions from each start x
-8 heads x 64 pairs; head_dim 128, base 500000 (Llama 3). The first column is the floor: the exact result rounded
-once to the dtype.
-
-With --scaling the frequencies are those of a context-extension recipe (configurations of released models):
-yarn (Qwen2.5 / DeepSeek style, factor 4 from 32K), llama3 (Llama 3.1, factor 8 from 8K), linear (factor 4),
-dynamic (NTK, factor 4 from 32K: the base grows with the position, in float32 on the GPU), longrope (Phi-3 style per-frequency factors,
-from 4K). transformers computes their frequencies in float32 (on the CPU for the static ones, on the GPU for
-dynamic and LongRoPE, which it recomputes in the forward) and multiplies cos / sin by the attention factor in
-float32; the exact reference uses float64 frequencies. torchtune is measured without scaling only.
-
-    python bench/bench_rope_accuracy.py [--scaling default|yarn|llama3|linear|dynamic|longrope|all] [--base B]
-"""
+"""Accuracy of RoPE at long positions (128K .. 10M): transformers, torchtune and mlops.positional against the exact rotation (float64 angles
+from the exact frequencies, float64 products). Stands alone: transformers' and torchtune's arithmetic is written out here, so no library is needed
+and any position runs (torchtune caches cos / sin for every position up to max_seq_len). Run: python bench/bench_rope_accuracy.py [--scaling KIND|all] [--base B]"""
 import argparse
 import os
 
@@ -38,6 +11,9 @@ import torch
 
 from mlops.positional import RoPE, rope_frequencies
 
+# --scaling selects the frequencies of a context-extension recipe (configurations of released models): yarn (Qwen2.5 / DeepSeek style, factor 4
+# from 32K), llama3 (Llama 3.1, factor 8 from 8K), linear (factor 4), dynamic (NTK, factor 4 from 32K: the base grows with the position, in
+# float32 on the GPU), longrope (Phi-3 style per-frequency factors, from 4K); torchtune is measured without scaling only
 SCALINGS = {
     "default": None,
     "yarn": {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768},
@@ -60,6 +36,8 @@ def label(p):
 
 
 # ---- the three implementations ----------------------------------------------------------------------------
+# transformers: angle = float32(position) * float32(inv_freq) (inv_freq as computed on the CPU; a module built on CUDA gets it from the GPU's
+# powf), cos / sin in FP32 rounded to the dtype, then q * cos + rotate_half(q) * sin in the dtype (half-split pairs)
 def inv_freq_fp32(dim, base):  # transformers and torchtune: float32 arithmetic
     return 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(dtype=torch.float) / dim))
 
@@ -76,8 +54,8 @@ def transformers_like(q, pos, inv32, att=1.0):
 
 
 def torchtune_like(q, pos, inv32):
-    """RotaryPositionalEmbeddings.forward with input_pos, interleaved pairs. Its cache is built at construction, on
-    the CPU for a module built there and moved (as here), and indexed by the positions."""
+    """RotaryPositionalEmbeddings.forward with input_pos, interleaved pairs: the same FP32 angle, cos / sin in FP32 from its cache (built at
+    construction, on the CPU for a module built there and moved, as here; indexed by the positions), the rotation in FP32, rounded once."""
     idx_theta = torch.einsum("i, j -> ij", pos.cpu().float(), inv32).float()
     cache = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1).to(q.device)  # [S, D/2, 2]
     xs = q.float().reshape(*q.shape[:-1], -1, 2)
@@ -101,7 +79,8 @@ def exact(q, pos, inv64, interleaved, att=1.0):
 
 
 def pair_errors(y, q, pos, inv64, interleaved, att=1.0):
-    """(RMS, max) of |y - exact| / |att * pair| over all pairs."""
+    """(RMS, max) of |y - exact| / |att * pair| over all pairs: N = 64 consecutive positions from each start x 8 heads x 64 pairs
+    (head_dim 128, base 500000: Llama 3). mlops: the phase reduced exactly in turns, sincospi, FP32 rotation, rounded once."""
     x1, x2, r1, r2 = exact(q, pos, inv64, interleaved, att)
     yd = y.double()
     if interleaved:
@@ -133,9 +112,9 @@ def hf_config(D, base, scaling):
 
 
 def hf_frequencies(D, base, scaling, seq_len):
-    """transformers' float32 inverse frequencies and attention factor for a forward at positions < seq_len: its
-    own functions where installed (on the CPU for the static recipes, on the GPU for dynamic and LongRoPE, which it
-    recomputes in the forward), else float32 of the float64 ones."""
+    """transformers' float32 inverse frequencies and attention factor for a forward at positions < seq_len: its own functions where installed
+    (CPU for the static recipes, GPU for dynamic and LongRoPE, which it recomputes in the forward; cos / sin times the attention factor in
+    float32), else float32 of the float64 ones. The exact reference uses float64 frequencies."""
     kind = (scaling or {}).get("rope_type", "default")
     try:
         from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
@@ -161,6 +140,8 @@ def hf_frequencies(D, base, scaling, seq_len):
 
 
 # ---- the copies against the libraries ----------------------------------------------------------------------
+# when the libraries are installed, checks that these copies give their bits: transformers' LlamaRotaryEmbedding + apply_rotary_pos_emb at
+# every position measured, torchtune's RotaryPositionalEmbeddings up to TORCHTUNE_CHECK_MAX (default 1M) positions
 def check_against_libraries(D, base, inv32, scaling):
     q = torch.randn(1, N, H, D, device=dev).to(torch.bfloat16)
     try:

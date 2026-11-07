@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 // The C API: the LM head for one token (the variants of the shape, as data) and greedy sampling of its logits on a stream.
-//
-//   nvcc -std=c++17 03_c_api.cu -I ../include -L ../out -lmlops_vocab -o c_api && ./c_api
-//   (after `make lib` in vocab/, or with the release's C archive)
+// Build: nvcc -std=c++17 03_c_api.cu -I ../include -L ../out -lmlops_vocab -o c_api && ./c_api (after `make lib` in vocab/ or
+// with the release's C archive)
 #include <cstdio>
 #include <cstdlib>
 #include <vector>

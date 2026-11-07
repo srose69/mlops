@@ -1,15 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Build of mlops-optimizers (import mlops.optim): AdamW and the NVFP4 AdamW-QAT for PyTorch.
-
-    pip install ./optimizers/python --no-build-isolation        (from the mlops root; or ./setup.sh optimizers)
-
-Needs, installed beforehand (nothing is downloaded):
-  * PyTorch;
-  * nvfp4effma 0.4+ (its headers; at run time its NVFP4 tensors and GEMM);
-  * e5m2effma 0.2+ only to build for GPUs below sm_89 (headers only, not needed at run time).
-Architectures and the other variables: ../../build/torch_ext.py.
-"""
+"""Build of mlops-optimizers (import mlops.optim): ``pip install ./optimizers/python --no-build-isolation`` (from the mlops root; or ./setup.sh optimizers).
+Needs, installed beforehand (nothing is downloaded): PyTorch; nvfp4effma 0.4+ (its headers; at run time its NVFP4 tensors and GEMM); e5m2effma 0.2+ only
+to build for GPUs below sm_89 (headers only). Architectures and the other variables: ../../build/torch_ext.py."""
 import os
 import sys
 

@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 // The C API: rotate q and k ([B, S, H, D], BF16) from positions, then back (the backward), on a stream.
-//
-//   nvcc -std=c++17 06_c_api.cu -I ../include -L ../out -lmlops_positional -o c_api && ./c_api
-//   (after `make lib` in positional/, or with the release's C archive)
+// Build: nvcc -std=c++17 06_c_api.cu -I ../include -L ../out -lmlops_positional -o c_api && ./c_api (after `make lib` in
+// positional/ or with the release's C archive)
 #include <cstdio>
 #include <cmath>
 #include <vector>

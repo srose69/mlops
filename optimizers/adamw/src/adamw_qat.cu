@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// mlops_adamw_qat host side (include/mlops_adamw_qat.h): argument checks, the per-step constants, state
-// layout, initialization from a quantized weight and the scale commit. The step kernel instances are in
-// adamw_qat_inst.cu (adamw_qat_kernels.cuh); mlops_adamw_qat_init, which quantizes with NVFP4EffMA, is in
-// adamw_qat_init.cu so that only programs calling it link NVFP4EffMA.
+// mlops_adamw_qat host side (include/mlops_adamw_qat.h): argument checks, the per-step constants, state layout, initialization from a
+// quantized weight and the scale commit. Step kernel instances: adamw_qat_inst.cu (adamw_qat_kernels.cuh); mlops_adamw_qat_init, which
+// quantizes with NVFP4EffMA, is in adamw_qat_init.cu so that only programs calling it link NVFP4EffMA.
 #include "adamw_qat_kernels.cuh"
 #include <algorithm>
 
@@ -41,12 +40,9 @@ __global__ void qat_commit_scales(Lattice L, Hyper h, const uint8_t *__restrict_
   if (blk < L.rows * L.nb && votes(h, blk)) L.scale[L.sidx(blk / L.nb, blk % L.nb)] = next[blk];
 }
 
-// Headroom: amax scaling puts the tensor's largest block scale at the top of the scale format, where it
-// could never grow. Init moves the global up by 2^kHead and every block byte down by 8 * kHead codes (one
-// binade = 8 codes in both formats, exact for normals), so values are unchanged and every block can grow
-// 2^kHead. E4M3 (2^-9 .. 448) affords 2^3; UE5M3's 31 binades (2^-17 .. 114688) afford 2^8 -- the room
-// Graphcore's UE5M3 recipe gets from a tensor scale refreshed only every 50 steps -- while keeping 23
-// binades below the largest block.
+// Headroom: amax scaling puts the tensor's largest block scale at the top of the scale format, where it could never grow. Init moves the
+// global up by 2^kHead and every block byte down by 8 * kHead codes (one binade = 8 codes in both formats, exact for normals): values are
+// unchanged and every block can grow 2^kHead. E4M3 (2^-9 .. 448) affords 2^3; UE5M3's 31 binades (2^-17 .. 114688) afford 2^8.
 template <bool UE> constexpr int kHead = UE ? 8 : 3;
 
 template <bool UE>

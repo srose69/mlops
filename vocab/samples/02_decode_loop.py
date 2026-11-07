@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 """A sampling loop with no host values: the head's statistics feed the sampler, the seed and the step live on the device.
-
-    python 02_decode_loop.py
-"""
+Run: python 02_decode_loop.py"""
 import torch
 
 from mlops.vocab import Sampler, lm_head

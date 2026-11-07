@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""mlops.positional RoPE: against transformers (bit for bit with its tables, forward and backward; frequencies of
-every scaling; a patched Llama model), against a float64 reference (positions, any layout, partial rotary,
-interleaved pairs, large positions), autograd, argument checks.
-
-    pytest tests/test_rope.py          (with mlops-positional installed; transformers for the comparisons with it)
-"""
+"""mlops.positional RoPE: against transformers (bit for bit with its tables, forward and backward; frequencies of every scaling; a patched
+Llama model), against a float64 reference (positions, any layout, partial rotary, interleaved pairs, large positions), autograd, argument checks.
+Run: pytest tests/test_rope.py (mlops-positional installed; transformers for the comparisons with it)"""
 import math
 
 import pytest
@@ -82,7 +79,7 @@ def rand(shape, dtype, seed, scale=1.0):
 @pytest.mark.parametrize("kind", ["default", "yarn", "llama3"])
 def test_hf_apply_rotary_pos_emb_bitwise(dtype, unsqueeze_dim, kind):
     cfg = hf_config(kind, head_dim=128, theta=500000.0)
-    rot = modeling_llama.LlamaRotaryEmbedding(cfg, device=DEV)
+    rot = modeling_llama.LlamaRotaryEmbedding(cfg).to(DEV)
     B, S, Hq, Hk, D = 2, 77, 8, 2, 128
     pos = torch.arange(S, device=DEV)[None].expand(B, S) + torch.tensor([[0], [1000]], device=DEV)
     x = torch.empty(1, device=DEV, dtype=dtype)
@@ -106,7 +103,7 @@ def test_frequencies_match_transformers(kind):
     cfg = hf_config(kind)
     seq_len = 8192 if kind in ("dynamic", "longrope") else None
     if kind == "default":
-        inv_hf, att_hf = modeling_llama.LlamaRotaryEmbedding.compute_default_rope_parameters(cfg, "cpu")
+        inv_hf, att_hf = modeling_llama.LlamaRotaryEmbedding.compute_default_rope_parameters(cfg)  # (on the CPU: transformers 5.20 takes no device)
     else:
         inv_hf, att_hf = ROPE_INIT_FUNCTIONS[cfg.rope_parameters["rope_type"]](cfg, "cpu", seq_len=seq_len)
     inv, att = rope_frequencies(64, 10000.0, cfg.rope_parameters, max_position_embeddings=cfg.max_position_embeddings,
@@ -124,7 +121,7 @@ def test_rope_from_hf_against_transformers(dtype, kind):
     the FP32 angle and cos / sin to the dtype), and within an ulp of it."""
     cfg = hf_config(kind, head_dim=64, theta=10000.0)
     rope = RoPE.from_hf(cfg)
-    rot = modeling_llama.LlamaRotaryEmbedding(cfg, device=DEV)
+    rot = modeling_llama.LlamaRotaryEmbedding(cfg).to(DEV)
     B, S = 2, 300
     pos = torch.arange(S, device=DEV)[None].expand(B, S) * 13 + 3  # up to ~4000
     q, k = rand((B, 4, S, 64), dtype, 5), rand((B, 2, S, 64), dtype, 6)
@@ -200,7 +197,7 @@ def test_positions_forms_and_inplace():
 
 
 def test_large_positions_exact():
-    """positions near 2^31: the phase is reduced exactly (transformers' FP32 angle would be off by up to ~100 rad)."""
+    """positions near 2^31: the phase is reduced exactly (transformers' FP32 angle would be off by many radians)."""
     rope = RoPE(64, 10000.0)
     q = rand((1, 16, 4, 64), torch.float32, 12)
     pos = torch.arange(16, device=DEV, dtype=torch.int64)[None] + (2 ** 31 - 100)

@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""mlops.vocab against PyTorch: embed (the rows, xw, the partial sums of squares, invalid ids), the head (every variant
-against a float64 matmul, statistics against the logits, the norm scalar), the sampler (greedy against argmax with the
-lowest index, determinism, the step counter, filters, the head's statistics giving the same tokens).
-
-    pytest tests/test_vocab.py          (with mlops-vocab installed)
-"""
+"""mlops.vocab against PyTorch: embed (rows, xw, partial sums of squares, invalid ids), the head (every variant against a float64 matmul,
+statistics against the logits, the norm scalar), the sampler (greedy against argmax with the lowest index, determinism, step counter, filters,
+the head's statistics giving the same tokens). Run: pytest tests/test_vocab.py (with mlops-vocab installed)"""
 import pytest
 import torch
 
@@ -50,13 +47,20 @@ def test_head(hidden, n):
     vocab = 5003
     w, x = bf16(vocab, hidden, scale=0.05, seed=4), bf16(n, hidden, scale=3.0, seed=5)
     ref = x.double() @ w.double().T
-    for variant in range(len(lm_head_variants(vocab, hidden, n))):
-        h = lm_head(w, x, variant=variant, want_stats=True)
-        mag = (x.double().abs() @ w.double().abs().T)
+    mag = x.double().abs() @ w.double().abs().T
+    smem_max = torch.cuda.get_device_properties(DEV).shared_memory_per_block_optin
+    for variant, v in enumerate(lm_head_variants(vocab, hidden, n)):
+        nb, smem, x_staged = v[3], v[7], v[10]
+        # the statistics' counts (NB x 1 KiB) that do not fit beside a staged x: the call is refused, as documented; the logits alone run
+        stats = not (x_staged and smem + nb * 256 * 4 > smem_max)
+        if not stats:
+            with pytest.raises(ValueError, match="stats_hist"):
+                lm_head(w, x, variant=variant, want_stats=True)
+        h = lm_head(w, x, variant=variant, want_stats=stats)
         assert ((h.logits.double() - ref).abs() <= (hidden / 16 + 8) * 2.0 ** -23 * mag + 1e-30).all()
-        # the statistics: each element's maximum, and the best of them is the row's
-        best = h.stats_max.max(1)
-        assert torch.equal(best.values, h.logits.max(1).values)
+        if stats:  # each element's maximum, and the best of them is the row's
+            best = h.stats_max.max(1)
+            assert torch.equal(best.values, h.logits.max(1).values)
 
 
 def test_head_norm_scalar_and_scale():

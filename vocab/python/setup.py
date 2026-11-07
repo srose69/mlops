@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 """Build of mlops-vocab (import mlops.vocab): embedding rows, the LM head and token sampling for PyTorch.
-
-    pip install ./vocab/python --no-build-isolation        (from the mlops root; or ./setup.sh vocab)
-
-Needs only PyTorch and the CUDA toolkit. Architectures and the other variables: ../../build/torch_ext.py.
-"""
+``pip install ./vocab/python --no-build-isolation`` (from the mlops root; or ./setup.sh vocab); needs only PyTorch and the CUDA
+toolkit. Architectures and the other variables: ../../build/torch_ext.py."""
 import os
 import sys
 

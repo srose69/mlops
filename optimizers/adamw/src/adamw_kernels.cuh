@@ -10,10 +10,9 @@ namespace mlops_adamw_detail {
 
 struct AdamArgs { float lr, omb1, omb2, rbc1, rbc2, eps, lr_wd, gscale; };
 
-// One element, in the documented order (include/mlops_adamw.h); p, m, v updated in place.
-// __f*_rn / __fmaf_rn / __fsqrt_rn pin IEEE round-to-nearest regardless of -use_fast_math, which
-// would otherwise swap the division and sqrt for fast approximations and break the header's
-// bit-reproducibility claim.
+// One element, in the documented order (include/mlops_adamw.h); p, m, v updated in place. __f*_rn / __fmaf_rn / __fsqrt_rn pin IEEE
+// round-to-nearest regardless of -use_fast_math, which would swap the division and sqrt for fast approximations and break the
+// header's bit-reproducibility claim.
 __device__ __forceinline__ void adam_elem(const AdamArgs &a, float g, float &p, float &m, float &v) {
   g = __fmul_rn(g, a.gscale);
   m = __fmaf_rn(a.omb1, g - m, m);

@@ -1,22 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// The LM head element on tensor cores, n <= 8 columns (include/mlops_lm_head.h). W is the A operand of
-// mma.m16n8k16 (BF16 in, FP32 out, sm_80+) or, converted to FP16 in registers, of mma.m16n8k8 (sm_75+) or of
-// mma.m8n8k4 (sm_70+); x the B operand, the columns the n dimension. KIND: 0, 1, 2 in that order. A warp takes a unit of 16 rows
-// over its k-range; thread (g, c) = (lane / 4, lane % 4) loads rows g and g + 8, J 16-byte pieces each of one
-// contiguous 8 J-element chunk of a 32 J-element block, and the matching pieces of x for column g. The sum over
-// k does not depend on how k is numbered inside a mma, so the chunk order only has to be the same for W and x:
-// every load is a whole 16-byte piece and a row's 4 lanes read 64 J contiguous bytes.
+// The LM head element on tensor cores, n <= 8 columns (include/mlops_lm_head.h). W is the A operand of mma.m16n8k16 (BF16 in, FP32 out, sm_80+)
+// or, converted to FP16 in registers, of mma.m16n8k8 (sm_75+) or of mma.m8n8k4 (sm_70+); x the B operand, the columns the n dimension.
+// KIND: 0, 1, 2 in that order.
 #pragma once
 #include "lm_head.cuh"
 
 namespace mlops_vocab_detail {
 
+// A warp takes a unit of 16 rows over its k-range; thread (g, c) = (lane / 4, lane % 4) loads rows g and g + 8, J 16-byte pieces each of one
+// contiguous 8 J-element chunk of a 32 J-element block, and the matching pieces of x for column g. The sum over k does not depend on how k is
+// numbered inside a mma, so the chunk order only has to be the same for W and x; a row's 4 lanes read 64 J contiguous bytes.
 constexpr int kMmaPhaseUnits = 4;  // units of 16 rows per phase
 
 template <int S> struct MmaSmem {
   float part[S][8][16 * kMmaPhaseUnits];
-  unsigned hist[8][256];
   float max[S][8];
   int arg[S][8];
   float scale[8];
@@ -59,14 +57,15 @@ __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1
 #endif
 }
 
-// One phase: the rows [r0, r0 + 16 kMmaPhaseUnits) over the warp's blocks [b0, b1) of 32 J elements, the loads of a
-// step (rows g and g + 8, x of column g, J pieces each) issued D steps ahead in a register ring. KIND 1: the pieces
-// are converted to FP16 and multiplied in four mma.m16n8k8 (a piece holds four pairs of k); KIND 0: two m16n8k16.
-template <int S, int J, int D, int KIND>
-__device__ __forceinline__ void head_phase_mma(const HeadOp &op, int r0, int hi, int b0, int b1, int warp, int lane, MmaSmem<S> &sm) {
+// One phase: the rows [r0, r0 + 16 kMmaPhaseUnits) over the warp's blocks [b0, b1) of 32 J elements, the loads of a step (rows g and g + 8, J pieces
+// each; without XS also the pieces of x of column g) issued D steps ahead in a register ring; with XS the pieces of x come from shared memory (xs) when
+// the step is consumed. KIND 1: the pieces are converted to FP16, four mma.m16n8k8 (a piece holds four pairs of k); KIND 0: two m16n8k16.
+template <int S, int J, int D, int KIND, bool XS>
+__device__ __forceinline__ void head_phase_mma(const HeadOp &op, int r0, int hi, int b0, int b1, int warp, int lane, MmaSmem<S> &sm,
+                                               const uint16_t *xs) {
   const int g = lane >> 2, c = lane & 3;
   const int nb = b1 - b0, units = min(kMmaPhaseUnits, (hi - r0 + 15) / 16), total = units * nb;
-  uint4 wa[D][J], wb[D][J], xb[D][J];
+  uint4 wa[D][J], wb[D][J], xb[D][XS ? 1 : J];
   int iu = 0, ip = 0;
   const int col = min(g, op.n - 1);
   auto issue = [&](int d) {
@@ -77,7 +76,7 @@ __device__ __forceinline__ void head_phase_mma(const HeadOp &op, int r0, int hi,
     for (int j = 0; j < J; ++j) {
       wa[d][j] = __ldcs(reinterpret_cast<const uint4 *>(op.w + rowa * op.hidden + k + 8 * j));
       wb[d][j] = __ldcs(reinterpret_cast<const uint4 *>(op.w + rowb * op.hidden + k + 8 * j));
-      xb[d][j] = __ldcg(reinterpret_cast<const uint4 *>(op.x + (size_t)col * op.hidden + k + 8 * j));
+      if constexpr (!XS) xb[d][j] = __ldcg(reinterpret_cast<const uint4 *>(op.x + (size_t)col * op.hidden + k + 8 * j));
     }
     if (++ip == nb) { ip = 0; ++iu; }
   };
@@ -93,14 +92,17 @@ __device__ __forceinline__ void head_phase_mma(const HeadOp &op, int r0, int hi,
       if (t + d >= total) break;  // warp-uniform
 #pragma unroll
       for (int j = 0; j < J; ++j) {
+        uint4 xv;
+        if constexpr (XS) xv = *reinterpret_cast<const uint4 *>(xs + (size_t)col * op.hidden + (size_t)(b0 + pi) * 32 * J + (size_t)c * 8 * J + 8 * j);
+        else xv = xb[d][j];
         if constexpr (KIND == 1) {
-          mma_f16_k8(acc, bf16x2_to_f16x2(wa[d][j].x), bf16x2_to_f16x2(wb[d][j].x), bf16x2_to_f16x2(xb[d][j].x));
-          mma_f16_k8(acc, bf16x2_to_f16x2(wa[d][j].y), bf16x2_to_f16x2(wb[d][j].y), bf16x2_to_f16x2(xb[d][j].y));
-          mma_f16_k8(acc, bf16x2_to_f16x2(wa[d][j].z), bf16x2_to_f16x2(wb[d][j].z), bf16x2_to_f16x2(xb[d][j].z));
-          mma_f16_k8(acc, bf16x2_to_f16x2(wa[d][j].w), bf16x2_to_f16x2(wb[d][j].w), bf16x2_to_f16x2(xb[d][j].w));
+          mma_f16_k8(acc, bf16x2_to_f16x2(wa[d][j].x), bf16x2_to_f16x2(wb[d][j].x), bf16x2_to_f16x2(xv.x));
+          mma_f16_k8(acc, bf16x2_to_f16x2(wa[d][j].y), bf16x2_to_f16x2(wb[d][j].y), bf16x2_to_f16x2(xv.y));
+          mma_f16_k8(acc, bf16x2_to_f16x2(wa[d][j].z), bf16x2_to_f16x2(wb[d][j].z), bf16x2_to_f16x2(xv.z));
+          mma_f16_k8(acc, bf16x2_to_f16x2(wa[d][j].w), bf16x2_to_f16x2(wb[d][j].w), bf16x2_to_f16x2(xv.w));
         } else {
-          mma_bf16(acc, wa[d][j].x, wb[d][j].x, wa[d][j].y, wb[d][j].y, xb[d][j].x, xb[d][j].y);
-          mma_bf16(acc, wa[d][j].z, wb[d][j].z, wa[d][j].w, wb[d][j].w, xb[d][j].z, xb[d][j].w);
+          mma_bf16(acc, wa[d][j].x, wb[d][j].x, wa[d][j].y, wb[d][j].y, xv.x, xv.y);
+          mma_bf16(acc, wa[d][j].z, wb[d][j].z, wa[d][j].w, wb[d][j].w, xv.z, xv.w);
         }
       }
       if (t + d + D < total) issue(d);
@@ -119,12 +121,13 @@ __device__ __forceinline__ void head_phase_mma(const HeadOp &op, int r0, int hi,
 
 // The Volta phase: units of 32 rows (four groups of 8), blocks of 8 J elements; lane (q, r) holds row 8 q + r of the
 // unit and column r of x, and one 16-byte piece of each is two mma.m8n8k4.
-template <int S, int J, int D>
-__device__ __forceinline__ void head_phase_884(const HeadOp &op, int r0, int hi, int b0, int b1, int warp, int lane, MmaSmem<S> &sm) {
+template <int S, int J, int D, bool XS>
+__device__ __forceinline__ void head_phase_884(const HeadOp &op, int r0, int hi, int b0, int b1, int warp, int lane, MmaSmem<S> &sm,
+                                               const uint16_t *xs) {
   constexpr int PU = 2;  // units of 32 rows per phase (the phase is 64 rows, as the others)
   const int q = (lane & 15) >> 2, half = lane >> 4, r = (lane & 3) + 4 * half;
   const int nb = b1 - b0, units = min(PU, (hi - r0 + 31) / 32), total = units * nb;
-  uint4 wr[D][J], xr[D][J];
+  uint4 wr[D][J], xr[D][XS ? 1 : J];
   int iu = 0, ip = 0;
   const int col = min(r, op.n - 1);
   auto issue = [&](int d) {
@@ -133,7 +136,7 @@ __device__ __forceinline__ void head_phase_884(const HeadOp &op, int r0, int hi,
 #pragma unroll
     for (int j = 0; j < J; ++j) {
       wr[d][j] = __ldcs(reinterpret_cast<const uint4 *>(op.w + rowc * op.hidden + k + 8 * j));
-      xr[d][j] = __ldcg(reinterpret_cast<const uint4 *>(op.x + (size_t)col * op.hidden + k + 8 * j));
+      if constexpr (!XS) xr[d][j] = __ldcg(reinterpret_cast<const uint4 *>(op.x + (size_t)col * op.hidden + k + 8 * j));
     }
     if (++ip == nb) { ip = 0; ++iu; }
   };
@@ -151,8 +154,11 @@ __device__ __forceinline__ void head_phase_884(const HeadOp &op, int r0, int hi,
       if (t + d >= total) break;  // warp-uniform
 #pragma unroll
       for (int j = 0; j < J; ++j) {
-        mma_f16_884(acc, bf16x2_to_f16x2(wr[d][j].x), bf16x2_to_f16x2(wr[d][j].y), bf16x2_to_f16x2(xr[d][j].x), bf16x2_to_f16x2(xr[d][j].y));
-        mma_f16_884(acc, bf16x2_to_f16x2(wr[d][j].z), bf16x2_to_f16x2(wr[d][j].w), bf16x2_to_f16x2(xr[d][j].z), bf16x2_to_f16x2(xr[d][j].w));
+        uint4 xv;
+        if constexpr (XS) xv = *reinterpret_cast<const uint4 *>(xs + (size_t)col * op.hidden + (size_t)(b0 + pi) * 8 * J + 8 * j);
+        else xv = xr[d][j];
+        mma_f16_884(acc, bf16x2_to_f16x2(wr[d][j].x), bf16x2_to_f16x2(wr[d][j].y), bf16x2_to_f16x2(xv.x), bf16x2_to_f16x2(xv.y));
+        mma_f16_884(acc, bf16x2_to_f16x2(wr[d][j].z), bf16x2_to_f16x2(wr[d][j].w), bf16x2_to_f16x2(xv.z), bf16x2_to_f16x2(xv.w));
       }
       if (t + d + D < total) issue(d);
       if (++pi == nb) {
@@ -170,17 +176,21 @@ __device__ __forceinline__ void head_phase_884(const HeadOp &op, int r0, int hi,
 
 // Element `item` of op.items on a CTA of S warps: the rows of units [item U / items, (item + 1) U / items),
 // U = ceil(vocab / UR), UR = 16 (32 on Volta's shape). The S partial sums of an (row, column) are added in warp order and scaled.
-template <int S, int J, int D, int KIND>
-__device__ __forceinline__ void head_item_mma(const HeadOp &op, int item, unsigned tid, MmaSmem<S> &sm) {
+template <int S, int J, int D, int KIND, bool XS>
+__device__ __forceinline__ void head_item_mma(const HeadOp &op, int item, unsigned tid, void *smem) {
   constexpr int UR = KIND == 2 ? 32 : 16, BLK = KIND == 2 ? 8 * J : 32 * J;  // rows of a unit, elements of a block
   constexpr int PR = 16 * kMmaPhaseUnits, RS = 32 * S / 8;                    // rows of a phase; threads per column in the combine
+  MmaSmem<S> &sm = *reinterpret_cast<MmaSmem<S> *>(smem);
+  uint16_t *xs = reinterpret_cast<uint16_t *>(static_cast<char *>(smem) + smem_x_offset(sizeof(MmaSmem<S>)));
+  unsigned *hist = reinterpret_cast<unsigned *>(reinterpret_cast<char *>(xs) + (XS ? smem_x_bytes(op.n, op.hidden) : 0));
   const int warp = tid >> 5, lane = tid & 31;
   const long long units = (op.vocab + UR - 1) / UR;
   const int lo = (int)(item * units / op.items) * UR, hi = min((int)(((item + 1) * units / op.items) * UR), op.vocab);
   const int blocks = op.hidden / BLK, b0 = warp * blocks / S, b1 = (warp + 1) * blocks / S;
 
+  if constexpr (XS) stage_x(op, xs, tid, 32 * S);
   if (op.hist)
-    for (unsigned i = tid; i < 8 * 256; i += 32 * S) (&sm.hist[0][0])[i] = 0u;
+    for (unsigned i = tid; i < 8 * 256; i += 32 * S) hist[i] = 0u;
   if (warp == 0) {
 #pragma unroll
     for (int c = 0; c < 8; ++c) {
@@ -195,8 +205,8 @@ __device__ __forceinline__ void head_item_mma(const HeadOp &op, int item, unsign
   float best = __int_as_float(0xff800000);
   int arg = 0x7fffffff;
   for (int r0 = lo; r0 < hi; r0 += PR) {
-    if constexpr (KIND == 2) head_phase_884<S, J, D>(op, r0, hi, b0, b1, warp, lane, sm);
-    else head_phase_mma<S, J, D, KIND>(op, r0, hi, b0, b1, warp, lane, sm);
+    if constexpr (KIND == 2) head_phase_884<S, J, D, XS>(op, r0, hi, b0, b1, warp, lane, sm, xs);
+    else head_phase_mma<S, J, D, KIND, XS>(op, r0, hi, b0, b1, warp, lane, sm, xs);
     __syncthreads();
     if (c_me < op.n)
       for (int rr = r_me; rr < PR; rr += RS) {
@@ -207,14 +217,14 @@ __device__ __forceinline__ void head_item_mma(const HeadOp &op, int item, unsign
         for (int w = 1; w < S; ++w) sum = __fadd_rn(sum, sm.part[w][c_me][rr]);
         const float l = __fmul_rn(__fmul_rn(sum, sm.scale[c_me]), op.logit_scale);
         if (op.logits) __stcg(op.logits + (size_t)c_me * op.vocab + row, l);  // read by other SMs: L2 only, not L1
-        if (op.hist) atomicAdd(&sm.hist[c_me][key_byte(l)], 1u);
+        if (op.hist) atomicAdd(&hist[c_me * 256 + key_byte(l)], 1u);
         if (l > best) { best = l; arg = row; }  // ascending rows: the first of equals
       }
     __syncthreads();
   }
   if (op.hist)
     for (unsigned i = tid; i < 8 * 256; i += 32 * S)
-      if (i / 256 < (unsigned)op.n) __stcg(op.hist + ((size_t)(i / 256) * op.items + item) * 256 + i % 256, (&sm.hist[0][0])[i]);
+      if (i / 256 < (unsigned)op.n) __stcg(op.hist + ((size_t)(i / 256) * op.items + item) * 256 + i % 256, hist[i]);
   if (op.stats_max) {
 #pragma unroll
     for (int c = 0; c < 8; ++c) {

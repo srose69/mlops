@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Low-level API: the kernels without torch.optim, and the bit-identical PyTorch reference.
-
-    python 07_low_level.py
-
-Use this when you manage the training loop / state yourself (custom layers, another framework on top),
-or to read and modify the algorithm in PyTorch (mlops.optim.reference).
-"""
+"""Low-level API: the kernels without torch.optim, and the bit-identical PyTorch reference. Run: python 07_low_level.py
+Use this to manage the training loop / state yourself (custom layers, another framework on top), or to read and modify the algorithm in PyTorch (mlops.optim.reference)."""
 import torch
 
 from mlops.optim import functional, reference

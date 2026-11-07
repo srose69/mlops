@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// FBLA prefill, sm_61+: `count` new tokens are appended and the query at position p attends to tokens 0 .. p,
-// closed groups through their 6-bit codes, the sink and own group in BF16.  Launches:
-//
-//   close_kernel     quantizes the groups the chunk closes into records and metadata, one CTA per (group, head)
-//   attention        sm_75 .. sm_89: transcode_kernel + prefill_tc_kernel (tensors/); else stream_kernel (DP4A)
-//   finish_kernel    the sink and open group's BF16 tokens, after the attention has read the old ones
+// FBLA prefill, sm_61+: `count` new tokens are appended and the query at position p attends to tokens 0 .. p, closed groups through their 6-bit codes, the sink and own
+// group in BF16. Launches: close_kernel (quantizes the groups the chunk closes into records and metadata, one CTA per (group, head)); attention (sm_75 .. sm_89:
+// transcode_kernel + prefill_tc_kernel in tensors/, else stream_kernel on DP4A); finish_kernel (the sink and open group's BF16 tokens, after the attention has read the old ones).
 #ifndef MLOPS_FBLA_PREFILL_CUH
 #define MLOPS_FBLA_PREFILL_CUH
 
@@ -128,7 +125,7 @@ __device__ __forceinline__ void close_group(const PrefillArgs &a, int n0, int g,
 // The item of close_kernel: the Pos::x()'th group the chunk closes, of head Pos::y() (a CTA past them returns)
 template <int CB, int FB, class Pos = Grid>
 __device__ __forceinline__ void close_item(const PrefillArgs &a, uint8_t (&code)[2][G][D]) {
-  const int n0 = n0_of<Pos>(a), g = (n0 == 0 ? 0 : (n0 - 1) / G) + Pos::x();
+  const int n0 = n0_of<Pos>(a, Pos::y()), g = (n0 == 0 ? 0 : (n0 - 1) / G) + Pos::x();
   if (g >= (n0 + count_of<Pos>(a) - 1) / G) return;  // (CTA-uniform)
   close_group<CB, FB, D, Pos>(a, n0, g, Pos::y(), code);
 }
@@ -145,7 +142,7 @@ void launch_finish(const PrefillArgs &a, int heads, cudaStream_t stream);
 // The item of finish_kernel: head Pos::x()'s sink and open group take the chunk's tokens
 template <class Pos = Grid>
 __device__ __forceinline__ void finish_item(const PrefillArgs &a) {
-  const int bh = Pos::x(), n0 = n0_of<Pos>(a), n1 = n0 + count_of<Pos>(a), gl = (n1 - 1) / G;
+  const int bh = Pos::x(), n0 = n0_of<Pos>(a, bh), n1 = n0 + count_of<Pos>(a), gl = (n1 - 1) / G;
   const bool fresh = n0 == 0 || (n0 - 1) / G != gl;  // the open group is a new one
   const size_t eh = (size_t)bh * G * D, ih = (size_t)bh * a.count * D;
 #pragma unroll
@@ -168,9 +165,8 @@ void launch_finish(const PrefillArgs &a, int heads, cudaStream_t stream) { finis
 #endif
 
 // ---- attention: streaming GEMM tiles -------------------------------------------------------------------
-// PROWS = 8 x consumer warps rows per CTA: BF16 groups first, then closed groups newest first, online softmax.
-// Producer warps decode records into swizzled shared tiles (a ring of half-group stages); consumers compute.
-// They meet at named barriers (stage full / empty) only.
+// PROWS = 8 x consumer warps rows per CTA: BF16 groups first, then closed groups newest first, online softmax. Producer warps decode records into swizzled
+// shared tiles (a ring of half-group stages); consumers compute; they meet at named barriers (stage full / empty) only.
 
 // Kd[64 tokens][32 words]: word = 4 channels; quad q of a token at q ^ ((token / 4) % 8).
 // Vd[16 token words][128 ch]: word = 4 tokens; quad q at q ^ ((q / 8) % 2).  Every fragment is one LDS.128.
@@ -382,6 +378,10 @@ __device__ __forceinline__ uint32_t p_quad(const float (&s)[4], float mb, float 
 __device__ __forceinline__ size_t qrow_of(const PrefillArgs &a, int bh, int r) {  // row -> its q / out index
   const int bb = bh / a.kv_heads, kh = bh - bb * a.kv_heads, i = r / a.qg;
   return (size_t)(bb * a.q_heads + kh * a.qg + (r - i * a.qg)) * a.count + i;
+}
+__device__ __forceinline__ size_t orow_of(const PrefillArgs &a, int bh, int r) {  // row -> its out element offset
+  const int bb = bh / a.kv_heads, kh = bh - bb * a.kv_heads, i = r / a.qg;
+  return (size_t)(bb * a.q_heads + kh * a.qg + (r - i * a.qg)) * a.out_hs + (size_t)i * a.out_ts;
 }
 
 // The attention (see above).
@@ -695,12 +695,12 @@ __device__ __forceinline__ void stream_item(const PrefillArgs &a, StreamSmem<War
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     if (!valid[i]) continue;
-    const size_t qr = qrow_of(a, bh, r0 + rr + i);
+    const size_t qr = orow_of(a, bh, r0 + rr + i);
     const float inv = 1.f / lt[i];
     uint32_t w[4];
 #pragma unroll
     for (int c = 0; c < 4; ++c) w[c] = to_bf16(o[i][2 * c] * inv) | (uint32_t)to_bf16(o[i][2 * c + 1] * inv) << 16;
-    reinterpret_cast<uint4 *>(a.out + qr * D)[b] = make_uint4(w[0], w[1], w[2], w[3]);
+    reinterpret_cast<uint4 *>(a.out + qr)[b] = make_uint4(w[0], w[1], w[2], w[3]);
   }
 }
 template <int CB, int FB>

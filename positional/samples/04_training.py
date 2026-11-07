@@ -1,22 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Training with RoPE: a 3-layer transformer learns to sort. A sequence is 24 numbers (0..63, with repeats), a
-separator, then the same numbers in ascending order; the model writes the sorted half token by token. Every output
-token needs the rank of each input among the others and the position reached so far in the output, so it takes
-several attention layers and positions (RoPE). Chance is 1/64 per token.
-
-RoPE is differentiable (its backward is the inverse rotation, the same kernel) and works on the strided q / k
-views of one packed qkv projection. mlops-optimizers' samples/08_transformer_training.py trains the same model with
-NVFP4 weights.
-
-    python 04_training.py          (40 s on a GTX 1080: 98 % of the tokens, two thirds of the sequences sorted)
-"""
+"""Training with RoPE: a 3-layer transformer learns to sort (24 numbers 0..63 with repeats, a separator, then them ascending; chance 1/64 a token).
+RoPE is differentiable (backward: the inverse rotation, the same kernel) and works on the strided q / k views of one packed qkv projection;
+mlops-optimizers' samples/08_transformer_training.py trains the same model with NVFP4 weights. Run: python 04_training.py"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from mlops.positional import RoPE
 
+# the model writes the sorted half token by token; each output token needs the rank of each input among the others and the position
+# reached so far in the output, so it takes several attention layers and positions (RoPE)
 N, NUMS = 24, 64                                   # sort 24 numbers from 0..63; token 64 separates
 VOCAB, DIM, HEADS, KV_HEADS, LAYERS, STEPS = NUMS + 1, 256, 8, 2, 3, 2000
 

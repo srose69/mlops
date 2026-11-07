@@ -1,16 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""PyTorch reference of mlops_adamw_qat (include/mlops_adamw_qat.h, adamw/src/adamw_qat_kernels.cuh).
-
-It steps the same objects the CUDA kernel steps -- an ``nvfp4effma.NVFP4Tensor`` (rowwise, 1x16 blocks,
-E4M3 or UE5M3 scales, linear or swizzled, amax or decode global) and the uint8 state buffer of
-``mlops.optim.functional.QATState`` -- in the same arithmetic order, with the same stochastic-rounding stream, so the
-two can be swapped on one state. FMA is emulated in float64 (a rare double rounding differs in the last
-bit). Readable rather than fast: one tensor per quantity, the kernel's per-thread loops written out.
-
-    st = mlops.optim.functional.QATState(w)
-    reference.step(st.weight, st.state, grad, lr=1e-3, step=1)   # instead of st.step(grad, lr=1e-3, step=1)
-"""
+"""PyTorch reference of mlops_adamw_qat (include/mlops_adamw_qat.h, adamw/src/adamw_qat_kernels.cuh): steps the same objects the CUDA kernel steps (an
+``nvfp4effma.NVFP4Tensor`` and the uint8 state buffer of ``QATState``) in the same arithmetic order and stochastic-rounding stream, so the two swap on one
+state. FMA is emulated in float64 (a rare double rounding differs in the last bit). Use: ``reference.step(st.weight, st.state, grad, lr=1e-3, step=1)``."""
 import math
 from typing import Tuple
 

@@ -48,20 +48,17 @@ def norm(x: torch.Tensor, weight: Optional[torch.Tensor] = None, bias: Optional[
          global_scale: Optional[torch.Tensor] = None, y_dtype: Optional[torch.dtype] = None, variant: int = 0, items: int = 0) -> NormOut:
     """RMSNorm (``kind="rms"``) or LayerNorm (``"layer"``) of the rows of x [rows, hidden] (bfloat16 / float16 / float32,
     hidden a multiple of 256 * groups), after ``v = round(x + residual)``; groups normalize hidden / groups values each.
-
-    ``weight`` / ``bias`` are [hidden] in y's dtype (``y_dtype``: the weight's, else x's); ``one_plus``: ``1 + weight``
-    (Gemma, Qwen3-Next, LayerNorm1P); no weight: none. ``order="hf"`` (Llama, Qwen: ``round(round(v r) w)``, an RMSNorm
-    with a plain weight, no bias and no gate) or ``"fp32"`` (one rounding at the end: Gemma, LayerNorm, biases, gates);
-    the default is ``"hf"`` for exactly that RMSNorm and ``"fp32"`` otherwise.
-    ``gate`` [rows, hidden] in x's dtype multiplies y by silu(gate) (``gate_mode="after"``) or v before the norm (``"before"``).
-
-    ``quant="int8"``: y as int8 with a float32 scale per 16 values (amax / 127); ``quant="nvfp4"``: E2M1 nibbles with an E4M3
-    scale per 16 values and ``global_scale`` (float32, one element, the decode factor; default 1) -- what NVFP4EffMA's
-    ``nvfp4a_quantize`` makes of y. ``variant`` indexes ``norm_variants``."""
+    ``variant`` indexes ``norm_variants``; the other arguments are described beside their use."""
+    # quant="int8": y as int8 with a float32 scale per 16 values (amax / 127); quant="nvfp4": E2M1 nibbles with an E4M3 scale per 16
+    # values and global_scale (float32, one element, the decode factor; default 1) -- what NVFP4EffMA's nvfp4a_quantize makes of y
     if quant not in _OUT:
         raise ValueError(f"quant must be None, 'int8' or 'nvfp4', got {quant!r}")
+    # gate [rows, hidden] in x's dtype multiplies y by silu(gate) (gate_mode="after") or v before the norm ("before")
     if gate_mode not in ("after", "before"):
         raise ValueError(f"gate_mode must be 'after' or 'before', got {gate_mode!r}")
+    # weight / bias are [hidden] in y's dtype (y_dtype: the weight's, else x's); one_plus: 1 + weight (Gemma, Qwen3-Next, LayerNorm1P);
+    # no weight: none. order="hf" (Llama, Qwen: round(round(v r) w), an RMSNorm with a plain weight, no bias, no gate) or "fp32" (one rounding
+    # at the end: Gemma, LayerNorm, biases, gates); the default is "hf" for exactly that RMSNorm and "fp32" otherwise
     k, s, o = _flavor(kind, weight is not None, one_plus, bias is not None, order, gate is not None)
     yd = y_dtype or (weight.dtype if weight is not None else x.dtype)
     y, scales, new_res = _C.norm(x, residual, weight, bias, gate, eps, groups, k, s, o, _GATE[gate_mode] if gate is not None else 0, _OUT[quant],

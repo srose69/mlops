@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 """Put the kernel into a transformers model: the outputs stay bit for bit the same, RoPE gets faster.
-
-    python 02_transformers_model.py          (needs transformers)
-"""
+Run: python 02_transformers_model.py (needs transformers)"""
 import time
 
 import torch

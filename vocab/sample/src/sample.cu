@@ -190,7 +190,7 @@ extern "C" int mlops_sample_items(const mlops_sample_config *c, const float *log
     snprintf(it.entry, sizeof it.entry, "mlops_vocab_items::sample<%d, %s>", pass, final ? "true" : "false");
     snprintf(it.args_type, sizeof it.args_type, "mlops_vocab_detail::SampleOp");
     it.args_bytes = (int)sizeof(SampleOp);
-    memcpy(it.args.bytes, &plan->op, sizeof(SampleOp));
+    mlops_vocab_detail::put_args(it.args.bytes, plan->op);
     it.geom[0] = pass; it.geom[1] = c->vocab; it.geom[2] = stats != nullptr; it.geom[3] = stats ? stats->count : 0;
     it.geom[4] = c->temperature > 0.f; it.geom[5] = c->penalty != 1.f; it.geom[6] = final;
   }

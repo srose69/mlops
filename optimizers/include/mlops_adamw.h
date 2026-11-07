@@ -1,14 +1,9 @@
 /* SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
  * Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
- *
- * mlops/optimizers/adamw: decoupled-weight-decay Adam (Loshchilov & Hutter), CUDA C++.
- *
- * param/grad: BF16, FP16 or FP32; exp_avg/exp_avg_sq: always FP32. Stateless C call over raw
- * device pointers, explicit cudaStream_t, returns a status instead of throwing/aborting.
- *
- * All four buffers must be 16-byte aligned (true for cudaMalloc'd buffers; a sub-view must start
- * on a 16-byte boundary) -- 4 elements/thread through one 128-bit load/store, bandwidth-bound.
  */
+/* mlops/optimizers/adamw: decoupled-weight-decay Adam (Loshchilov & Hutter), CUDA C++. param/grad: BF16, FP16 or FP32; exp_avg/exp_avg_sq: always FP32.
+ * Stateless C call over raw device pointers, explicit cudaStream_t, returns a status instead of throwing/aborting. All four buffers must be 16-byte
+ * aligned (true for cudaMalloc'd buffers; a sub-view must start on a 16-byte boundary): 4 elements/thread through one 128-bit load/store. */
 #ifndef MLOPS_ADAMW_H
 #define MLOPS_ADAMW_H
 
@@ -33,16 +28,10 @@ typedef enum {
   MLOPS_ADAMW_CUDA_ERROR = 2
 } mlops_adamw_status;
 
-/* Elementwise over `count` values, in place. Per element, in FP32 (bit-reproducible; host
- * emulation in tests/test_adamw.cu):
- *   g = grad * grad_scale
- *   m = beta1 * m + (1 - beta1) * g;        v = beta2 * v + (1 - beta2) * (g * g)   (one FMA each)
- *   u = (m * rbc1) / (sqrt(v * rbc2) + eps)  with rbc = 1 / (1 - beta^step) (1 if no bias corr.)
- *   p = p - (lr * weight_decay) * p   (one FMA, skipped if weight_decay == 0)
- *   p = p - lr * u                    (one FMA)
- * The scalar factors (1 - beta, rbc, lr * weight_decay) are formed on the host in double and
- * rounded to FP32 once.
- */
+/* Elementwise over `count` values, in place. Per element, in FP32 (bit-reproducible; host emulation in tests/test_adamw.cu): g = grad * grad_scale;
+ * m = beta1 * m + (1 - beta1) * g, v = beta2 * v + (1 - beta2) * (g * g) (one FMA each); u = (m * rbc1) / (sqrt(v * rbc2) + eps), rbc = 1 / (1 - beta^step) (1 if no
+ * bias corr.); p = p - (lr * weight_decay) * p (one FMA, skipped if weight_decay == 0); p = p - lr * u (one FMA). */
+/* The scalar factors (1 - beta, rbc, lr * weight_decay) are formed on the host in double and rounded to FP32 once. */
 typedef struct {
   float lr, beta1, beta2, eps, weight_decay;
   int step;             /* 1-based step number */

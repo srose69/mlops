@@ -106,6 +106,13 @@ Both are regular `torch.optim.Optimizer`s: parameter groups, `lr` changes throug
   the block-scale moves, in null standard deviations, default 3) and `seed` (stochastic rounding; each
   parameter gets its own stream from its position in the optimizer). Its moments live in the layers'
   buffers, so a checkpoint needs `model.state_dict()`; `opt_qat.state_dict()` carries only step counts.
+* **`QATGroupedLinear(groups, in, out, weight=None, init_std=0.02, four_over_six=None, scale_dtype=None, grad_dtype=None)`**:
+  `groups` bias-free layers (the experts of a mixture of experts) stored as one stacked NVFP4 tensor `[groups * out, in]`, one amax
+  and one AdamWQAT state, otherwise a `QATLinear`. `forward(x, seg)`: `x` `[rows, in]` grouped by layer (`seg`: int32 `[groups + 1]` on
+  the device, layer `g` owning rows `seg[g]:seg[g + 1]`) in one launch of `nvfp4effma.grouped_linear` (`act` as for `QATLinear`; `"auto"` is
+  `"int8"`); the backward is exact group by group, two launches of `mlops_qat_grouped_dgrad` / `_wgrad` (FP32 grouped GEMMs on the dequantized weight and
+  the activations, `include/mlops_qat_grouped.h`). The row counts stay on the device in both directions. `QATLinear.dequantized(dtype)`
+  returns the weight as a dense tensor whose gradient goes to the NVFP4 weight, for computations that use it elementwise.
 * **`QATLinear(in, out, weight=None, init_std=0.02, four_over_six=None, scale_dtype=None, grad_dtype=None, act="exact")`**:
   bias-free linear layer, `in` a multiple of 64. The initial weight is quantized by `nvfp4effma.quantize`
   (1 × 16 blocks, amax global, optionally 4over6). `scale_dtype`: `"ue5m3"` (the default) or `"e4m3"`
@@ -126,11 +133,17 @@ Both are regular `torch.optim.Optimizer`s: parameter groups, `lr` changes throug
   leave the NVFP4 bytes alone). `layer.weight` is a `QATParameter`: a float32 `[out, in]` handle with 4 bytes
   of storage, for autograd and the optimizer only, never read as a weight.
 * **Gradients**: `grad_dtype=None` gives a float32 `weight.grad`. `torch.float8_e5m2` /
-  `torch.float8_e4m3fn` gives `weight.grad_fp8 = (FP8 bytes, grad_scale)` with amax scaling instead
-  (PyTorch does not allow an FP8 `.grad` on a float32 tensor). Several backwards before a step accumulate.
+  `torch.float8_e4m3fn` gives `weight.grad_fp8 = (FP8 bytes, grad_scale)` with amax scaling instead (the
+  scale is a float32 scalar tensor on the device: nothing is read back; PyTorch does not allow an FP8
+  `.grad` on a float32 tensor). Several backwards before a step accumulate.
   The backward computes the product in float32 and encodes it, so this saves optimizer traffic but no
   GEMM work. `AdamWQAT.zero_grad` clears both.
 * **`split_params(model)`**: (dense parameters, QAT parameters), each parameter once.
+* **CUDA graphs and `torch.compile`**: the forward and backward of `QATLinear` and `QATGroupedLinear` (every `act`, float32 and FP8
+  gradients) read nothing back to the host, so they can be captured in a CUDA graph and replayed with new inputs (and, for the grouped
+  layer, new row counts); `torch.compile` traces them without a graph break: the extension's calls are PyTorch operators
+  (`torch.ops.mlops_optim.*` here, `torch.ops.nvfp4effma.*` in NVFP4EffMA) with schemas and Meta kernels. The optimizers' `step` is
+  not part of the captured region: `lr`, `step` and the FP8 scale are host numbers there, so call it outside the graph.
 
 ## Low level: mlops.optim.functional
 

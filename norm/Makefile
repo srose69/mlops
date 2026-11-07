@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-# mlops-norm: normalization layers (layer/).
-#   make lib        libmlops_norm.a for $(ARCHS) (default: every architecture sm_50..sm_90; SASS only)
-#   make test       mlops_norm against a host emulation, the INT8 and NVFP4 outputs also against nvfp4a_quantize, and its
-#                   items through NVRTC (GPU $(GPU))
-#   make bench      the norms against a device-to-device copy of the same bytes
-#   make install    headers, static library and pkg-config file under PREFIX (default /usr/local)
-# Toolchain, architectures and parallelism: ../build/arch.mk. NVFP4EffMA's headers (the installed package, or ../NVFP4EffMA
+# mlops-norm: normalization layers (layer/); targets lib, test, bench, install (described beside each).
+# Toolchain, architectures and parallelism: ../build/arch.mk.  Needs NVFP4EffMA's headers (the installed package, ../NVFP4EffMA
 # or NVFP4EFFMA_DIR; the quantizer's primitives are imported from it) and the CUDA toolkit.
 MLOPS_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
 include $(MLOPS_ROOT)/build/arch.mk
@@ -36,6 +31,7 @@ $(eval $(call LIBRARY,$(OBJDIR),$(GENCODE) --threads $(NVCC_THREADS)))
 $(eval $(call LIBRARY,out/native,-arch=sm_$(TEST_ARCH)))
 out/libmlops_norm.a: $(OBJDIR)/libmlops_norm.a
 	cp $< $@
+# libmlops_norm.a for $(ARCHS) (default: every architecture sm_50..sm_90; SASS only)
 lib: out/libmlops_norm.a
 
 out/test_norm: layer/tests/test_norm.cu out/native/libmlops_norm.a
@@ -43,13 +39,16 @@ out/test_norm: layer/tests/test_norm.cu out/native/libmlops_norm.a
 out/test_items: layer/tests/test_items.cu $(LAYER_H) out/native/libmlops_norm.a
 	$(NVCC) $(FLAGS) -arch=sm_$(TEST_ARCH) -DNORM_INCLUDE='"$(CURDIR)/include"' -DNVFP4_INCLUDE='"$(NVFP4EFFMA_DIR)/include"' -DNVFP4_SRC='"$(NVFP4EFFMA_DIR)/src"' -DCUDA_INCLUDE='"$(CUDA_HOME)/include"' -o $@ $< out/native/libmlops_norm.a -lnvrtc -lcuda
 test-bin: out/test_norm out/test_items
+# mlops_norm against a host emulation, the INT8 and NVFP4 outputs also against nvfp4a_quantize, and its items through NVRTC (GPU $(GPU))
 test: out/test_norm out/test_items
 	$(RUN) ./out/test_norm
 	$(RUN) ./out/test_items
+# the norms against a device-to-device copy of the same bytes
 bench: out/test_norm
 	$(RUN) ./out/test_norm bench
 
 PREFIX ?= /usr/local
+# headers, static library and pkg-config file under PREFIX
 install: $(OBJDIR)/libmlops_norm.a
 	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib/pkgconfig
 	install -m 644 include/mlops_norm.h include/mlops_norm_layer.h include/mlops_norm_items.h $(DESTDIR)$(PREFIX)/include/

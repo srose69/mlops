@@ -1,21 +1,44 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. mlops; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// mlops_fbla_decode against a float64 host model of the format's definition (include/mlops_fbla.h): per
-// group q-hat = rint(z * fl(127 / max|z|)) (one rounding), z = q * step_K exact, sq = max|z| * fl(sl / 127), sl = fl(scale * log2 e),
-// per 16-token sub-block the coarse or the full code by
-// W_j = 2^(lse_j - R) > tau (lse_j and R from the coarse scores), p = round(255 * 2^(s - m_block)), and
-// o = sum_j 2^m_j sum_t p_t v_t / sum_j 2^m_j sum_t p_t.  Both layouts, GQA 1 / 2 / 4, contexts that exercise
-// every work decomposition and a partial open group.  The kernel's 2^x and log2 are MUFU approximations,
-// so a rounded p may differ by one: the bound is on the BF16 output.
+// mlops_fbla_decode against a float64 host model of the format's definition (include/mlops_fbla.h): per group q-hat = rint(z * fl(127 / max|z|)), z = q * step_K exact, sq = max|z| *
+// fl(sl / 127), sl = fl(scale * log2 e); per 16-token sub-block the coarse or the full code by W_j = 2^(lse_j - R) > tau (from the coarse scores), p = round(255 * 2^(s - m_block)),
+// o = sum_j 2^m_j sum_t p_t v_t / sum_j 2^m_j sum_t p_t. Both layouts, GQA 1 / 2 / 4, every work decomposition, a partial open group. MUFU 2^x / log2 may shift a rounded p by one: bound on BF16 output.
 #include "mlops_fbla.h"
+#include "mlops_fbla_items.h"
 #include "rope.cuh"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <random>
+#include <shared_mutex>
+#include <string>
+#include <thread>
 #include <vector>
+
+// Cases hold this shared while they run; one that captures a CUDA graph takes it exclusively (a device-wide synchronize is not
+// allowed while any stream captures).
+static std::shared_mutex gpu_lock;
+struct ExclusiveGpu {
+  ExclusiveGpu() { gpu_lock.unlock_shared(); gpu_lock.lock(); }
+  ~ExclusiveGpu() { gpu_lock.unlock(); gpu_lock.lock_shared(); }
+};
+
+// A case's report goes to its own buffer while the cases run on several threads, and is printed in the cases' order.
+static thread_local std::string *report_sink = nullptr;
+static void say(const char *fmt, ...) {
+  char text[1024];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(text, sizeof text, fmt, args);
+  va_end(args);
+  if (report_sink) *report_sink += text;
+  else fputs(text, stdout);
+}
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { \
   fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); exit(1); } } while (0)
@@ -146,11 +169,9 @@ struct Case {
       }
   }
 
-  // float64 model of the definition
-  // decode semantics at position P - 1 over its prefix of P tokens, queries qv [B, QH, D]
-  // pc / pe: tokens of a P block (its maximum and weight) in the closed / the BF16 groups: 16 in decode and the
-  // DP4A prefill, 128 / 64 in the tensor-core prefill.  fpe: the BF16 groups' P = 255 2^(s - mb) rounded to BF16
-  // (the tensor-core prefill), else rint (every block's of decode and DP4A)
+  // float64 model of the definition, decode semantics at position P - 1 over its prefix of P tokens, queries qv [B, QH, D]. pc / pe: tokens of a P block (its maximum and
+  // weight) in the closed / the BF16 groups: 16 in decode and the DP4A prefill, 128 / 64 in the tensor-core prefill. fpe: the BF16 groups' P = 255 2^(s - mb) rounded to
+  // BF16 (the tensor-core prefill), else rint (every block's of decode and DP4A)
   std::vector<double> reference_at(int P, const float *qv, int pc = S, int pe = S, bool fpe = false) const {
     const int groups = (P + G - 1) / G, nb = groups * 8, N = P;
     const size_t pad = (size_t)this->groups * G;
@@ -273,7 +294,7 @@ template <class T> static T *up(const std::vector<T> &h) {
 
 // Strided runs (cfg head_stride / group_stride): the cache is layer 1 of 3 whose groups lie side by side -- unit (head
 // h, group g) at (layer heads + h) + g (3 heads); the other layers' units hold random bytes.
-static bool g_strided = false;
+static thread_local bool g_strided = false;
 constexpr int kLayers = 3, kLayer = 1;
 static void set_strides(mlops_fbla_config &cfg, size_t heads) {
   cfg.head_stride = g_strided ? 1 : 0;
@@ -322,12 +343,12 @@ static int run(int cb, int fb, int B, int QH, int KH, int N, float tau, unsigned
   void *scratch; CK(cudaMalloc(&scratch, sz)); CK(cudaMemset(scratch, 0xFF, sz));  // no initial contents required
   mlops_fbla_cache cache{own(dc, uc, heads), own(df, uf, heads), own(dmeta, 512, heads), dsk, dsv, dok, dov};
   int f = 0;
+  std::vector<uint16_t> first;
   for (int rep = 0; rep < 2; ++rep) {  // twice: the result repeats bitwise on the used scratch
     if (mlops_fbla_decode(&cfg, dq, &cache, dout, scratch, sz, 0)) { fprintf(stderr, "%s\n", mlops_fbla_last_error()); exit(1); }
     CK(cudaDeviceSynchronize());
     std::vector<uint16_t> got(ref.size());
     CK(cudaMemcpy(got.data(), dout, got.size() * 2, cudaMemcpyDeviceToHost));
-    static std::vector<uint16_t> first;
     const bool same = rep == 0 || got == first;
     first = got;
     double worst = 0, rms = 0, nrm = 0;
@@ -337,7 +358,7 @@ static int run(int cb, int fb, int B, int QH, int KH, int N, float tau, unsigned
     }
     const double rel = sqrt(rms / nrm);
     const bool ok = rel < 4e-3 && worst < 2e-2 && same;
-    printf("[%s] %d+%d B=%d heads %d/%d N=%-6d capacity %-6d tau %-6g run %d%s: rel. RMS error %.2e, max abs %.2e%s\n",
+    say("[%s] %d+%d B=%d heads %d/%d N=%-6d capacity %-6d tau %-6g run %d%s: rel. RMS error %.2e, max abs %.2e%s\n",
            ok ? "PASS" : "FAIL", cb, fb, B, QH, KH, N, capacity, tau, rep, g_strided ? " (strided)" : "", rel, worst,
            same ? "" : ", differs from run 0");
     f += !ok;
@@ -347,12 +368,9 @@ static int run(int cb, int fb, int B, int QH, int KH, int N, float tau, unsigned
   return f;
 }
 
-// Prefill: an empty cache of capacity N filled by chunks; every chunk's queries (one per position and q head)
-// against the float64 model at their positions (a sample of them: the first and last of a chunk, around group
-// boundaries, and every 37th), then the records and metadata of every closed group against the host's
-// packing, bit for bit.  append_only: the chunks are appended with q = null, and the cache alone is checked.
-// the prefill runs on tensor cores (P blocks of 128 tokens in the closed groups, 64 in the BF16 ones) on sm_75 ..
-// sm_89, unless MLOPS_FBLA_DP4A=1
+// Prefill: an empty cache of capacity N filled by chunks; every chunk's queries (one per position and q head) against the float64 model at their positions (a sample: the first and
+// last of a chunk, around group boundaries, every 37th), then the records and metadata of every closed group against the host's packing, bit for bit. append_only: chunks are
+// appended with q = null, only the cache is checked. The prefill runs on tensor cores (P blocks of 128 tokens in closed groups, 64 in BF16 ones) on sm_75 .. sm_89 unless MLOPS_FBLA_DP4A=1
 static bool tc_prefill() {
   int dev = 0, major = 0, minor = 0;
   cudaGetDevice(&dev);
@@ -363,7 +381,7 @@ static bool tc_prefill() {
   return cc >= 75 && cc <= 89 && !(e && e[0] == '1');
 }
 
-static bool g_images = false;  // the cache carries the tensor-core prefill's persistent images (tc_images)
+static thread_local bool g_images = false;  // the cache carries the tensor-core prefill's persistent images (tc_images)
 static int run_prefill(int cb, int fb, int B, int QH, int KH, int N, unsigned seed, std::vector<int> chunks,
                        bool append_only = false) {
   const bool tc = tc_prefill();
@@ -446,24 +464,24 @@ static int run_prefill(int cb, int fb, int B, int QH, int KH, int N, unsigned se
     }
   const double rel = nrm2 > 0 ? sqrt(err2 / nrm2) : 0;
   const bool ok = bad == 0 && (append_only || (rel < 4e-3 && worst < 2e-2));
-  printf("[%s] prefill %d+%d B=%d heads %d/%d N=%-6d chunks %-3zu%s%s: ", ok ? "PASS" : "FAIL", cb, fb, B, QH, KH, N,
+  say("[%s] prefill %d+%d B=%d heads %d/%d N=%-6d chunks %-3zu%s%s: ", ok ? "PASS" : "FAIL", cb, fb, B, QH, KH, N,
          chunks.size(), append_only ? " (append only)" : g_images ? " (images)" : "", g_strided ? " (strided)" : "");
-  if (!append_only) printf("%ld positions, rel. RMS error %.2e, max abs %.2e; ", checked, rel, worst);
-  printf("closed groups' bytes differing: %ld\n", bad);
+  if (!append_only) say("%ld positions, rel. RMS error %.2e, max abs %.2e; ", checked, rel, worst);
+  say("closed groups' bytes differing: %ld\n", bad);
   f += !ok;
   for (void *x : {(void *)dc, (void *)df, (void *)dm, (void *)dsk, (void *)dsv, (void *)dok, (void *)dov, (void *)dimg}) cudaFree(x);
   return f;
 }
 
-// The prefill's chunks at the device length and count: n0 tokens prefilled into both caches, then the same chunks two
-// ways -- mlops_fbla_prefill per chunk on the host, and one CUDA graph of mlops_fbla_prefill_at calls with the length
-// and each chunk's count in device memory (no launch of either call depending on them) -- bit for bit, every chunk's
-// outputs and the caches.  The chunk buffers are the ceiling's size; the last chunk holds fewer tokens.
+// The prefill's chunks at the device length and count: n0 tokens prefilled into both caches, then the same chunks two ways -- mlops_fbla_prefill per chunk on the host, and one
+// CUDA graph of mlops_fbla_prefill_at calls with the length and each chunk's count in device memory -- bit for bit, every chunk's outputs and the caches. The chunk buffers are the
+// ceiling's size; the last chunk holds fewer tokens.
 __global__ void step_chunk(int *length, int *count, const int *counts, int i) {
   if (threadIdx.x == 0) { *count = counts[i + 1]; *length += counts[i]; }
 }
 static int run_prefill_at(int cb, int fb, int B, int QH, int KH, int n0, std::vector<int> counts, unsigned seed,
                           bool append_only = false) {
+  ExclusiveGpu exclusive;  // (captures a graph)
   const int max_count = *std::max_element(counts.begin(), counts.end());
   int total = 0;
   for (int c : counts) total += c;
@@ -568,7 +586,7 @@ static int run_prefill_at(int cb, int fb, int B, int QH, int KH, int n0, std::ve
   CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
   cudaGraph_t graph;
   cudaGraphExec_t exec;
-  CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+  CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed));  // (the calls' once-per-thread setup may fall inside)
   int bad_call = 0;
   for (int i = 0; i < n; ++i) {
     bad_call |= mlops_fbla_prefill_at(&cfg, dlen, dcount, max_count, append_only ? nullptr : dq[i], dk[i], dv[i],
@@ -609,7 +627,7 @@ static int run_prefill_at(int cb, int fb, int B, int QH, int KH, int n0, std::ve
     }
   }
   const bool ok = differ == 0 && bytes_differ == 0;
-  printf("[%s] prefill_at %d+%d B=%d heads %d/%d tokens %d..%d, %zu chunks (max %d)%s%s: chunk outputs differing %ld, cache elements differing %ld\n",
+  say("[%s] prefill_at %d+%d B=%d heads %d/%d tokens %d..%d, %zu chunks (max %d)%s%s: chunk outputs differing %ld, cache elements differing %ld\n",
          ok ? "PASS" : "FAIL", cb, fb, B, QH, KH, n0, n0 + total, counts.size(), max_count,
          append_only ? ", append only" : "", g_strided ? " (strided)" : "", differ, bytes_differ);
   cudaGraphExecDestroy(exec);
@@ -628,6 +646,7 @@ static int run_prefill_at(int cb, int fb, int B, int QH, int KH, int n0, std::ve
 // launches do not depend on the length) -- bit for bit, outputs and caches.
 __global__ void advance(int *length) { ++*length; }
 static int run_device_length(int cb, int fb, int B, int QH, int KH, int n0, int steps, float tau, unsigned seed) {
+  ExclusiveGpu exclusive;  // (captures a graph)
   const int cap = n0 + steps + 100;
   const size_t heads = (size_t)B * KH, cg = (cap + G - 1) / G;
   const size_t uc = 8u * 2 * cb * 256, uf = 8u * 2 * fb * 256;
@@ -668,7 +687,7 @@ static int run_device_length(int cb, int fb, int B, int QH, int KH, int n0, int 
   CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
   cudaGraph_t graph;
   cudaGraphExec_t exec;
-  CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+  CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeRelaxed));  // (the calls' once-per-thread setup may fall inside)
   int bad_call = mlops_fbla_append_at(&cfg, dlen, dk, dv, &cache[1].x, st);
   advance<<<1, 1, 0, st>>>(dlen);
   bad_call |= mlops_fbla_decode_at(&cfg, dlen, dq, &cache[1].x, out[1], scratch[1], sz, st);
@@ -710,7 +729,7 @@ static int run_device_length(int cb, int fb, int B, int QH, int KH, int n0, int 
   int length = 0;
   CK(cudaMemcpy(&length, dlen, 4, cudaMemcpyDeviceToHost));
   const bool ok = differ == 0 && bytes == 0 && length == n0 + steps;
-  printf("[%s] device length %d+%d B=%d heads %d/%d tokens %d .. %d tau %-6g%s: outputs differing %ld, cache elements differing %ld\n",
+  say("[%s] device length %d+%d B=%d heads %d/%d tokens %d .. %d tau %-6g%s: outputs differing %ld, cache elements differing %ld\n",
          ok ? "PASS" : "FAIL", cb, fb, B, QH, KH, n0, n0 + steps, tau, g_strided ? " (strided)" : "", differ, bytes);
   cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(st);
   for (Cache &k : cache) for (void *x : {(void *)k.cb_, (void *)k.fb_, (void *)k.mb_, (void *)k.e}) cudaFree(x);
@@ -718,10 +737,9 @@ static int run_device_length(int cb, int fb, int B, int QH, int KH, int n0, int 
   return !ok;
 }
 
-// The fused step input (mlops_fbla_qkv_at) against its parts: q and k normalized on the host (the documented order:
-// the lane's four squares, the xor butterfly, 1 / sqrt rounded to nearest), rotated by the RoPE device code itself
-// (rope.cuh, as mlops_rope), k and v appended with append_at -- q and the cache bit for bit, token by token from n0,
-// q / k / v in inferno's layout (per KV head its q heads, k, v).
+// The fused step input (mlops_fbla_qkv_at) against its parts: q and k normalized on the host (the documented order: the lane's four squares, the xor butterfly, 1 / sqrt rounded
+// to nearest), rotated by the RoPE device code itself (rope.cuh, as mlops_rope), k and v appended with append_at -- q and the cache bit for bit, token by token from n0, q / k / v
+// in inferno's layout (per KV head its q heads, k, v).
 __global__ void ref_rope(const uint16_t *x, uint16_t *y, const int *length, int off, const mlops_rope_detail::Freq *freq) {
   const int i = threadIdx.x, h = blockIdx.x;
   float c, sn;
@@ -841,7 +859,7 @@ static int run_qkv(int cb, int fb, int B, int QH, int KH, int n0, int steps, boo
     for (size_t i = 0; i < ae.size(); ++i) bytes += ae[i] != be[i];
   }
   const bool ok = qdiff == 0 && bytes == 0;
-  printf("[%s] qkv_at %d+%d B=%d heads %d/%d tokens %d .. %d %s%s: q differing %ld, cache elements differing %ld\n", ok ? "PASS" : "FAIL",
+  say("[%s] qkv_at %d+%d B=%d heads %d/%d tokens %d .. %d %s%s: q differing %ld, cache elements differing %ld\n", ok ? "PASS" : "FAIL",
          cb, fb, B, QH, KH, n0, n0 + steps, norm ? "q/k norm" : "no norm", g_strided ? " (strided)" : "", qdiff, bytes);
   for (Cache &k : cache) for (void *x : {(void *)k.cb_, (void *)k.fb_, (void *)k.mb_, (void *)k.e}) cudaFree(x);
   for (void *x : {(void *)dqkv, (void *)dqn, (void *)dkn, (void *)dv, (void *)dqr, (void *)dkr, (void *)dqo, (void *)dqw, (void *)dkw,
@@ -850,83 +868,439 @@ static int run_qkv(int cb, int fb, int B, int QH, int KH, int n0, int steps, boo
   return !ok;
 }
 
+// The prefill's output in token-major rows [position][q_heads * 128] (out_head_stride 128, out_token_stride q_heads * 128) against
+// the default [q_heads][position][128]: the same values, by mlops_fbla_prefill and by mlops_fbla_prefill_at (count < max_count),
+// the items' write ranges inside the array.
+static int run_out_layout(int cb, int fb, int QH, int KH, int n0, int count, int max_count, unsigned seed) {
+  const int cap = n0 + max_count + 1;
+  const size_t heads = KH, cg = (cap + G - 1) / G;
+  const size_t uc = 8u * 2 * cb * 256, uf = 8u * 2 * fb * 256;
+  const mlops_fbla_format fmt = cb == 3 ? MLOPS_FBLA_3P3 : MLOPS_FBLA_4P2;
+  std::mt19937 r(seed);
+  std::normal_distribution<float> n01(0.f, 1.f);
+  auto randn = [&](size_t n, float sd) { std::vector<uint16_t> v(n); for (auto &x : v) x = f2b(sd * n01(r)); return v; };
+  struct Cache { uint16_t *e; mlops_fbla_cache x; uint8_t *cb_, *fb_, *im = nullptr; uint16_t *mb_; } cache[2];
+  const mlops_fbla_config one{1, 1, 1, 0, 0.f, 0.f, fmt, G};
+  const size_t slot = mlops_fbla_images_bytes(&one);
+  for (Cache &k : cache) {
+    place(std::vector<uint8_t>(heads * cg * uc, 0), uc, heads, cg, &k.cb_);
+    place(std::vector<uint8_t>(heads * cg * uf, 0), uf, heads, cg, &k.fb_);
+    place(std::vector<uint16_t>(heads * cg * 512, 0), 512, heads, cg, &k.mb_);
+    k.e = up(std::vector<uint16_t>(4 * heads * G * D, 0));
+    k.x = {own(k.cb_, uc, heads), own(k.fb_, uf, heads), own(k.mb_, 512, heads), k.e, k.e + heads * G * D, k.e + 2 * heads * G * D,
+           k.e + 3 * heads * G * D, nullptr};
+    if (slot) {
+      place(std::vector<uint8_t>(heads * cg * slot, 0), slot, heads, cg, &k.im);
+      k.x.tc_images = own(k.im, slot, heads);
+    }
+  }
+  mlops_fbla_config cfg{1, QH, KH, 0, 0.f, 0.f, fmt, cap};
+  set_strides(cfg, heads);
+  const std::vector<uint16_t> pk = randn(2 * heads * n0 * D, 2.f), pq = randn((size_t)QH * n0 * D, 1.5f);
+  uint16_t *dpk = up(pk), *dpq = up(pq), *dpo;
+  CK(cudaMalloc(&dpo, pq.size() * 2 + 16));
+  if (n0)
+    for (Cache &k : cache)
+      if (mlops_fbla_prefill(&cfg, n0, dpq, dpk, dpk + heads * n0 * D, &k.x, dpo, 0)) { fprintf(stderr, "%s\n", mlops_fbla_last_error()); exit(1); }
+  const std::vector<uint16_t> kc = randn(2 * heads * max_count * D, 2.f), qc = randn((size_t)QH * max_count * D, 1.5f);
+  uint16_t *dk = up(kc), *dv = dk + heads * max_count * D, *dq = up(qc);
+  const size_t qn = (size_t)QH * max_count * D;
+  uint16_t *o_head = up(std::vector<uint16_t>(qn, 0xA5A5)), *o_tok = up(std::vector<uint16_t>(qn, 0xA5A5));
+  int *len, *cnt;
+  CK(cudaMalloc(&len, 4)); CK(cudaMemcpy(len, &n0, 4, cudaMemcpyHostToDevice));
+  CK(cudaMalloc(&cnt, 4)); CK(cudaMemcpy(cnt, &count, 4, cudaMemcpyHostToDevice));
+  mlops_fbla_config c0 = cfg, c1 = cfg;
+  c0.tokens = c1.tokens = 0;
+  c1.out_head_stride = D;
+  c1.out_token_stride = (int64_t)QH * D;
+  if (mlops_fbla_prefill_at(&c0, len, cnt, max_count, dq, dk, dv, &cache[0].x, o_head, 0) ||
+      mlops_fbla_prefill_at(&c1, len, cnt, max_count, dq, dk, dv, &cache[1].x, o_tok, 0)) { fprintf(stderr, "%s\n", mlops_fbla_last_error()); exit(1); }
+  CK(cudaDeviceSynchronize());
+  std::vector<uint16_t> a(qn), b(qn);
+  CK(cudaMemcpy(a.data(), o_head, qn * 2, cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(b.data(), o_tok, qn * 2, cudaMemcpyDeviceToHost));
+  long diff = 0, untouched = 0;
+  for (int h = 0; h < QH; ++h)
+    for (int i = 0; i < max_count; ++i)
+      for (int e = 0; e < D; ++e) {
+        const uint16_t x = a[((size_t)h * max_count + i) * D + e], y = b[(size_t)i * QH * D + (size_t)h * D + e];
+        if (i < count) diff += x != y;
+        else untouched += (x != 0xA5A5) + (y != 0xA5A5);
+      }
+  // the cache: the same records
+  const auto ea = gather(cache[0].cb_, heads * cg * uc, uc, heads, cg), eb = gather(cache[1].cb_, heads * cg * uc, uc, heads, cg);
+  for (size_t i = 0; i < ea.size(); ++i) diff += ea[i] != eb[i];
+  // the items' ranges: inside the output, covering every position of the chunk
+  mlops_fbla_items pass[8];
+  const int np = mlops_fbla_prefill_at_items(&c1, len, cnt, max_count, dq, dk, dv, &cache[1].x, o_tok, pass, 8);
+  long bad = np <= 0;
+  std::vector<char> covered(qn * 2, 0);
+  for (int p = 0; p < np; ++p)
+    for (int it = 0; it < pass[p].items; ++it) {
+      mlops_fbla_item_range rg[64];
+      const int nr = mlops_fbla_item_access(pass, np, p, it, rg, 64);
+      for (int q = 0; q < nr && q < 64; ++q) {
+        if (rg[q].arg != MLOPS_FBLA_ARG_OUT) continue;
+        const long long end = rg[q].offset + (long long)(rg[q].rows - 1) * rg[q].stride + rg[q].bytes;
+        if (!rg[q].write || rg[q].offset < 0 || end > (long long)qn * 2) { ++bad; continue; }
+        for (int row = 0; row < rg[q].rows; ++row) std::fill(covered.begin() + rg[q].offset + row * rg[q].stride, covered.begin() + rg[q].offset + row * rg[q].stride + rg[q].bytes, 1);
+      }
+    }
+  for (int i = 0; i < count; ++i)
+    for (int h = 0; h < QH; ++h) bad += !covered[((size_t)i * QH + h) * D * 2] || !covered[((size_t)i * QH + h) * D * 2 + D * 2 - 1];
+  const bool ok = diff == 0 && untouched == 0 && bad == 0;
+  say("[%s] out layout %d+%d heads %d/%d positions %d + %d of %d: differing %ld, past the count touched %ld, bad ranges %ld\n", ok ? "PASS" : "FAIL", cb, fb, QH, KH,
+         n0, count, max_count, diff, untouched, bad);
+  for (Cache &k : cache) for (void *x : {(void *)k.cb_, (void *)k.fb_, (void *)k.mb_, (void *)k.e, (void *)k.im}) cudaFree(x);
+  for (void *x : {(void *)dpk, (void *)dpq, (void *)dpo, (void *)dk, (void *)dq, (void *)o_head, (void *)o_tok, (void *)len, (void *)cnt}) cudaFree(x);
+  return !ok;
+}
+
+// A prefill chunk's attention inputs (mlops_fbla_qkv_prefill_at) against the same parts position by position (the host norm,
+// the RoPE device code at *length + n0 + i): q, k and v bit for bit for the chunk's `count` of `max_count` rows, the rest of the
+// outputs untouched.
+static int run_qkv_chunk(int QH, int KH, int n0, int count, int max_count, bool norm, unsigned seed) {
+  const int qg = QH / KH, cap = n0 + max_count + 8;
+  const size_t row = (size_t)KH * (qg + 2) * D;
+  std::mt19937 r(seed);
+  std::normal_distribution<float> n01(0.f, 1.f);
+  auto randn = [&](size_t n, float sd) { std::vector<uint16_t> v(n); for (auto &x : v) x = f2b(sd * n01(r)); return v; };
+  const float eps = 1e-6f;
+  const std::vector<uint16_t> qw = randn(D, 0.5f), kw = randn(D, 0.5f), h = randn(max_count * row, 2.f);
+  std::vector<float> freq(4 * 64);
+  for (int i = 0; i < 64; ++i) {
+    const double f = pow(1e6, -2.0 * i / D) / (2 * M_PI), g = fmod(65536.0 * f, 1.0);
+    freq[4 * i] = (float)f; freq[4 * i + 1] = (float)(f - (float)f);
+    freq[4 * i + 2] = (float)g; freq[4 * i + 3] = (float)(g - (float)g);
+  }
+  const size_t qn = (size_t)QH * max_count * D, kn = (size_t)KH * max_count * D;
+  std::vector<uint16_t> wq(qn, 0xA5A5), wk(kn, 0xA5A5), wv(kn, 0xA5A5);  // the expected outputs, poison where untouched
+  int *len, *cnt;
+  CK(cudaMalloc(&len, 4)); CK(cudaMemcpy(len, &n0, 4, cudaMemcpyHostToDevice));
+  CK(cudaMalloc(&cnt, 4)); CK(cudaMemcpy(cnt, &count, 4, cudaMemcpyHostToDevice));
+  uint16_t *dx, *dnorm, *dro;
+  CK(cudaMalloc(&dnorm, (size_t)QH * D * 2)); CK(cudaMalloc(&dro, (size_t)QH * D * 2));
+  float *dfreq = up(freq);
+  const auto *fr = reinterpret_cast<const mlops_rope_detail::Freq *>(dfreq);
+  for (int i = 0; i < count; ++i) {
+    std::vector<uint16_t> qs((size_t)QH * D), ks((size_t)KH * D), vs((size_t)KH * D);
+    for (int g = 0; g < KH; ++g) {
+      const uint16_t *grp = h.data() + i * row + (size_t)g * (qg + 2) * D;
+      for (int j = 0; j < qg + 2; ++j) {
+        std::vector<uint16_t> y(grp + j * D, grp + (j + 1) * D);
+        if (norm && j <= qg) y = host_norm(grp + j * D, j < qg ? qw : kw, eps);
+        uint16_t *to = j < qg ? &qs[((size_t)g * qg + j) * D] : j == qg ? &ks[(size_t)g * D] : &vs[(size_t)g * D];
+        std::copy(y.begin(), y.end(), to);
+      }
+    }
+    const auto rope = [&](const std::vector<uint16_t> &in, int heads) {
+      CK(cudaMemcpy(dnorm, in.data(), in.size() * 2, cudaMemcpyHostToDevice));
+      ref_rope<<<heads, 64>>>(dnorm, dro, len, i, fr);
+      std::vector<uint16_t> out(in.size());
+      CK(cudaMemcpy(out.data(), dro, out.size() * 2, cudaMemcpyDeviceToHost));
+      return out;
+    };
+    const auto qr = rope(qs, QH), kr = rope(ks, KH);
+    for (int a = 0; a < QH; ++a) std::copy(&qr[(size_t)a * D], &qr[(size_t)(a + 1) * D], &wq[((size_t)a * max_count + i) * D]);
+    for (int a = 0; a < KH; ++a) {
+      std::copy(&kr[(size_t)a * D], &kr[(size_t)(a + 1) * D], &wk[((size_t)a * max_count + i) * D]);
+      std::copy(&vs[(size_t)a * D], &vs[(size_t)(a + 1) * D], &wv[((size_t)a * max_count + i) * D]);
+    }
+  }
+  dx = up(h);
+  uint16_t *dq = up(std::vector<uint16_t>(qn, 0xA5A5)), *dk = up(std::vector<uint16_t>(kn, 0xA5A5)), *dv = up(std::vector<uint16_t>(kn, 0xA5A5));
+  uint16_t *dqw = up(qw), *dkw = up(kw);
+  mlops_fbla_config cfg{1, QH, KH, n0, 0.f, 0.f, MLOPS_FBLA_3P3, cap, 0, 0};
+  const mlops_fbla_token tok{dx, dx + qg * D, dx + (qg + 1) * D, (int64_t)row, (int64_t)(qg + 2) * D, (int64_t)(qg + 2) * D,
+                             norm ? dqw : nullptr, norm ? dkw : nullptr, eps, dfreq, 0.f, nullptr};
+  cfg.tokens = 0;  // positions *length + 0 + i: n0 lives in *length
+  const mlops_fbla_status st = mlops_fbla_qkv_prefill_at(&cfg, len, cnt, max_count, &tok, dq, dk, dv, 0);
+  if (st) { fprintf(stderr, "%s\n", mlops_fbla_last_error()); exit(1); }
+  CK(cudaDeviceSynchronize());
+  long diff = 0;
+  const auto cmp = [&](const uint16_t *d, const std::vector<uint16_t> &want) {
+    std::vector<uint16_t> got(want.size());
+    CK(cudaMemcpy(got.data(), d, got.size() * 2, cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < got.size(); ++i) diff += got[i] != want[i];
+  };
+  cmp(dq, wq); cmp(dk, wk); cmp(dv, wv);
+  // the items describe the same pass: ranges that cover what it wrote, inside their arguments
+  mlops_fbla_items pass[2];
+  const int np = mlops_fbla_qkv_prefill_at_items(&cfg, len, cnt, max_count, &tok, dq, dk, dv, pass, 2);
+  long bad_ranges = np != 1;
+  for (int it = 0; np == 1 && it < pass[0].items; ++it) {
+    mlops_fbla_item_range rg[16];
+    const int nr = mlops_fbla_item_access(pass, 1, 0, it, rg, 16);
+    bad_ranges += nr <= 0 || nr > 16;
+    for (int q = 0; q < nr && q < 16; ++q) {
+      const long long end = rg[q].offset + (long long)(rg[q].rows - 1) * rg[q].stride + rg[q].bytes;
+      const long long size = rg[q].arg == MLOPS_FBLA_ARG_Q ? (long long)qn * 2 : rg[q].arg == MLOPS_FBLA_ARG_K || rg[q].arg == MLOPS_FBLA_ARG_V ? (long long)kn * 2
+                           : rg[q].arg == MLOPS_FBLA_ARG_TQ || rg[q].arg == MLOPS_FBLA_ARG_TK || rg[q].arg == MLOPS_FBLA_ARG_TV ? (long long)max_count * row * 2
+                           : 1ll << 40;
+      bad_ranges += rg[q].offset < 0 || end > size;
+    }
+  }
+  const bool ok = diff == 0 && bad_ranges == 0;
+  say("[%s] qkv_prefill_at heads %d/%d positions %d + %d of %d %s: elements differing %ld, bad ranges %ld\n", ok ? "PASS" : "FAIL", QH, KH, n0, count, max_count,
+         norm ? "q/k norm" : "no norm", diff, bad_ranges);
+  for (void *x : {(void *)len, (void *)cnt, (void *)dnorm, (void *)dro, (void *)dfreq, (void *)dx, (void *)dq, (void *)dk, (void *)dv, (void *)dqw, (void *)dkw})
+    cudaFree(x);
+  return !ok;
+}
+
+// Every case is a job on a pool of threads (the host models dominate); a job's flags (strided units, images) are its own.
+// Batch rows of different lengths (cfg.length_stride = 1): the step (qkv_at or append_at, then decode_at) over the batch against each row run alone
+// (batch 1, its own cache, the row's length), bit for bit: the outputs at every step, then the caches.
+__global__ void advance_rows(int *length, int n) { if (threadIdx.x < n) ++length[threadIdx.x]; }
+
+static int run_batch_lengths(int cb, int fb, int QH, int KH, std::vector<int> n0s, int steps, bool via_qkv, unsigned seed) {
+  ExclusiveGpu exclusive;  // (the calls' once-per-thread setup)
+  const int B = (int)n0s.size(), cap = *std::max_element(n0s.begin(), n0s.end()) + steps + 100, qg = QH / KH;
+  const size_t heads = (size_t)B * KH, cg = (cap + G - 1) / G, row = (size_t)KH * (qg + 2) * D, uc = 8u * 2 * cb * 256, uf = 8u * 2 * fb * 256;
+  const mlops_fbla_format fmt = cb == 3 ? MLOPS_FBLA_3P3 : MLOPS_FBLA_4P2;
+  std::mt19937 r(seed);
+  std::normal_distribution<float> n01(0.f, 1.f);
+  auto randn = [&](size_t n, float sd) { std::vector<uint16_t> v(n); for (auto &x : v) x = f2b(sd * n01(r)); return v; };
+  auto zeros = [&](size_t bytes) { void *p; CK(cudaMalloc(&p, bytes)); CK(cudaMemset(p, 0, bytes)); return p; };
+  // a cache of `h` KV heads; rows of the batched one are views at KV head b * KH
+  struct Store { uint8_t *c, *f; uint16_t *m, *e; size_t h; };
+  auto make = [&](size_t h) { return Store{(uint8_t *)zeros(h * cg * uc), (uint8_t *)zeros(h * cg * uf), (uint16_t *)zeros(h * cg * 1024), (uint16_t *)zeros(4 * h * G * D * 2), h}; };
+  auto view = [&](const Store &s, size_t b) {
+    const size_t h0 = b * KH, plane = s.h * G * D;
+    return mlops_fbla_cache{s.c + h0 * cg * uc, s.f + h0 * cg * uf, s.m + h0 * cg * 512, s.e + h0 * G * D, s.e + plane + h0 * G * D,
+                            s.e + 2 * plane + h0 * G * D, s.e + 3 * plane + h0 * G * D, nullptr};
+  };
+  const Store whole = make(heads);
+  std::vector<Store> alone;
+  for (int b = 0; b < B; ++b) alone.push_back(make(KH));
+  mlops_fbla_config one{1, QH, KH, 0, 0.f, 1e-3f, fmt, cap, 0, 0}, all{B, QH, KH, 0, 0.f, 1e-3f, fmt, cap, 0, 0};
+  all.length_stride = 1;
+  for (int b = 0; b < B; ++b) {  // each row's prompt, the same in both
+    if (!n0s[b]) continue;
+    const std::vector<uint16_t> kv = randn(2 * (size_t)KH * n0s[b] * D, 2.f);
+    uint16_t *d = up(kv);
+    mlops_fbla_cache w = view(whole, b), a = view(alone[b], 0);
+    mlops_fbla_config c = one;
+    if (mlops_fbla_prefill(&c, n0s[b], nullptr, d, d + (size_t)KH * n0s[b] * D, &w, nullptr, 0) ||
+        mlops_fbla_prefill(&c, n0s[b], nullptr, d, d + (size_t)KH * n0s[b] * D, &a, nullptr, 0)) { fprintf(stderr, "%s\n", mlops_fbla_last_error()); exit(1); }
+    CK(cudaDeviceSynchronize());
+    cudaFree(d);
+  }
+  std::vector<float> freq(4 * 64);
+  for (int i = 0; i < 64; ++i) {  // mlops_rope_freq of theta 1e6
+    const double f = pow(1e6, -2.0 * i / D) / (2 * M_PI), g = fmod(65536.0 * f, 1.0);
+    freq[4 * i] = (float)f; freq[4 * i + 1] = (float)(f - (float)f);
+    freq[4 * i + 2] = (float)g; freq[4 * i + 3] = (float)(g - (float)g);
+  }
+  float *dfreq = up(freq);
+  uint16_t *dqw = up(randn(D, 0.5f)), *dkw = up(randn(D, 0.5f)), *dqkv, *dk, *dv, *dq, *dqo, *dout;
+  CK(cudaMalloc(&dqkv, B * row * 2)); CK(cudaMalloc(&dk, heads * D * 2)); CK(cudaMalloc(&dv, heads * D * 2));
+  CK(cudaMalloc(&dq, (size_t)B * QH * D * 2)); CK(cudaMalloc(&dqo, (size_t)B * QH * D * 2)); CK(cudaMalloc(&dout, (size_t)B * QH * D * 2));
+  uint16_t *rqo = (uint16_t *)zeros((size_t)B * QH * D * 2), *rout = (uint16_t *)zeros((size_t)B * QH * D * 2);
+  int *dlen = up(n0s), *rlen = up(n0s);  // the batch's lengths; the rows' own, in the same array (row b at b)
+  mlops_fbla_config lc = all, rc = one;
+  lc.tokens = rc.tokens = cap;
+  const size_t sz = mlops_fbla_decode_scratch_bytes(&lc), rsz = mlops_fbla_decode_scratch_bytes(&rc);
+  void *scratch, *rscratch;
+  CK(cudaMalloc(&scratch, sz)); CK(cudaMalloc(&rscratch, rsz));
+  CK(cudaMemset(scratch, 0xFF, sz)); CK(cudaMemset(rscratch, 0xFF, rsz));  // (no initial contents required)
+  mlops_fbla_cache wc = view(whole, 0);
+  const mlops_fbla_token tok{dqkv, dqkv + qg * D, dqkv + (qg + 1) * D, (int64_t)row, (int64_t)(qg + 2) * D, (int64_t)(qg + 2) * D, dqw, dkw, 1e-6f, dfreq, 0.f, dqo};
+  long differ = 0;
+  auto fail_if = [&](int status) { if (status) { fprintf(stderr, "%s\n", mlops_fbla_last_error()); exit(1); } };
+  for (int s = 0; s < steps; ++s) {
+    const std::vector<uint16_t> h = randn(B * row, 2.f), kh = randn(heads * D, 2.f), vh = randn(heads * D, 2.f), qh = randn((size_t)B * QH * D, 1.5f);
+    CK(cudaMemcpy(dqkv, h.data(), h.size() * 2, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dk, kh.data(), kh.size() * 2, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dv, vh.data(), vh.size() * 2, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dq, qh.data(), qh.size() * 2, cudaMemcpyHostToDevice));
+    mlops_fbla_config step = all, rstep = one, dec = all, rdec = one;
+    dec.tokens = rdec.tokens = 1;  // *length does not yet count the appended token
+    if (via_qkv) fail_if(mlops_fbla_qkv_at(&step, dlen, &tok, &wc, 0));
+    else fail_if(mlops_fbla_append_at(&step, dlen, dk, dv, &wc, 0));
+    fail_if(mlops_fbla_decode_at(&dec, dlen, via_qkv ? dqo : dq, &wc, dout, scratch, sz, 0));
+    for (int b = 0; b < B; ++b) {
+      mlops_fbla_cache a = view(alone[b], 0);
+      const mlops_fbla_token t1{dqkv + b * row, dqkv + b * row + qg * D, dqkv + b * row + (qg + 1) * D, (int64_t)row, (int64_t)(qg + 2) * D, (int64_t)(qg + 2) * D,
+                                dqw, dkw, 1e-6f, dfreq, 0.f, rqo + (size_t)b * QH * D};
+      if (via_qkv) fail_if(mlops_fbla_qkv_at(&rstep, rlen + b, &t1, &a, 0));
+      else fail_if(mlops_fbla_append_at(&rstep, rlen + b, dk + (size_t)b * KH * D, dv + (size_t)b * KH * D, &a, 0));
+      fail_if(mlops_fbla_decode_at(&rdec, rlen + b, via_qkv ? rqo + (size_t)b * QH * D : dq + (size_t)b * QH * D, &a, rout + (size_t)b * QH * D, rscratch, rsz, 0));
+    }
+    advance_rows<<<1, 32>>>(dlen, B);
+    advance_rows<<<1, 32>>>(rlen, B);
+    CK(cudaDeviceSynchronize());
+    std::vector<uint16_t> o((size_t)B * QH * D), ro(o.size());
+    CK(cudaMemcpy(o.data(), dout, o.size() * 2, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(ro.data(), rout, ro.size() * 2, cudaMemcpyDeviceToHost));
+    // The decode's CTAs per KV head follow from the batch (the wave is filled by batch * kv_heads heads), so its sums regroup: the attention
+    // output agrees to a few BF16 ulps (tol > 0); q and the cache are exact.
+    auto rows_differing = [&](const char *what, float tol) {  // the first row that differs, named
+      for (int b = 0; b < B; ++b)
+        for (size_t i = (size_t)b * QH * D; i < (size_t)(b + 1) * QH * D; ++i) {
+          const float x = b2f(o[i]), y = b2f(ro[i]);
+          if (fabsf(x - y) > tol * std::max(fabsf(x), fabsf(y))) {
+            say("  step %d: %s of row %d differs (%g against %g)\n", s, what, b, x, y);
+            return 1;
+          }
+        }
+      return 0;
+    };
+    differ += rows_differing("the attention output", 1.f / 32);
+    if (via_qkv) {
+      CK(cudaMemcpy(o.data(), dqo, o.size() * 2, cudaMemcpyDeviceToHost));
+      CK(cudaMemcpy(ro.data(), rqo, ro.size() * 2, cudaMemcpyDeviceToHost));
+      differ += rows_differing("q", 0.f);
+    }
+  }
+  long bytes = 0;  // the caches after the last token, row by row
+  auto host = [&](const void *p, size_t n) { std::vector<uint8_t> v(n); CK(cudaMemcpy(v.data(), p, n, cudaMemcpyDeviceToHost)); return v; };
+  for (int b = 0; b < B; ++b) {
+    const mlops_fbla_cache w = view(whole, b), a = view(alone[b], 0);
+    const struct { const void *x, *y; size_t n; } parts[] = {{w.coarse, a.coarse, KH * cg * uc}, {w.fine, a.fine, KH * cg * uf}, {w.meta, a.meta, KH * cg * 1024},
+        {w.exact_sink_k, a.exact_sink_k, (size_t)KH * G * D * 2}, {w.exact_sink_v, a.exact_sink_v, (size_t)KH * G * D * 2},
+        {w.exact_open_k, a.exact_open_k, (size_t)KH * G * D * 2}, {w.exact_open_v, a.exact_open_v, (size_t)KH * G * D * 2}};
+    for (const auto &p : parts) bytes += host(p.x, p.n) != host(p.y, p.n);
+  }
+  std::vector<int> lens(B);
+  CK(cudaMemcpy(lens.data(), dlen, B * 4, cudaMemcpyDeviceToHost));
+  bool lens_ok = true;
+  for (int b = 0; b < B; ++b) lens_ok &= lens[b] == n0s[b] + steps;
+  const bool ok = differ == 0 && bytes == 0 && lens_ok;
+  std::string rows;
+  for (int n : n0s) rows += (rows.empty() ? "" : ",") + std::to_string(n);
+  say("[%s] per-row lengths %d+%d B=%d heads %d/%d lengths %s + %d steps (%s): outputs differing %ld, cache parts differing %ld\n", ok ? "PASS" : "FAIL", cb, fb, B, QH, KH,
+      rows.c_str(), steps, via_qkv ? "qkv_at" : "append_at", differ, bytes);
+  for (const Store &s : [&] { std::vector<Store> v = alone; v.push_back(whole); return v; }())
+    for (void *p : {(void *)s.c, (void *)s.f, (void *)s.m, (void *)s.e}) cudaFree(p);
+  for (void *p : {(void *)dfreq, (void *)dqw, (void *)dkw, (void *)dqkv, (void *)dk, (void *)dv, (void *)dq, (void *)dqo, (void *)dout, (void *)rqo, (void *)rout,
+                  (void *)dlen, (void *)rlen, scratch, rscratch}) cudaFree(p);
+  return !ok;
+}
+
 int main() {
-  int f = 0;
+  std::vector<std::function<int()>> jobs;
+  const auto add = [&](std::function<int()> fn, bool strided = false, bool images = false) {
+    jobs.push_back([=] { g_strided = strided; g_images = images; return fn(); });
+  };
+  const bool tc = tc_prefill();
   for (int fmt = 0; fmt < 2; ++fmt) {
     const int cb = fmt ? 4 : 3, fb = fmt ? 2 : 3;
-    f += run(cb, fb, 1, 2, 2, 384, 1e-2f, 1);      // MHA, one closed group
-    f += run(cb, fb, 1, 4, 2, 1000, 3e-3f, 2);     // GQA 2, open group of 104 tokens
-    f += run(cb, fb, 2, 8, 2, 4096, 1e-3f, 3);     // GQA 4, batch 2
-    f += run(cb, fb, 1, 16, 8, 20000, 3e-4f, 4);   // Qwen3 geometry, long context
-    f += run(cb, fb, 1, 4, 2, 2048, 0.f, 5);       // format default tau
-    f += run(cb, fb, 1, 4, 2, 2048, 1e30f, 6);     // nothing refined
-    f += run(cb, fb, 1, 4, 2, 2048, 1e-30f, 7);    // everything refined
-    f += run(cb, fb, 1, 4, 2, 3000, 1e-3f, 8, 8192);  // a cache laid out for 8192 tokens, 3000 filled
-    f += run(cb, fb, 1, 4, 2, 262144, 1e-4f, 9);   // 256K
-    f += run(cb, fb, 1, 8, 2, 2048, 1e30f, 10);    // GQA 4, nothing refined
-    f += run(cb, fb, 1, 8, 2, 2048, 1e-30f, 11);   // GQA 4, everything refined
-    f += run(cb, fb, 1, 32, 8, 20000, 3e-4f, 12);  // GQA 4, Llama-3-8B geometry
-    // ratios beyond 4: virtual KV heads of 4, 2 or 1 queries
-    f += run(cb, fb, 1, 16, 2, 3000, 1e-3f, 13);   // GQA 8 (2 x 4), Qwen3-32B / Llama-3-70B
-    f += run(cb, fb, 2, 32, 2, 2048, 1e-3f, 14);   // GQA 16 (4 x 4), batch 2
-    f += run(cb, fb, 1, 10, 2, 3000, 1e-3f, 15);   // GQA 5 (5 x 1), Qwen3-14B
-    f += run(cb, fb, 1, 14, 2, 3000, 1e-3f, 16);   // GQA 7 (7 x 1), Qwen2.5-7B
-    f += run(cb, fb, 1, 12, 2, 2048, 1e-3f, 17);   // GQA 6 (3 x 2)
-    f += run(cb, fb, 1, 64, 8, 20000, 3e-4f, 18);  // GQA 8, 8 KV heads, long context
+    add([=] { return run_out_layout(cb, fb, 4, 2, 0, 200, 300, 21); });
+    add([=] { return run_out_layout(cb, fb, 16, 8, 1000, 100, 160, 22); });
+    add([=] { return run_out_layout(cb, fb, 6, 2, 129, 1, 64, 23); });
+    add([=] { return run_out_layout(cb, fb, 32, 8, 300, 17, 40, 24); });
   }
-  for (int pass = 0; pass < (tc_prefill() ? 4 : 2); ++pass) {  // tensor cores: without and with persistent images
+  for (int fmt = 0; fmt < 2; ++fmt) {
+    const int cb = fmt ? 4 : 3, fb = fmt ? 2 : 3;
+    for (bool qkv : {true, false}) {
+      add([=] { return run_batch_lengths(cb, fb, 8, 2, {127, 255, 1000}, 6, qkv, 31); });  // GQA 4; rows closing a group at different steps
+      add([=] { return run_batch_lengths(cb, fb, 2, 2, {1, 300}, 5, qkv, 32); });          // MHA
+      add([=] { return run_batch_lengths(cb, fb, 16, 2, {2000, 129, 4000, 63}, 4, qkv, 33); });  // GQA 8: virtual KV heads
+      add([=] { return run_batch_lengths(cb, fb, 16, 2, {2000}, 4, qkv, 34); });                  // (one row: the batched run is the row's own)
+    }
+  }
+  for (bool norm : {true, false}) {
+    add([=] { return run_qkv_chunk(2, 2, 0, 37, 40, norm, 11); });
+    add([=] { return run_qkv_chunk(16, 8, 1000, 64, 64, norm, 12); });
+    add([=] { return run_qkv_chunk(32, 8, 129, 1, 24, norm, 13); });
+    add([=] { return run_qkv_chunk(6, 2, 4097, 9, 40, norm, 14); });
+  }
+  for (int fmt = 0; fmt < 2; ++fmt) {
+    const int cb = fmt ? 4 : 3, fb = fmt ? 2 : 3;
+    add([=] { return run(cb, fb, 1, 2, 2, 384, 1e-2f, 1); });      // MHA, one closed group
+    add([=] { return run(cb, fb, 1, 4, 2, 1000, 3e-3f, 2); });     // GQA 2, open group of 104 tokens
+    add([=] { return run(cb, fb, 2, 8, 2, 4096, 1e-3f, 3); });     // GQA 4, batch 2
+    add([=] { return run(cb, fb, 1, 16, 8, 20000, 3e-4f, 4); });   // Qwen3 geometry, long context
+    add([=] { return run(cb, fb, 1, 4, 2, 2048, 0.f, 5); });       // format default tau
+    add([=] { return run(cb, fb, 1, 4, 2, 2048, 1e30f, 6); });     // nothing refined
+    add([=] { return run(cb, fb, 1, 4, 2, 2048, 1e-30f, 7); });    // everything refined
+    add([=] { return run(cb, fb, 1, 4, 2, 3000, 1e-3f, 8, 8192); });  // a cache laid out for 8192 tokens, 3000 filled
+    add([=] { return run(cb, fb, 1, 4, 2, 262144, 1e-4f, 9); });   // 256K
+    add([=] { return run(cb, fb, 1, 8, 2, 2048, 1e30f, 10); });    // GQA 4, nothing refined
+    add([=] { return run(cb, fb, 1, 8, 2, 2048, 1e-30f, 11); });   // GQA 4, everything refined
+    add([=] { return run(cb, fb, 1, 32, 8, 20000, 3e-4f, 12); });  // GQA 4, Llama-3-8B geometry
+    // ratios beyond 4: virtual KV heads of 4, 2 or 1 queries
+    add([=] { return run(cb, fb, 1, 16, 2, 3000, 1e-3f, 13); });   // GQA 8 (2 x 4), Qwen3-32B / Llama-3-70B
+    add([=] { return run(cb, fb, 2, 32, 2, 2048, 1e-3f, 14); });   // GQA 16 (4 x 4), batch 2
+    add([=] { return run(cb, fb, 1, 10, 2, 3000, 1e-3f, 15); });   // GQA 5 (5 x 1), Qwen3-14B
+    add([=] { return run(cb, fb, 1, 14, 2, 3000, 1e-3f, 16); });   // GQA 7 (7 x 1), Qwen2.5-7B
+    add([=] { return run(cb, fb, 1, 12, 2, 2048, 1e-3f, 17); });   // GQA 6 (3 x 2)
+    add([=] { return run(cb, fb, 1, 64, 8, 20000, 3e-4f, 18); });  // GQA 8, 8 KV heads, long context
+  }
+  for (int pass = 0; pass < (tc ? 4 : 2); ++pass) {  // tensor cores: without and with persistent images
     const int fmt = pass % 2, cb = fmt ? 4 : 3, fb = fmt ? 2 : 3;
-    g_images = pass >= 2;
-    f += run_prefill(cb, fb, 1, 2, 2, 100, 21, {100});                 // inside the first group
-    f += run_prefill(cb, fb, 1, 4, 2, 1000, 22, {1000});               // one chunk, open group of 104
-    f += run_prefill(cb, fb, 2, 8, 2, 2048, 23, {300, 212, 128, 1, 1407});  // chunk edges on and off groups
-    f += run_prefill(cb, fb, 1, 16, 8, 4096, 24, {1024, 1024, 2048});  // Qwen3 geometry
-    f += run_prefill(cb, fb, 1, 2, 2, 3000, 25, {1500, 1500});         // MHA, two chunks
-    f += run_prefill(cb, fb, 1, 8, 2, 3000, 26, {700, 2300});          // GQA 4
-    f += run_prefill(cb, fb, 1, 4, 2, 8177, 28, {6000, 2100, 77});     // short chunks on a long stream (split-K)
-    f += run_prefill(cb, fb, 1, 16, 2, 3000, 29, {1100, 1900});         // GQA 8
-    f += run_prefill(cb, fb, 1, 6, 2, 2000, 30, {700, 1300});           // GQA 3 (the ratio at run time)
-    f += run_prefill(cb, fb, 1, 32, 2, 1500, 31, {700, 800});           // GQA 16
-    f += run_prefill(cb, fb, 1, 10, 2, 2000, 32, {900, 1100});          // GQA 5
-    f += run_prefill(cb, fb, 1, 2, 2, 2000, 27, {1, 1, 254, 1744}, true);  // append only
-    f += run_prefill_at(cb, fb, 1, 2, 2, 100, {100, 100}, 61);           // inside the first group
-    f += run_prefill_at(cb, fb, 1, 4, 2, 1000, {300, 212, 128, 1, 1407}, 62);  // chunk edges on and off groups
-    f += run_prefill_at(cb, fb, 2, 8, 2, 2048, {512, 512, 700, 330}, 63);     // GQA 4, batch 2, the last chunk short
-    f += run_prefill_at(cb, fb, 1, 8, 2, 2048, {512, 512, 700, 330}, 68);    // GQA 4, batch 1
-    f += run_prefill_at(cb, fb, 2, 8, 4, 2048, {512, 512, 700, 330}, 69);    // GQA 2, batch 2
-    f += run_prefill_at(cb, fb, 1, 16, 8, 1024, {1024, 2048}, 64);       // Qwen3 geometry, the prompt over groups
-    f += run_prefill_at(cb, fb, 1, 10, 2, 120, {100, 100}, 65);          // GQA 5
-    f += run_prefill_at(cb, fb, 1, 2, 2, 2000, {1, 1, 254, 1744}, 66, true);  // append only
+    const bool im = pass >= 2;
+    add([=] { return run_prefill(cb, fb, 1, 2, 2, 100, 21, {100}); }, false, im);                 // inside the first group
+    add([=] { return run_prefill(cb, fb, 1, 4, 2, 1000, 22, {1000}); }, false, im);               // one chunk, open group of 104
+    add([=] { return run_prefill(cb, fb, 2, 8, 2, 2048, 23, {300, 212, 128, 1, 1407}); }, false, im);  // chunk edges on and off groups
+    add([=] { return run_prefill(cb, fb, 1, 16, 8, 4096, 24, {1024, 1024, 2048}); }, false, im);  // Qwen3 geometry
+    add([=] { return run_prefill(cb, fb, 1, 2, 2, 3000, 25, {1500, 1500}); }, false, im);         // MHA, two chunks
+    add([=] { return run_prefill(cb, fb, 1, 8, 2, 3000, 26, {700, 2300}); }, false, im);          // GQA 4
+    add([=] { return run_prefill(cb, fb, 1, 4, 2, 8177, 28, {6000, 2100, 77}); }, false, im);     // short chunks on a long stream (split-K)
+    add([=] { return run_prefill(cb, fb, 1, 16, 2, 3000, 29, {1100, 1900}); }, false, im);         // GQA 8
+    add([=] { return run_prefill(cb, fb, 1, 6, 2, 2000, 30, {700, 1300}); }, false, im);           // GQA 3 (the ratio at run time)
+    add([=] { return run_prefill(cb, fb, 1, 32, 2, 1500, 31, {700, 800}); }, false, im);           // GQA 16
+    add([=] { return run_prefill(cb, fb, 1, 10, 2, 2000, 32, {900, 1100}); }, false, im);          // GQA 5
+    add([=] { return run_prefill(cb, fb, 1, 2, 2, 2000, 27, {1, 1, 254, 1744}, true); }, false, im);  // append only
+    add([=] { return run_prefill_at(cb, fb, 1, 2, 2, 100, {100, 100}, 61); }, false, im);           // inside the first group
+    add([=] { return run_prefill_at(cb, fb, 1, 4, 2, 1000, {300, 212, 128, 1, 1407}, 62); }, false, im);  // chunk edges on and off groups
+    add([=] { return run_prefill_at(cb, fb, 2, 8, 2, 2048, {512, 512, 700, 330}, 63); }, false, im);     // GQA 4, batch 2, the last chunk short
+    add([=] { return run_prefill_at(cb, fb, 1, 8, 2, 2048, {512, 512, 700, 330}, 68); }, false, im);    // GQA 4, batch 1
+    add([=] { return run_prefill_at(cb, fb, 2, 8, 4, 2048, {512, 512, 700, 330}, 69); }, false, im);    // GQA 2, batch 2
+    add([=] { return run_prefill_at(cb, fb, 1, 16, 8, 1024, {1024, 2048}, 64); }, false, im);       // Qwen3 geometry, the prompt over groups
+    add([=] { return run_prefill_at(cb, fb, 1, 10, 2, 120, {100, 100}, 65); }, false, im);          // GQA 5
+    add([=] { return run_prefill_at(cb, fb, 1, 2, 2, 2000, {1, 1, 254, 1744}, 66, true); }, false, im);  // append only
   }
   for (int fmt = 0; fmt < 2; ++fmt) {  // the length in device memory: across group edges, the sink's end, GQA 1 / 2 / 4;
     const int cb = fmt ? 4 : 3, fb = fmt ? 2 : 3;  // tau as the decode cases of the same geometry (4, 3, 1)
-    f += run_device_length(cb, fb, 1, 16, 8, 120, 280, 3e-4f, 41);
-    f += run_device_length(cb, fb, 2, 8, 2, 1, 300, 1e-3f, 42);
-    f += run_device_length(cb, fb, 1, 2, 2, 1000, 150, 1e-2f, 43);
-    f += run_device_length(cb, fb, 1, 16, 2, 120, 280, 1e-3f, 45);  // GQA 8: virtual heads at the device length
-    f += run_device_length(cb, fb, 1, 10, 2, 120, 150, 1e-3f, 46);  // GQA 5
+    add([=] { return run_device_length(cb, fb, 1, 16, 8, 120, 280, 3e-4f, 41); });
+    add([=] { return run_device_length(cb, fb, 2, 8, 2, 1, 300, 1e-3f, 42); });
+    add([=] { return run_device_length(cb, fb, 1, 2, 2, 1000, 150, 1e-2f, 43); });
+    add([=] { return run_device_length(cb, fb, 1, 16, 2, 120, 280, 1e-3f, 45); });  // GQA 8: virtual heads at the device length
+    add([=] { return run_device_length(cb, fb, 1, 10, 2, 120, 150, 1e-3f, 46); });  // GQA 5
   }
   for (int fmt = 0; fmt < 2; ++fmt) {  // the fused step input: across group edges, from the sink, GQA 1 / 2 / 4, norm or not
     const int cb = fmt ? 4 : 3, fb = fmt ? 2 : 3;
-    f += run_qkv(cb, fb, 1, 32, 8, 120, 280, true, 51);
-    f += run_qkv(cb, fb, 2, 8, 2, 0, 300, true, 52);
-    f += run_qkv(cb, fb, 1, 2, 2, 1000, 150, false, 53);
+    add([=] { return run_qkv(cb, fb, 1, 32, 8, 120, 280, true, 51); });
+    add([=] { return run_qkv(cb, fb, 2, 8, 2, 0, 300, true, 52); });
+    add([=] { return run_qkv(cb, fb, 1, 2, 2, 1000, 150, false, 53); });
   }
-  g_strided = true;  // the layers' groups side by side: the same results, the cache's units where the strides put them
-  for (int fmt = 0; fmt < 2; ++fmt) {
+  for (int fmt = 0; fmt < 2; ++fmt) {  // strided: the layers' groups side by side, the cache's units where the strides put them
     const int cb = fmt ? 4 : 3, fb = fmt ? 2 : 3;
-    f += run(cb, fb, 2, 8, 2, 4096, 1e-3f, 3);
-    f += run(cb, fb, 1, 16, 8, 20000, 3e-4f, 4);
-    f += run(cb, fb, 1, 4, 2, 3000, 1e-3f, 8, 8192);
-    for (int images = 0; images < (tc_prefill() ? 2 : 1); ++images) {
-      g_images = images;
-      f += run_prefill(cb, fb, 2, 8, 2, 2048, 23, {300, 212, 128, 1, 1407});
-      f += run_prefill(cb, fb, 1, 16, 8, 4096, 24, {1024, 1024, 2048});
-      f += run_prefill(cb, fb, 1, 4, 2, 8177, 28, {6000, 2100, 77});
+    add([=] { return run(cb, fb, 2, 8, 2, 4096, 1e-3f, 3); }, true);
+    add([=] { return run(cb, fb, 1, 16, 8, 20000, 3e-4f, 4); }, true);
+    add([=] { return run(cb, fb, 1, 4, 2, 3000, 1e-3f, 8, 8192); }, true);
+    for (int images = 0; images < (tc ? 2 : 1); ++images) {
+      add([=] { return run_prefill(cb, fb, 2, 8, 2, 2048, 23, {300, 212, 128, 1, 1407}); }, true, images);
+      add([=] { return run_prefill(cb, fb, 1, 16, 8, 4096, 24, {1024, 1024, 2048}); }, true, images);
+      add([=] { return run_prefill(cb, fb, 1, 4, 2, 8177, 28, {6000, 2100, 77}); }, true, images);
     }
-    f += run_prefill_at(cb, fb, 1, 4, 2, 1000, {300, 212, 128, 1, 1407}, 67);
-    f += run_device_length(cb, fb, 1, 16, 8, 120, 280, 3e-4f, 44);
-    f += run_qkv(cb, fb, 1, 32, 8, 120, 280, true, 54);
+    add([=] { return run_prefill_at(cb, fb, 1, 4, 2, 1000, {300, 212, 128, 1, 1407}, 67); }, true);
+    add([=] { return run_device_length(cb, fb, 1, 16, 8, 120, 280, 3e-4f, 44); }, true);
+    add([=] { return run_qkv(cb, fb, 1, 32, 8, 120, 280, true, 54); }, true);
+  }
+  std::vector<std::string> reports(jobs.size());
+  std::vector<int> failed(jobs.size(), 0);
+  std::atomic<size_t> next{0};
+  const auto worker = [&] {
+    CK(cudaFree(nullptr));
+    for (size_t i; (i = next++) < jobs.size();) {
+      report_sink = &reports[i];
+      gpu_lock.lock_shared();
+      failed[i] = jobs[i]();
+      gpu_lock.unlock_shared();
+      report_sink = nullptr;
+    }
+  };
+  std::vector<std::thread> pool;
+  const size_t threads = std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), jobs.size());
+  for (size_t t = 0; t < threads; ++t) pool.emplace_back(worker);
+  for (std::thread &t : pool) t.join();
+  int f = 0;
+  for (size_t i = 0; i < jobs.size(); ++i) {
+    fputs(reports[i].c_str(), stdout);
+    f += failed[i];
   }
   printf(f ? "\n%d FAILED\n" : "\nall passed\n", f);
   return f != 0;
